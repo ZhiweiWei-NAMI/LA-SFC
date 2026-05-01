@@ -582,6 +582,9 @@ class IPPOPolicy(BaseMARLPolicy):
         temporal_feature_dim: int = 8,
         learnable_prior: bool = True,
         prior_l2_coef: float = 1e-3,
+        learned_logit_scale: float = 1.0,
+        prior_logit_scale: float = 1.0,
+        learnable_logit_blend: bool = False,
     ):
         try:
             import torch
@@ -609,6 +612,9 @@ class IPPOPolicy(BaseMARLPolicy):
         self.temporal_feature_dim = int(temporal_feature_dim)
         self.learnable_prior = bool(learnable_prior)
         self.prior_l2_coef = float(prior_l2_coef)
+        self.learned_logit_scale = float(learned_logit_scale)
+        self.prior_logit_scale = float(prior_logit_scale)
+        self.learnable_logit_blend = bool(learnable_logit_blend)
         self.rng = random.Random(seed)
         torch.manual_seed(seed)
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -649,6 +655,9 @@ class IPPOPolicy(BaseMARLPolicy):
                 max_agents: int,
                 prior_init_values: Sequence[float],
                 learnable_prior_value: bool,
+                learned_logit_scale_value: float,
+                prior_logit_scale_value: float,
+                learnable_logit_blend_value: bool,
             ):
                 super().__init__()
                 self.body = nn.Sequential(nn.Linear(obs_dim, hid), nn.Tanh(), nn.Linear(hid, hid), nn.Tanh())
@@ -667,6 +676,18 @@ class IPPOPolicy(BaseMARLPolicy):
                 else:
                     self.register_buffer("prior_feature_weights", prior_init_tensor.clone())
                 self.register_buffer("prior_feature_init", prior_init_tensor.clone())
+                learned_scale_init = torch.tensor(max(1e-4, float(learned_logit_scale_value)), dtype=torch.float32)
+                prior_scale_init = torch.tensor(max(1e-4, float(prior_logit_scale_value)), dtype=torch.float32)
+                learned_scale_raw = torch.log(torch.expm1(learned_scale_init))
+                prior_scale_raw = torch.log(torch.expm1(prior_scale_init))
+                if bool(learnable_logit_blend_value):
+                    self.learned_logit_scale_raw = nn.Parameter(learned_scale_raw.clone())
+                    self.prior_logit_scale_raw = nn.Parameter(prior_scale_raw.clone())
+                else:
+                    self.register_buffer("learned_logit_scale_raw", learned_scale_raw.clone())
+                    self.register_buffer("prior_logit_scale_raw", prior_scale_raw.clone())
+                self.register_buffer("learned_logit_scale_init", learned_scale_init.clone())
+                self.register_buffer("prior_logit_scale_init", prior_scale_init.clone())
                 self.node_encoder = nn.Sequential(nn.Linear(node_dim, hid), nn.Tanh(), nn.Linear(hid, hid), nn.Tanh())
                 self.edge_encoder = nn.Sequential(nn.Linear(edge_dim, hid), nn.Tanh(), nn.Linear(hid, hid), nn.Tanh())
                 self.gnn_message_layers = nn.ModuleList(
@@ -784,10 +805,36 @@ class IPPOPolicy(BaseMARLPolicy):
             def candidate_prior_logits(self, prior_features):
                 return torch.matmul(prior_features, self.prior_feature_weights.to(dtype=prior_features.dtype))
 
+            def blend_candidate_logits(self, learned_scores, prior_scores):
+                learned_scale, prior_scale = self.logit_blend_scales()
+                return learned_scale.to(dtype=learned_scores.dtype, device=learned_scores.device) * learned_scores + prior_scale.to(
+                    dtype=prior_scores.dtype,
+                    device=prior_scores.device,
+                ) * prior_scores
+
+            def logit_blend_scales(self):
+                learned_scale = torch.nn.functional.softplus(self.learned_logit_scale_raw) + 1e-4
+                prior_scale = torch.nn.functional.softplus(self.prior_logit_scale_raw) + 1e-4
+                return learned_scale, prior_scale
+
             def prior_regularization_loss(self):
                 weights = self.prior_feature_weights
                 init = self.prior_feature_init.to(dtype=weights.dtype, device=weights.device)
-                return (weights - init).pow(2).mean()
+                prior_loss = (weights - init).pow(2).mean()
+                learned_scale, prior_scale = self.logit_blend_scales()
+                learned_init = self.learned_logit_scale_init.to(dtype=learned_scale.dtype, device=learned_scale.device)
+                prior_init = self.prior_logit_scale_init.to(dtype=prior_scale.dtype, device=prior_scale.device)
+                blend_loss = (learned_scale - learned_init).pow(2) + (prior_scale - prior_init).pow(2)
+                return prior_loss + 0.1 * blend_loss
+
+            def logit_blend_snapshot(self):
+                learned_scale, prior_scale = self.logit_blend_scales()
+                return {
+                    "learned": float(learned_scale.detach().cpu().item()),
+                    "prior": float(prior_scale.detach().cpu().item()),
+                    "initial_learned": float(self.learned_logit_scale_init.detach().cpu().item()),
+                    "initial_prior": float(self.prior_logit_scale_init.detach().cpu().item()),
+                }
 
             def region_critic_value(self, contexts):
                 import torch
@@ -865,6 +912,9 @@ class IPPOPolicy(BaseMARLPolicy):
             self.max_critic_agents,
             prior_init,
             self.learnable_prior,
+            self.learned_logit_scale,
+            self.prior_logit_scale,
+            self.learnable_logit_blend,
         ).to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=float(lr))
 
@@ -1029,7 +1079,7 @@ class IPPOPolicy(BaseMARLPolicy):
         if not log_prob_tensors or not value_tensors:
             return None
         return PolicyEvaluation(
-            log_prob_tensor=sum(item.reshape(()) for item in log_prob_tensors),
+            log_prob_tensor=sum(item.reshape(()) for item in log_prob_tensors) / float(len(log_prob_tensors)),
             value_tensor=sum(item.reshape(()) for item in value_tensors) / float(len(value_tensors)),
             entropy_tensor=sum(item.reshape(()) for item in entropy_tensors) / float(len(entropy_tensors)),
             action_count=action_count,
@@ -1060,7 +1110,8 @@ class IPPOPolicy(BaseMARLPolicy):
             learned_scores = self.model.region_candidate_logits(obs_tensor, features)
         else:
             learned_scores = self.model.candidate_logits(obs_tensor, features)
-        return learned_scores + self._candidate_prior_logits(candidate_set, mask_len, learned_scores)
+        prior_scores = self._candidate_prior_logits(candidate_set, mask_len, learned_scores)
+        return self.model.blend_candidate_logits(learned_scores, prior_scores)
 
     def _candidate_prior_logits(self, candidate_set: Mapping[str, Any], mask_len: int, reference: Any) -> Any:
         rows: List[List[float]] = []
@@ -1096,7 +1147,7 @@ class IPPOPolicy(BaseMARLPolicy):
             return None
         return self.model.prior_regularization_loss()
 
-    def prior_weight_snapshot(self) -> Dict[str, List[float]]:
+    def prior_weight_snapshot(self) -> Dict[str, Any]:
         if not hasattr(self.model, "prior_feature_weights"):
             return {}
         names = [
@@ -1112,12 +1163,15 @@ class IPPOPolicy(BaseMARLPolicy):
         ]
         weights = self.model.prior_feature_weights.detach().cpu().tolist()
         init = self.model.prior_feature_init.detach().cpu().tolist()
-        return {
+        snapshot = {
             "names": names,
             "initial": [float(item) for item in init],
             "learned": [float(item) for item in weights],
             "delta": [float(w - i) for w, i in zip(weights, init)],
         }
+        if hasattr(self.model, "logit_blend_snapshot"):
+            snapshot["logit_blend"] = self.model.logit_blend_snapshot()
+        return snapshot
 
     def supervised_update(self, observations: Mapping[str, Mapping[str, Any]], expert_actions: Mapping[str, Any]) -> int:
         """Behavior-clone one batch of expert candidate choices from observations."""

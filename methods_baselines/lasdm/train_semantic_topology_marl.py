@@ -92,6 +92,13 @@ def main() -> None:
                 use_region_encoder=bool(marl_cfg.get("ippo_use_region_encoder", True)),
                 learnable_prior=bool(marl_cfg.get("ippo_learnable_prior", True)),
                 prior_l2_coef=float(marl_cfg.get("ippo_prior_l2_coef", 1e-3) or 0.0),
+                learned_logit_scale=float(
+                    marl_cfg.get("ippo_learned_logit_scale_init", marl_cfg.get("ippo_learned_logit_scale", 1.0)) or 1.0
+                ),
+                prior_logit_scale=float(
+                    marl_cfg.get("ippo_prior_logit_scale_init", marl_cfg.get("ippo_prior_logit_scale", 1.0)) or 1.0
+                ),
+                learnable_logit_blend=bool(marl_cfg.get("ippo_learnable_logit_blend", False)),
                 device=str(marl_cfg.get("ippo_device", "") or "") or None,
             )
             trainer = IPPOTrainer(
@@ -101,13 +108,17 @@ def main() -> None:
                 clip_eps=float(marl_cfg.get("ippo_clip_eps", 0.2) or 0.2),
                 gae_lambda=float(marl_cfg.get("ippo_gae_lambda", 0.95) or 0.95),
                 entropy_coef=float(marl_cfg.get("ippo_entropy_coef", 0.01) or 0.01),
-                value_coef=float(marl_cfg.get("ippo_value_coef", 0.5) or 0.5),
+                actor_loss_coef=float(marl_cfg.get("ippo_actor_loss_coef", 1.0) or 1.0),
+                value_coef=float(marl_cfg.get("ippo_value_coef", 1.0) or 1.0),
                 update_epochs=int(marl_cfg.get("ippo_update_epochs", 4) or 4),
                 minibatch_size=int(marl_cfg.get("ippo_minibatch_size", 64) or 64),
                 prior_l2_coef=float(marl_cfg.get("ippo_prior_l2_coef", 1e-3) or 0.0),
                 target_kl=float(marl_cfg.get("ippo_target_kl", 0.02) or 0.02),
                 rollout_episodes_per_update=int(marl_cfg.get("ippo_rollout_episodes_per_update", 1) or 1),
                 max_grad_norm=float(marl_cfg.get("ippo_max_grad_norm", 0.5) or 0.5),
+                normalize_returns=bool(marl_cfg.get("ippo_return_norm_enabled", marl_cfg.get("ippo_normalize_returns", True))),
+                return_norm_momentum=float(marl_cfg.get("ippo_return_norm_momentum", 0.95) or 0.95),
+                return_norm_eps=float(marl_cfg.get("ippo_return_norm_eps", 1e-6) or 1e-6),
                 entropy_coef_start=(
                     float(marl_cfg["ippo_entropy_coef_start"])
                     if "ippo_entropy_coef_start" in marl_cfg
@@ -252,7 +263,7 @@ def _build_reward_fn(marl_cfg: Mapping[str, Any]) -> SFCReward:
     values = {}
     for key, value in reward_cfg.items():
         if key in allowed:
-            values[key] = float(value)
+            values[key] = bool(value) if key == "dense_enabled" else float(value)
     return SFCReward(SFCRewardConfig(**values))
 
 

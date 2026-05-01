@@ -375,6 +375,9 @@ def train_semantic_ippo_runtime(
         rollout_episodes_per_update = max(1, int(marl_cfg.get("ippo_rollout_episodes_per_update", 1) or 1))
         target_kl = float(marl_cfg.get("ippo_target_kl", 0.02) or 0.02)
         max_grad_norm = float(marl_cfg.get("ippo_max_grad_norm", 0.5) or 0.5)
+        normalize_returns = bool(marl_cfg.get("ippo_return_norm_enabled", marl_cfg.get("ippo_normalize_returns", True)))
+        return_norm_momentum = float(marl_cfg.get("ippo_return_norm_momentum", 0.95) or 0.95)
+        return_norm_eps = float(marl_cfg.get("ippo_return_norm_eps", 1e-6) or 1e-6)
         for episode in range(int(episodes)):
             scenario = scenarios[episode % len(scenarios)]
             role = roles[episode % len(roles)]
@@ -409,7 +412,7 @@ def train_semantic_ippo_runtime(
                     mean_reward = sum(rewards.values()) / max(1, len(rewards))
                     total += mean_reward
                     if policy_step is not None:
-                        step_log_prob = _sum_tensor(policy_step.log_prob_tensors)
+                        step_log_prob = _mean_tensor(policy_step.log_prob_tensors)
                         step_value = _mean_tensor(policy_step.value_tensors)
                         if step_log_prob is not None and step_value is not None:
                             episode_steps.append(
@@ -458,12 +461,16 @@ def train_semantic_ippo_runtime(
                             gae_lambda=float(marl_cfg.get("ippo_gae_lambda", 0.95) or 0.95),
                             clip_eps=float(marl_cfg.get("ippo_clip_eps", 0.2) or 0.2),
                             entropy_coef=entropy_coef,
-                            value_coef=float(marl_cfg.get("ippo_value_coef", 0.5) or 0.5),
+                            actor_loss_coef=float(marl_cfg.get("ippo_actor_loss_coef", 1.0) or 1.0),
+                            value_coef=float(marl_cfg.get("ippo_value_coef", 1.0) or 1.0),
                             update_epochs=int(marl_cfg.get("ippo_update_epochs", 4) or 4),
                             minibatch_size=int(marl_cfg.get("ippo_minibatch_size", 64) or 64),
                             prior_l2_coef=float(marl_cfg.get("ippo_prior_l2_coef", 1e-3) or 0.0),
                             target_kl=target_kl,
                             max_grad_norm=max_grad_norm,
+                            normalize_returns=normalize_returns,
+                            return_norm_momentum=return_norm_momentum,
+                            return_norm_eps=return_norm_eps,
                         )
                         ppo_update_index += 1
                         ppo_diagnostic_rows.append(
@@ -1042,12 +1049,16 @@ def _runtime_ippo_episode_update(
     gae_lambda: float = 0.95,
     clip_eps: float = 0.2,
     entropy_coef: float = 0.01,
-    value_coef: float = 0.5,
+    actor_loss_coef: float = 1.0,
+    value_coef: float = 1.0,
     update_epochs: int = 4,
     minibatch_size: int = 64,
     prior_l2_coef: float = 0.0,
     target_kl: float = 0.02,
     max_grad_norm: float = 0.5,
+    normalize_returns: bool = True,
+    return_norm_momentum: float = 0.95,
+    return_norm_eps: float = 1e-6,
 ) -> Dict[str, float]:
     return ppo_update_policy(
         policy,
@@ -1056,12 +1067,16 @@ def _runtime_ippo_episode_update(
         gae_lambda=gae_lambda,
         clip_eps=clip_eps,
         entropy_coef=entropy_coef,
+        actor_loss_coef=actor_loss_coef,
         value_coef=value_coef,
         update_epochs=update_epochs,
         minibatch_size=minibatch_size,
         max_grad_norm=max_grad_norm,
         prior_l2_coef=prior_l2_coef,
         target_kl=target_kl,
+        normalize_returns=normalize_returns,
+        return_norm_momentum=return_norm_momentum,
+        return_norm_eps=return_norm_eps,
     )
 
 
@@ -1193,16 +1208,6 @@ def _mean_tensor(items: Sequence[Any]) -> Optional[Any]:
     return sum(item.reshape(()) for item in items) / float(len(items))
 
 
-def _sum_tensor(items: Sequence[Any]) -> Optional[Any]:
-    if not items:
-        return None
-    first = items[0]
-    torch = getattr(first, "new_tensor", None)
-    if torch is None:
-        return None
-    return sum(item.reshape(()) for item in items)
-
-
 def _tensor_float(item: Any) -> float:
     return float(item.detach().cpu().item())
 
@@ -1250,6 +1255,13 @@ def _ippo_policy_kwargs(
         "use_region_encoder": bool(marl_cfg.get("ippo_use_region_encoder", True)),
         "learnable_prior": bool(marl_cfg.get("ippo_learnable_prior", True)),
         "prior_l2_coef": float(marl_cfg.get("ippo_prior_l2_coef", 1e-3) or 0.0),
+        "learned_logit_scale": float(
+            marl_cfg.get("ippo_learned_logit_scale_init", marl_cfg.get("ippo_learned_logit_scale", 1.0)) or 1.0
+        ),
+        "prior_logit_scale": float(
+            marl_cfg.get("ippo_prior_logit_scale_init", marl_cfg.get("ippo_prior_logit_scale", 1.0)) or 1.0
+        ),
+        "learnable_logit_blend": bool(marl_cfg.get("ippo_learnable_logit_blend", False)),
         "device": device or None,
     }
 

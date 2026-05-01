@@ -317,6 +317,12 @@ marl:
   auto_exchange: true
   include_remote_candidates: true
   ippo_centralized_critic: true
+  ippo_use_region_encoder: true
+  ippo_learnable_prior: true
+  ippo_prior_l2_coef: 0.001
+  ippo_learnable_logit_blend: true
+  ippo_learned_logit_scale_init: 2.0
+  ippo_prior_logit_scale_init: 0.2
   ippo_critic_agent_count: 4
   ippo_device: cuda
   ippo_expert_policy: topology_greedy
@@ -327,14 +333,18 @@ marl:
   ippo_gamma: 0.99
   ippo_clip_eps: 0.12
   ippo_gae_lambda: 0.95
-  ippo_value_coef: 0.5
-  ippo_update_epochs: 2
+  ippo_value_coef: 1.0
+  ippo_update_epochs: 4
   ippo_minibatch_size: 256
   ippo_entropy_coef: 0.01
+  ippo_actor_loss_coef: 4.0
   ippo_target_kl: 0.02
   ippo_rollout_episodes_per_update: 4
   ippo_max_grad_norm: 0.5
-  ippo_lr: 0.0001
+  ippo_return_norm_enabled: true
+  ippo_return_norm_momentum: 0.95
+  ippo_return_norm_eps: 0.000001
+  ippo_lr: 0.0002
   ippo_entropy_coef_start: 0.02
   ippo_entropy_coef_end: 0.003
   ippo_entropy_decay_episodes: 120

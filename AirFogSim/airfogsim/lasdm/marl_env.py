@@ -1108,6 +1108,8 @@ def _reward_aux_from_decisions(decisions: Sequence[LASDMDecision]) -> Dict[str, 
     rb_waits = []
     wireless_pressures = []
     wireless_hops = []
+    route_available_values = []
+    semantic_group_counts: Dict[str, int] = {}
     route_unavailable = 0
     for item in selected:
         metadata = dict(item.get("metadata", {}) or {})
@@ -1129,9 +1131,13 @@ def _reward_aux_from_decisions(decisions: Sequence[LASDMDecision]) -> Dict[str, 
         rb_waits.append(_to_float(metadata.get("expected_rb_wait_s"), 0.0))
         wireless_pressures.append(_to_float(metadata.get("wireless_pressure"), 0.0))
         wireless_hops.append(_to_float(metadata.get("wireless_hops"), 0.0))
-        if _to_float(metadata.get("route_available"), _to_float(item.get("route_available"), 1.0)) <= 0.0:
+        route_available = _to_float(metadata.get("route_available"), _to_float(item.get("route_available"), 1.0))
+        route_available_values.append(1.0 if route_available > 0.0 else 0.0)
+        semantic_group = str(metadata.get("semantic_group", item.get("semantic_group", "unknown")) or "unknown")
+        semantic_group_counts[semantic_group] = semantic_group_counts.get(semantic_group, 0) + 1
+        if route_available <= 0.0:
             route_unavailable += 1
-    return {
+    aux = {
         "mean_semantic_top_score": _mean(semantic_scores),
         "stale_remote_ratio": _mean(stale_values),
         "load_imbalance": _mean(load_ratios),
@@ -1147,7 +1153,18 @@ def _reward_aux_from_decisions(decisions: Sequence[LASDMDecision]) -> Dict[str, 
         "expected_rb_wait_s": _mean(rb_waits),
         "wireless_pressure": _mean(wireless_pressures),
         "wireless_hops": _mean(wireless_hops),
+        "selected_route_available_mean": _mean(route_available_values),
+        "selected_deadline_slack_mean": _mean(deadline_slacks),
+        "selected_expected_runtime_penalty_mean": _mean(expected_penalties),
+        "selected_topology_risk_mean": _mean(topology_risks),
+        "selected_mobility_risk_mean": _mean(mobility_risks),
+        "selected_stale_remote_ratio": _mean(stale_values),
+        "selected_semantic_group_count": float(len(selected)),
     }
+    for group, count in semantic_group_counts.items():
+        key = "".join(char if char.isalnum() else "_" for char in group.lower()).strip("_") or "unknown"
+        aux[f"selected_semantic_group_{key}_count"] = float(count)
+    return aux
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:

@@ -85,13 +85,17 @@ class IPPOTrainer:
         clip_eps: float = 0.2,
         gae_lambda: float = 0.95,
         entropy_coef: float = 0.01,
-        value_coef: float = 0.5,
+        actor_loss_coef: float = 1.0,
+        value_coef: float = 1.0,
         update_epochs: int = 4,
         minibatch_size: int = 64,
         prior_l2_coef: float = 0.0,
         target_kl: float = 0.02,
         rollout_episodes_per_update: int = 1,
         max_grad_norm: float = 0.5,
+        normalize_returns: bool = True,
+        return_norm_momentum: float = 0.95,
+        return_norm_eps: float = 1e-6,
         entropy_coef_start: Optional[float] = None,
         entropy_coef_end: Optional[float] = None,
         entropy_decay_episodes: int = 0,
@@ -102,6 +106,7 @@ class IPPOTrainer:
         self.clip_eps = float(clip_eps)
         self.gae_lambda = float(gae_lambda)
         self.entropy_coef = float(entropy_coef)
+        self.actor_loss_coef = float(actor_loss_coef)
         self.value_coef = float(value_coef)
         self.update_epochs = int(update_epochs)
         self.minibatch_size = int(minibatch_size)
@@ -109,6 +114,9 @@ class IPPOTrainer:
         self.target_kl = float(target_kl)
         self.rollout_episodes_per_update = max(1, int(rollout_episodes_per_update))
         self.max_grad_norm = float(max_grad_norm)
+        self.normalize_returns = bool(normalize_returns)
+        self.return_norm_momentum = float(return_norm_momentum)
+        self.return_norm_eps = float(return_norm_eps)
         self.entropy_coef_start = None if entropy_coef_start is None else float(entropy_coef_start)
         self.entropy_coef_end = None if entropy_coef_end is None else float(entropy_coef_end)
         self.entropy_decay_episodes = max(0, int(entropy_decay_episodes))
@@ -129,7 +137,7 @@ class IPPOTrainer:
                 observations, rewards, done, info = self.env.step(policy_step.actions)
                 mean_reward = sum(rewards.values()) / max(1, len(rewards))
                 total += mean_reward
-                step_log_prob = _sum_tensor(policy_step.log_prob_tensors)
+                step_log_prob = _mean_tensor(policy_step.log_prob_tensors)
                 step_value = _mean_tensor(policy_step.value_tensors)
                 if step_log_prob is not None and step_value is not None:
                     episode_steps.append(
@@ -189,12 +197,16 @@ class IPPOTrainer:
             gae_lambda=self.gae_lambda,
             clip_eps=self.clip_eps,
             entropy_coef=self._entropy_coef_for_episode(episode),
+            actor_loss_coef=self.actor_loss_coef,
             value_coef=self.value_coef,
             update_epochs=self.update_epochs,
             minibatch_size=self.minibatch_size,
             max_grad_norm=self.max_grad_norm,
             prior_l2_coef=self.prior_l2_coef,
             target_kl=self.target_kl,
+            normalize_returns=self.normalize_returns,
+            return_norm_momentum=self.return_norm_momentum,
+            return_norm_eps=self.return_norm_eps,
         )
 
     def _entropy_coef_for_episode(self, episode: int) -> float:
@@ -248,12 +260,16 @@ def ppo_update_policy(
     gae_lambda: float = 0.95,
     clip_eps: float = 0.2,
     entropy_coef: float = 0.01,
-    value_coef: float = 0.5,
+    actor_loss_coef: float = 1.0,
+    value_coef: float = 1.0,
     update_epochs: int = 4,
     minibatch_size: int = 64,
     max_grad_norm: float = 0.5,
     prior_l2_coef: float = 0.0,
     target_kl: float = 0.02,
+    normalize_returns: bool = True,
+    return_norm_momentum: float = 0.95,
+    return_norm_eps: float = 1e-6,
 ) -> Dict[str, float]:
     if not rollout:
         return {}
@@ -275,6 +291,17 @@ def ppo_update_policy(
         last_gae = delta + float(gamma) * float(gae_lambda) * nonterminal * last_gae
         advantages[index] = last_gae
     returns = advantages + old_values
+    return_batch_mean = returns.mean()
+    return_batch_std = returns.std(unbiased=False) if len(rollout) > 1 else torch.tensor(0.0, dtype=torch.float32, device=device)
+    return_norm_mean = torch.tensor(0.0, dtype=torch.float32, device=device)
+    return_norm_std = torch.tensor(1.0, dtype=torch.float32, device=device)
+    if bool(normalize_returns):
+        return_norm_mean, return_norm_std = _update_return_normalizer(
+            policy,
+            returns,
+            momentum=float(return_norm_momentum),
+            eps=float(return_norm_eps),
+        )
     if len(rollout) > 0:
         raw_advantage_mean = advantages.mean()
         raw_advantage_std = advantages.std(unbiased=False) if len(rollout) > 1 else torch.tensor(0.0, dtype=torch.float32, device=device)
@@ -291,12 +318,18 @@ def ppo_update_policy(
         "actor_loss": 0.0,
         "critic_loss": 0.0,
         "entropy": 0.0,
+        "actor_loss_coef": float(actor_loss_coef),
         "approx_kl": 0.0,
         "clip_fraction": 0.0,
         "grad_norm": 0.0,
         "prior_l2": 0.0,
         "mean_advantage": float(raw_advantage_mean.detach().cpu().item()),
         "std_advantage": float(raw_advantage_std.detach().cpu().item()),
+        "return_batch_mean": float(return_batch_mean.detach().cpu().item()),
+        "return_batch_std": float(return_batch_std.detach().cpu().item()),
+        "return_norm_mean": float(return_norm_mean.detach().cpu().item()),
+        "return_norm_std": float(return_norm_std.detach().cpu().item()),
+        "return_norm_enabled": 1.0 if bool(normalize_returns) else 0.0,
         "updates": 0.0,
         "epochs_completed": 0.0,
         "target_kl": target_kl_value,
@@ -333,12 +366,15 @@ def ppo_update_policy(
             clipped_actor = torch.clamp(ratio, 1.0 - float(clip_eps), 1.0 + float(clip_eps)) * batch_advantages
             actor_loss = -torch.min(unclipped_actor, clipped_actor).mean()
 
-            value_pred_clipped = batch_old_values + (new_values - batch_old_values).clamp(-float(clip_eps), float(clip_eps))
-            value_loss_unclipped = (new_values - batch_returns).pow(2)
-            value_loss_clipped = (value_pred_clipped - batch_returns).pow(2)
+            scaled_new_values = (new_values - return_norm_mean) / return_norm_std
+            scaled_returns = (batch_returns - return_norm_mean) / return_norm_std
+            scaled_old_values = (batch_old_values - return_norm_mean) / return_norm_std
+            value_pred_clipped = scaled_old_values + (scaled_new_values - scaled_old_values).clamp(-float(clip_eps), float(clip_eps))
+            value_loss_unclipped = (scaled_new_values - scaled_returns).pow(2)
+            value_loss_clipped = (value_pred_clipped - scaled_returns).pow(2)
             critic_loss = 0.5 * torch.max(value_loss_unclipped, value_loss_clipped).mean()
             entropy_bonus = entropy.mean()
-            loss = actor_loss + float(value_coef) * critic_loss - float(entropy_coef) * entropy_bonus
+            loss = float(actor_loss_coef) * actor_loss + float(value_coef) * critic_loss - float(entropy_coef) * entropy_bonus
             prior_l2 = None
             if float(prior_l2_coef) > 0.0 and hasattr(policy, "prior_regularization_loss"):
                 prior_l2 = policy.prior_regularization_loss()
@@ -369,12 +405,18 @@ def ppo_update_policy(
                 "actor_loss": float(actor_loss.detach().cpu().item()),
                 "critic_loss": float(critic_loss.detach().cpu().item()),
                 "entropy": float(entropy_bonus.detach().cpu().item()),
+                "actor_loss_coef": float(actor_loss_coef),
                 "approx_kl": float(approx_kl.detach().cpu().item()),
                 "clip_fraction": float(clip_fraction.detach().cpu().item()),
                 "grad_norm": float(grad_norm.detach().cpu().item()),
                 "prior_l2": float(prior_l2.detach().cpu().item()) if prior_l2 is not None else 0.0,
                 "mean_advantage": float(raw_advantage_mean.detach().cpu().item()),
                 "std_advantage": float(raw_advantage_std.detach().cpu().item()),
+                "return_batch_mean": float(return_batch_mean.detach().cpu().item()),
+                "return_batch_std": float(return_batch_std.detach().cpu().item()),
+                "return_norm_mean": float(return_norm_mean.detach().cpu().item()),
+                "return_norm_std": float(return_norm_std.detach().cpu().item()),
+                "return_norm_enabled": 1.0 if bool(normalize_returns) else 0.0,
                 "updates": float(metrics.get("updates", 0.0) + 1.0),
                 "epochs_completed": float(epoch + 1),
                 "target_kl": target_kl_value,
@@ -389,10 +431,31 @@ def ppo_update_policy(
     return metrics
 
 
-def _sum_tensor(items: Sequence[Any]) -> Optional[Any]:
-    if not items:
-        return None
-    return sum(item.reshape(()) for item in items)
+def _update_return_normalizer(policy: IPPOPolicy, returns: Any, momentum: float = 0.95, eps: float = 1e-6) -> Any:
+    """Track raw return scale while keeping critic outputs in raw reward units."""
+
+    torch = policy.torch
+    device = returns.device
+    eps_value = max(float(eps), 1e-8)
+    momentum_value = max(0.0, min(0.9999, float(momentum)))
+    batch_mean = returns.detach().mean()
+    batch_var = returns.detach().var(unbiased=False) if len(returns) > 1 else torch.tensor(0.0, dtype=torch.float32, device=device)
+    batch_var = batch_var.clamp_min(eps_value * eps_value)
+    initialized = bool(getattr(policy, "_ppo_return_norm_initialized", False))
+    if not initialized:
+        mean = batch_mean
+        var = batch_var
+        policy._ppo_return_norm_initialized = True
+    else:
+        old_mean = getattr(policy, "_ppo_return_norm_mean").to(device=device)
+        old_var = getattr(policy, "_ppo_return_norm_var").to(device=device)
+        delta = batch_mean - old_mean
+        mean = momentum_value * old_mean + (1.0 - momentum_value) * batch_mean
+        var = momentum_value * old_var + (1.0 - momentum_value) * batch_var + momentum_value * (1.0 - momentum_value) * delta.pow(2)
+        var = var.clamp_min(eps_value * eps_value)
+    policy._ppo_return_norm_mean = mean.detach()
+    policy._ppo_return_norm_var = var.detach()
+    return policy._ppo_return_norm_mean.to(device=device), torch.sqrt(policy._ppo_return_norm_var.to(device=device)).clamp_min(eps_value)
 
 
 def _mean_tensor(items: List[Any]) -> Optional[Any]:
