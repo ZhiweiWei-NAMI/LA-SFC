@@ -368,6 +368,13 @@ def train_semantic_ippo_runtime(
         selection_rows: List[Dict[str, Any]] = []
         reward_rows: List[TrainingMetrics] = []
         progress_rows: List[Dict[str, Any]] = []
+        ppo_diagnostic_rows: List[Dict[str, Any]] = []
+        rollout_buffer: List[PPORolloutStep] = []
+        rollout_episode_count = 0
+        ppo_update_index = 0
+        rollout_episodes_per_update = max(1, int(marl_cfg.get("ippo_rollout_episodes_per_update", 1) or 1))
+        target_kl = float(marl_cfg.get("ippo_target_kl", 0.02) or 0.02)
+        max_grad_norm = float(marl_cfg.get("ippo_max_grad_norm", 0.5) or 0.5)
         for episode in range(int(episodes)):
             scenario = scenarios[episode % len(scenarios)]
             role = roles[episode % len(roles)]
@@ -412,7 +419,8 @@ def train_semantic_ippo_runtime(
                                     reward=float(mean_reward),
                                     old_log_prob=_tensor_float(step_log_prob),
                                     old_value=_tensor_float(step_value),
-                                    done=bool(done),
+                                    done=bool(done or step + 1 >= int(max_steps)),
+                                    episode=int(episode),
                                 )
                             )
                     summary_dict = info.get("summary", {})
@@ -434,18 +442,45 @@ def train_semantic_ippo_runtime(
                     if done:
                         break
                 if not pretrain_episode:
-                    _runtime_ippo_episode_update(
-                        policy,
-                        episode_steps,
-                        gamma=float(marl_cfg.get("ippo_gamma", 0.99) or 0.99),
-                        gae_lambda=float(marl_cfg.get("ippo_gae_lambda", 0.95) or 0.95),
-                        clip_eps=float(marl_cfg.get("ippo_clip_eps", 0.2) or 0.2),
-                        entropy_coef=float(marl_cfg.get("ippo_entropy_coef", 0.01) or 0.01),
-                        value_coef=float(marl_cfg.get("ippo_value_coef", 0.5) or 0.5),
-                        update_epochs=int(marl_cfg.get("ippo_update_epochs", 4) or 4),
-                        minibatch_size=int(marl_cfg.get("ippo_minibatch_size", 64) or 64),
-                        prior_l2_coef=float(marl_cfg.get("ippo_prior_l2_coef", 1e-3) or 0.0),
+                    if episode_steps:
+                        rollout_buffer.extend(episode_steps)
+                        rollout_episode_count += 1
+                    should_update = (
+                        rollout_episode_count >= rollout_episodes_per_update
+                        or episode == int(episodes) - 1
                     )
+                    if should_update and rollout_buffer:
+                        entropy_coef = _scheduled_ippo_entropy_coef(marl_cfg, episode)
+                        metrics = _runtime_ippo_episode_update(
+                            policy,
+                            rollout_buffer,
+                            gamma=float(marl_cfg.get("ippo_gamma", 0.99) or 0.99),
+                            gae_lambda=float(marl_cfg.get("ippo_gae_lambda", 0.95) or 0.95),
+                            clip_eps=float(marl_cfg.get("ippo_clip_eps", 0.2) or 0.2),
+                            entropy_coef=entropy_coef,
+                            value_coef=float(marl_cfg.get("ippo_value_coef", 0.5) or 0.5),
+                            update_epochs=int(marl_cfg.get("ippo_update_epochs", 4) or 4),
+                            minibatch_size=int(marl_cfg.get("ippo_minibatch_size", 64) or 64),
+                            prior_l2_coef=float(marl_cfg.get("ippo_prior_l2_coef", 1e-3) or 0.0),
+                            target_kl=target_kl,
+                            max_grad_norm=max_grad_norm,
+                        )
+                        ppo_update_index += 1
+                        ppo_diagnostic_rows.append(
+                            {
+                                "episode": int(episode),
+                                "seed": int(seed),
+                                "baseline": baseline,
+                                "update_index": ppo_update_index,
+                                "rollout_episodes": rollout_episode_count,
+                                "rollout_steps": len(rollout_buffer),
+                                "entropy_coef": entropy_coef,
+                                **metrics,
+                            }
+                        )
+                        _write_csv_dynamic(seed_dir / "ppo_diagnostics.csv", ppo_diagnostic_rows)
+                        rollout_buffer = []
+                        rollout_episode_count = 0
                 if episode == episodes - 1:
                     env.write_traces(str(seed_dir))
                     _write_runtime_trace_files(seed_dir, "semantic_runtime_train", baseline, scenario, role, seed, env)
@@ -460,7 +495,7 @@ def train_semantic_ippo_runtime(
                     _close_env(air_env)
                     air_env = None
                     validation_seeds = [
-                        int(seed) if offset == 0 else int(seed) + int(offset) + int(episode)
+                        int(seed) if offset == 0 else int(seed) + int(offset)
                         for offset in selection_seed_offsets
                     ]
                     validation_metrics = _evaluate_ippo_policy_selection_suite(
@@ -506,6 +541,7 @@ def train_semantic_ippo_runtime(
                 )
                 write_reward_curve(seed_dir / "reward_curve.csv", reward_rows)
                 _write_csv_dynamic(seed_dir / "train_progress.csv", progress_rows)
+                _write_csv_dynamic(seed_dir / "ppo_diagnostics.csv", ppo_diagnostic_rows)
                 progress_guard = _evaluate_training_progress_guard(progress_rows, marl_cfg)
                 if not progress_guard.get("passed", True):
                     _write_json(seed_dir / "training_progress_guard_failure.json", progress_guard)
@@ -1010,8 +1046,10 @@ def _runtime_ippo_episode_update(
     update_epochs: int = 4,
     minibatch_size: int = 64,
     prior_l2_coef: float = 0.0,
-) -> None:
-    ppo_update_policy(
+    target_kl: float = 0.02,
+    max_grad_norm: float = 0.5,
+) -> Dict[str, float]:
+    return ppo_update_policy(
         policy,
         episode_steps,
         gamma=gamma,
@@ -1021,8 +1059,21 @@ def _runtime_ippo_episode_update(
         value_coef=value_coef,
         update_epochs=update_epochs,
         minibatch_size=minibatch_size,
+        max_grad_norm=max_grad_norm,
         prior_l2_coef=prior_l2_coef,
+        target_kl=target_kl,
     )
+
+
+def _scheduled_ippo_entropy_coef(marl_cfg: Mapping[str, Any], episode: int) -> float:
+    fallback = float(marl_cfg.get("ippo_entropy_coef", 0.01) or 0.01)
+    if "ippo_entropy_coef_start" not in marl_cfg or "ippo_entropy_coef_end" not in marl_cfg:
+        return fallback
+    decay_episodes = max(1, int(marl_cfg.get("ippo_entropy_decay_episodes", 1) or 1))
+    start = float(marl_cfg.get("ippo_entropy_coef_start", fallback) or fallback)
+    end = float(marl_cfg.get("ippo_entropy_coef_end", fallback) or fallback)
+    progress = max(0.0, min(1.0, float(episode) / float(decay_episodes)))
+    return start + (end - start) * progress
 
 
 def _evaluate_ippo_policy_for_selection(
@@ -1184,6 +1235,7 @@ def _ippo_policy_kwargs(
         "observation_dim": int(obs_dim),
         "max_candidates": int(max_candidates),
         "seed": int(seed),
+        "lr": float(marl_cfg.get("ippo_lr", 3e-4) or 3e-4),
         "utility_prior_logit_weight": float(marl_cfg.get("ippo_utility_prior_logit_weight", 2.5) or 2.5),
         "route_unavailable_penalty": float(
             marl_cfg.get("ippo_route_unavailable_penalty", marl_cfg.get("ippo_expert_route_unavailable_penalty", 20.0))

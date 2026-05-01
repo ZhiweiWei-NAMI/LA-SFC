@@ -77,6 +77,7 @@ def main() -> None:
                 observation_dim=obs_dim,
                 max_candidates=max_candidates,
                 seed=args.seed,
+                lr=float(marl_cfg.get("ippo_lr", 3e-4) or 3e-4),
                 centralized_critic=bool(marl_cfg.get("ippo_centralized_critic", True)),
                 critic_observation_dim=obs_dim * max(1, critic_agents),
                 max_critic_agents=max(1, critic_agents),
@@ -93,7 +94,32 @@ def main() -> None:
                 prior_l2_coef=float(marl_cfg.get("ippo_prior_l2_coef", 1e-3) or 0.0),
                 device=str(marl_cfg.get("ippo_device", "") or "") or None,
             )
-            trainer = IPPOTrainer(env, policy)
+            trainer = IPPOTrainer(
+                env,
+                policy,
+                gamma=float(marl_cfg.get("ippo_gamma", 0.99) or 0.99),
+                clip_eps=float(marl_cfg.get("ippo_clip_eps", 0.2) or 0.2),
+                gae_lambda=float(marl_cfg.get("ippo_gae_lambda", 0.95) or 0.95),
+                entropy_coef=float(marl_cfg.get("ippo_entropy_coef", 0.01) or 0.01),
+                value_coef=float(marl_cfg.get("ippo_value_coef", 0.5) or 0.5),
+                update_epochs=int(marl_cfg.get("ippo_update_epochs", 4) or 4),
+                minibatch_size=int(marl_cfg.get("ippo_minibatch_size", 64) or 64),
+                prior_l2_coef=float(marl_cfg.get("ippo_prior_l2_coef", 1e-3) or 0.0),
+                target_kl=float(marl_cfg.get("ippo_target_kl", 0.02) or 0.02),
+                rollout_episodes_per_update=int(marl_cfg.get("ippo_rollout_episodes_per_update", 1) or 1),
+                max_grad_norm=float(marl_cfg.get("ippo_max_grad_norm", 0.5) or 0.5),
+                entropy_coef_start=(
+                    float(marl_cfg["ippo_entropy_coef_start"])
+                    if "ippo_entropy_coef_start" in marl_cfg
+                    else None
+                ),
+                entropy_coef_end=(
+                    float(marl_cfg["ippo_entropy_coef_end"])
+                    if "ippo_entropy_coef_end" in marl_cfg
+                    else None
+                ),
+                entropy_decay_episodes=int(marl_cfg.get("ippo_entropy_decay_episodes", 0) or 0),
+            )
             rows = trainer.train(episodes=episodes, max_steps=max_steps, output_dir=str(output_dir))
         else:
             policy = policy_from_name(args.policy, seed=args.seed)

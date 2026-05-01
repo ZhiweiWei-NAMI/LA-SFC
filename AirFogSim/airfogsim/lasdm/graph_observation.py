@@ -189,7 +189,7 @@ class GraphObservationBuilder:
                 semantic_score,
                 staleness,
                 1.0 if candidate.is_remote else 0.0,
-                min(1.0, float(candidate.metadata.get("freshness", 1.0))),
+                min(1.0, float(candidate.metadata.get("freshness", 1.0))) if temporal_enabled else 0.0,
                 min(1.0, float(candidate.metadata.get("health_score", 1.0))),
                 min(1.0, float(candidate.metadata.get("load_ratio", 0.0))) if topology_enabled else 0.0,
                 min(1.0, candidate.payload_bytes / 4096.0),

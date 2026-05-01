@@ -324,9 +324,20 @@ marl:
   ippo_behavior_clone_steps_per_observation: 4
   ippo_behavior_clone_finetune_steps_per_observation: 0
   ippo_reward_curve_policy_only: true
-  ippo_update_epochs: 4
-  ippo_minibatch_size: 128
+  ippo_gamma: 0.99
+  ippo_clip_eps: 0.12
+  ippo_gae_lambda: 0.95
+  ippo_value_coef: 0.5
+  ippo_update_epochs: 2
+  ippo_minibatch_size: 256
   ippo_entropy_coef: 0.01
+  ippo_target_kl: 0.02
+  ippo_rollout_episodes_per_update: 4
+  ippo_max_grad_norm: 0.5
+  ippo_lr: 0.0001
+  ippo_entropy_coef_start: 0.02
+  ippo_entropy_coef_end: 0.003
+  ippo_entropy_decay_episodes: 120
   ippo_checkpoint_selection_interval: 20
   ippo_checkpoint_selection_max_steps: 80
   ippo_checkpoint_selection_seed_offsets: [1000]

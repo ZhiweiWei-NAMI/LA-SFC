@@ -34,6 +34,7 @@ class PPORolloutStep:
     old_log_prob: float
     old_value: float
     done: bool
+    episode: int = 0
 
 
 class HeuristicEvaluator:
@@ -87,6 +88,13 @@ class IPPOTrainer:
         value_coef: float = 0.5,
         update_epochs: int = 4,
         minibatch_size: int = 64,
+        prior_l2_coef: float = 0.0,
+        target_kl: float = 0.02,
+        rollout_episodes_per_update: int = 1,
+        max_grad_norm: float = 0.5,
+        entropy_coef_start: Optional[float] = None,
+        entropy_coef_end: Optional[float] = None,
+        entropy_decay_episodes: int = 0,
     ):
         self.env = env
         self.policy = policy
@@ -97,9 +105,20 @@ class IPPOTrainer:
         self.value_coef = float(value_coef)
         self.update_epochs = int(update_epochs)
         self.minibatch_size = int(minibatch_size)
+        self.prior_l2_coef = float(prior_l2_coef)
+        self.target_kl = float(target_kl)
+        self.rollout_episodes_per_update = max(1, int(rollout_episodes_per_update))
+        self.max_grad_norm = float(max_grad_norm)
+        self.entropy_coef_start = None if entropy_coef_start is None else float(entropy_coef_start)
+        self.entropy_coef_end = None if entropy_coef_end is None else float(entropy_coef_end)
+        self.entropy_decay_episodes = max(0, int(entropy_decay_episodes))
 
     def train(self, episodes: int = 10, max_steps: int = 100, output_dir: Optional[str] = None) -> List[TrainingMetrics]:
         rows: List[TrainingMetrics] = []
+        diagnostics: List[Dict[str, Any]] = []
+        rollout_buffer: List[PPORolloutStep] = []
+        rollout_episode_count = 0
+        update_index = 0
         for episode in range(int(episodes)):
             observations = self.env.reset()
             total = 0.0
@@ -120,7 +139,8 @@ class IPPOTrainer:
                             reward=float(mean_reward),
                             old_log_prob=_tensor_float(step_log_prob),
                             old_value=_tensor_float(step_value),
-                            done=bool(done),
+                            done=bool(done or step + 1 >= int(max_steps)),
+                            episode=int(episode),
                         )
                     )
                 summary = info.get("summary", {})
@@ -138,23 +158,50 @@ class IPPOTrainer:
                 )
                 if done:
                     break
-            self.update_policy(episode_steps)
+            if episode_steps:
+                rollout_buffer.extend(episode_steps)
+                rollout_episode_count += 1
+            should_update = rollout_episode_count >= self.rollout_episodes_per_update or episode == int(episodes) - 1
+            if should_update and rollout_buffer:
+                metrics = self.update_policy(rollout_buffer, episode=episode)
+                update_index += 1
+                diagnostics.append(
+                    {
+                        "episode": int(episode),
+                        "update_index": update_index,
+                        "rollout_episodes": rollout_episode_count,
+                        "rollout_steps": len(rollout_buffer),
+                        **metrics,
+                    }
+                )
+                rollout_buffer = []
+                rollout_episode_count = 0
         if output_dir is not None:
             self.write_outputs(output_dir, rows)
+            write_ppo_diagnostics(Path(output_dir) / "ppo_diagnostics.csv", diagnostics)
         return rows
 
-    def update_policy(self, episode_steps: Sequence[PPORolloutStep]) -> None:
-        ppo_update_policy(
+    def update_policy(self, episode_steps: Sequence[PPORolloutStep], episode: int = 0) -> Dict[str, float]:
+        return ppo_update_policy(
             self.policy,
             episode_steps,
             gamma=self.gamma,
             gae_lambda=self.gae_lambda,
             clip_eps=self.clip_eps,
-            entropy_coef=self.entropy_coef,
+            entropy_coef=self._entropy_coef_for_episode(episode),
             value_coef=self.value_coef,
             update_epochs=self.update_epochs,
             minibatch_size=self.minibatch_size,
+            max_grad_norm=self.max_grad_norm,
+            prior_l2_coef=self.prior_l2_coef,
+            target_kl=self.target_kl,
         )
+
+    def _entropy_coef_for_episode(self, episode: int) -> float:
+        if self.entropy_coef_start is None or self.entropy_coef_end is None or self.entropy_decay_episodes <= 0:
+            return self.entropy_coef
+        progress = max(0.0, min(1.0, float(episode) / float(self.entropy_decay_episodes)))
+        return self.entropy_coef_start + (self.entropy_coef_end - self.entropy_coef_start) * progress
 
     def write_outputs(self, output_dir: str, rows: List[TrainingMetrics]) -> None:
         target = Path(output_dir)
@@ -182,6 +229,18 @@ def write_reward_curve(path: str | Path, rows: List[TrainingMetrics]) -> None:
             writer.writerow(row.to_dict())
 
 
+def write_ppo_diagnostics(path: str | Path, rows: Sequence[Mapping[str, Any]]) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = sorted({key for row in rows for key in row.keys()})
+    with path.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        if fieldnames:
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(dict(row))
+
+
 def ppo_update_policy(
     policy: IPPOPolicy,
     rollout: Sequence[PPORolloutStep],
@@ -194,6 +253,7 @@ def ppo_update_policy(
     minibatch_size: int = 64,
     max_grad_norm: float = 0.5,
     prior_l2_coef: float = 0.0,
+    target_kl: float = 0.02,
 ) -> Dict[str, float]:
     if not rollout:
         return {}
@@ -203,6 +263,8 @@ def ppo_update_policy(
     old_values = torch.tensor([step.old_value for step in rollout], dtype=torch.float32, device=device)
     old_log_probs = torch.tensor([step.old_log_prob for step in rollout], dtype=torch.float32, device=device)
     dones = torch.tensor([1.0 if step.done else 0.0 for step in rollout], dtype=torch.float32, device=device)
+    raw_advantage_mean = torch.tensor(0.0, dtype=torch.float32, device=device)
+    raw_advantage_std = torch.tensor(0.0, dtype=torch.float32, device=device)
 
     advantages = torch.zeros_like(rewards)
     last_gae = torch.tensor(0.0, dtype=torch.float32, device=device)
@@ -213,6 +275,9 @@ def ppo_update_policy(
         last_gae = delta + float(gamma) * float(gae_lambda) * nonterminal * last_gae
         advantages[index] = last_gae
     returns = advantages + old_values
+    if len(rollout) > 0:
+        raw_advantage_mean = advantages.mean()
+        raw_advantage_std = advantages.std(unbiased=False) if len(rollout) > 1 else torch.tensor(0.0, dtype=torch.float32, device=device)
     if len(rollout) > 1:
         std = advantages.std(unbiased=False)
         if float(std.item()) > 1e-6:
@@ -220,8 +285,25 @@ def ppo_update_policy(
 
     batch_size = max(1, min(int(minibatch_size), len(rollout)))
     update_epochs = max(1, int(update_epochs))
-    metrics: Dict[str, float] = {}
-    for _epoch in range(update_epochs):
+    target_kl_value = max(0.0, float(target_kl or 0.0))
+    metrics: Dict[str, float] = {
+        "loss": 0.0,
+        "actor_loss": 0.0,
+        "critic_loss": 0.0,
+        "entropy": 0.0,
+        "approx_kl": 0.0,
+        "clip_fraction": 0.0,
+        "grad_norm": 0.0,
+        "prior_l2": 0.0,
+        "mean_advantage": float(raw_advantage_mean.detach().cpu().item()),
+        "std_advantage": float(raw_advantage_std.detach().cpu().item()),
+        "updates": 0.0,
+        "epochs_completed": 0.0,
+        "target_kl": target_kl_value,
+        "stopped_early": 0.0,
+    }
+    stop_early = False
+    for epoch in range(update_epochs):
         permutation = torch.randperm(len(rollout), device=device)
         for start in range(0, len(rollout), batch_size):
             batch_indices = permutation[start : start + batch_size]
@@ -244,6 +326,9 @@ def ppo_update_policy(
             batch_returns = returns[index_tensor]
             batch_old_values = old_values[index_tensor]
             ratio = torch.exp(new_log_probs - batch_old_log_probs)
+            log_ratio = new_log_probs - batch_old_log_probs
+            approx_kl = ((ratio - 1.0) - log_ratio).mean()
+            clip_fraction = ((ratio - 1.0).abs() > float(clip_eps)).float().mean()
             unclipped_actor = ratio * batch_advantages
             clipped_actor = torch.clamp(ratio, 1.0 - float(clip_eps), 1.0 + float(clip_eps)) * batch_advantages
             actor_loss = -torch.min(unclipped_actor, clipped_actor).mean()
@@ -262,15 +347,45 @@ def ppo_update_policy(
 
             policy.optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(policy.model.parameters(), float(max_grad_norm))
+            grad_norm = torch.nn.utils.clip_grad_norm_(policy.model.parameters(), float(max_grad_norm))
             policy.optimizer.step()
+            with torch.no_grad():
+                post_evaluations = []
+                post_old_log_probs = []
+                for raw_index in valid_indices:
+                    post_eval = policy.evaluate_actions(rollout[raw_index].observations, rollout[raw_index].actions)
+                    if post_eval is not None:
+                        post_evaluations.append(post_eval)
+                        post_old_log_probs.append(old_log_probs[raw_index])
+                if post_evaluations:
+                    post_log_probs = torch.stack([item.log_prob_tensor.reshape(()) for item in post_evaluations])
+                    post_old = torch.stack([item.reshape(()) for item in post_old_log_probs])
+                    post_ratio = torch.exp(post_log_probs - post_old)
+                    post_log_ratio = post_log_probs - post_old
+                    approx_kl = ((post_ratio - 1.0) - post_log_ratio).mean()
+                    clip_fraction = ((post_ratio - 1.0).abs() > float(clip_eps)).float().mean()
             metrics = {
                 "loss": float(loss.detach().cpu().item()),
                 "actor_loss": float(actor_loss.detach().cpu().item()),
                 "critic_loss": float(critic_loss.detach().cpu().item()),
                 "entropy": float(entropy_bonus.detach().cpu().item()),
+                "approx_kl": float(approx_kl.detach().cpu().item()),
+                "clip_fraction": float(clip_fraction.detach().cpu().item()),
+                "grad_norm": float(grad_norm.detach().cpu().item()),
                 "prior_l2": float(prior_l2.detach().cpu().item()) if prior_l2 is not None else 0.0,
+                "mean_advantage": float(raw_advantage_mean.detach().cpu().item()),
+                "std_advantage": float(raw_advantage_std.detach().cpu().item()),
+                "updates": float(metrics.get("updates", 0.0) + 1.0),
+                "epochs_completed": float(epoch + 1),
+                "target_kl": target_kl_value,
+                "stopped_early": 0.0,
             }
+            if target_kl_value > 0.0 and float(approx_kl.detach().cpu().item()) > 1.5 * target_kl_value:
+                metrics["stopped_early"] = 1.0
+                stop_early = True
+                break
+        if stop_early:
+            break
     return metrics
 
 
