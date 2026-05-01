@@ -16,11 +16,9 @@ build/
 *.run
 **/runs/**
 tripinfo.xml
-tripinfo.csv
 
-# Data files
-*.csv
-*.json
+# Data files (scoped: only binary/large formats, not CSV/JSON
+# which may be config/manifest/input files)
 *.pkl
 *.h5
 *.npy

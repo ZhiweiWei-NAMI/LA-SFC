@@ -435,12 +435,8 @@ class SemanticTopologyMARLEnv:
                 continue
             chain_order = list(chain.topological_order())
             discovered: Dict[str, List[CatalogCandidate]] = {}
-            semantic_discovery_enabled = bool(self.config.include_semantic_features)
             discovery_top_k = int(self.config.semantic_top_k)
             discovery_min_similarity = float(self.config.min_semantic_similarity)
-            if not semantic_discovery_enabled:
-                discovery_top_k = max(discovery_top_k * 16, 256)
-                discovery_min_similarity = -1.0
             for sfc_node_id in order:
                 discovered[sfc_node_id] = self.discovery_protocol.discover_sfc_node(
                     agent_id,
@@ -584,33 +580,8 @@ class SemanticTopologyMARLEnv:
                         source: float(fields.get(field, 0.0) or 0.0) for source, fields in source_metrics.items()
                     }
                 enriched.append(replace(candidate, metadata=metadata))
-            if not self.config.include_semantic_features:
-                enriched = self._semantic_blind_runtime_order(enriched)
             enriched_by_node[sfc_node_id] = enriched
         return enriched_by_node
-
-    def _semantic_blind_runtime_order(self, candidates: Sequence[CatalogCandidate]) -> List[CatalogCandidate]:
-        node_type_rank = {"rsu": 0, "vehicle": 1, "uav": 2, "cloud_server": 3}
-
-        def key(candidate: CatalogCandidate) -> Tuple[float, int, float, float, float, float, int, int, str, str]:
-            metadata = dict(candidate.metadata or {})
-            route_available = float(metadata.get("route_available", 0.0) or 0.0)
-            deadline_slack = float(metadata.get("deadline_slack_s", 0.0) or 0.0)
-            deadline_violation = 1 if deadline_slack < 0.0 else 0
-            return (
-                -route_available,
-                deadline_violation,
-                max(0.0, -deadline_slack),
-                float(metadata.get("expected_runtime_penalty_s", 0.0) or 0.0),
-                float(metadata.get("route_tx_time_s", 0.0) or 0.0),
-                float(metadata.get("load_ratio", 0.0) or 0.0),
-                1 if candidate.is_remote else 0,
-                node_type_rank.get(str(candidate.node_type), 9),
-                str(candidate.region_id),
-                str(candidate.instance_id),
-            )
-
-        return sorted(candidates, key=key)
 
     def _completed_predecessor_output_node(self, sfc_id: str, sfc_node_id: str) -> str:
         outputs = getattr(self.runtime_bridge, "node_outputs", {}) or {}

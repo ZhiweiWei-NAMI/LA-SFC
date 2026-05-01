@@ -483,6 +483,7 @@ def train_semantic_ippo_runtime(
                         **validation_metrics,
                     }
                     selection_rows.append(selection_row)
+                    _write_csv_dynamic(seed_dir / "checkpoint_selection.csv", selection_rows)
                     if validation_score > best_score:
                         best_score = validation_score
                         best_state = copy.deepcopy(policy.model.state_dict())

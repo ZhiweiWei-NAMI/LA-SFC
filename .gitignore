@@ -13,10 +13,11 @@ analysis/
 *.onnx
 
 # ============================================================
-# Large Data Files
+# Large Data Files (experiment_artifacts/ and analysis/ are
+# already fully ignored; these globs only catch stray files
+# outside those directories — keep scoped to avoid hiding
+# config/input CSVs or JSONL manifests.)
 # ============================================================
-*.csv
-*.jsonl
 *.pkl
 *.h5
 *.npy

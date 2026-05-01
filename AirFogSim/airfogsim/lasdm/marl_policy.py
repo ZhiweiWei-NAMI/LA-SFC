@@ -206,10 +206,10 @@ class TopologyGreedyPolicy(SemanticGreedyPolicy):
                 score -= self.route_unavailable_penalty
             score -= self.cold_start_penalty * float(metadata.get("cold_start_s", candidate.get("cold_start_s", 0.0)) or 0.0)
             score -= overload_count * (task_cpu / effective_cpu) / budget
+            if deadline_slack < 0.0:
+                score -= self.deadline_violation_penalty * (1.0 + abs(deadline_slack) / budget)
+            score -= self.runtime_penalty * expected_runtime_penalty / budget
             if self.semantic_weight > 0.0:
-                if deadline_slack < 0.0:
-                    score -= self.deadline_violation_penalty * (1.0 + abs(deadline_slack) / budget)
-                score -= self.runtime_penalty * expected_runtime_penalty / budget
                 score -= self.semantic_mismatch_penalty * max(0.0, 1.0 - semantic_score) ** 2
             if candidate.get("node_type") == "uav":
                 score -= self.uav_energy_penalty
