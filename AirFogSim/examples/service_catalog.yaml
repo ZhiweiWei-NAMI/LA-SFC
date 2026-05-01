@@ -1,0 +1,196 @@
+microservices:
+  - ms_id: c2_qos_monitor
+    category: connectivity/C2
+    provides: [c2_monitoring, qos_monitoring]
+    cpu_per_mb: 0.02
+    memory_mb: 64
+    input_semantic: telemetry
+    output_semantic: c2_status
+    output_ratio: 0.05
+    allowed_node_types: [uav, rsu]
+    cold_start_s: 0.02
+
+  - ms_id: remote_id_check
+    category: airspace_governance
+    provides: [remote_id, identity_check]
+    cpu_per_mb: 0.03
+    memory_mb: 64
+    input_semantic: telemetry
+    output_semantic: identity_status
+    output_ratio: 0.02
+    allowed_node_types: [uav, rsu, cloud_server]
+    min_trust: 0.6
+
+  - ms_id: route_compliance_check
+    category: airspace_governance
+    provides: [route_compliance, geo_zone_check]
+    cpu_per_mb: 0.04
+    memory_mb: 128
+    input_semantic: trajectory
+    output_semantic: compliance_status
+    output_ratio: 0.03
+    allowed_node_types: [rsu, cloud_server]
+
+  - ms_id: flight_authorization_gateway
+    category: airspace_governance
+    provides: [flight_authorization, authorization_check]
+    cpu_per_mb: 0.05
+    memory_mb: 128
+    input_semantic: compliance_status
+    output_semantic: authorization_status
+    output_ratio: 0.05
+    allowed_node_types: [rsu, cloud_server]
+    min_trust: 0.8
+
+  - ms_id: conformance_monitor
+    category: airspace_governance
+    provides: [conformance_monitoring, conformance_check]
+    cpu_per_mb: 0.04
+    memory_mb: 128
+    input_semantic: authorization_status
+    output_semantic: conformance_status
+    output_ratio: 0.04
+    allowed_node_types: [rsu, cloud_server]
+    min_trust: 0.7
+
+  - ms_id: keyframe_extraction
+    category: sensing/situation_awareness
+    provides: [video_preprocess, keyframe]
+    cpu_per_mb: 0.08
+    memory_mb: 128
+    input_semantic: video
+    output_semantic: keyframes
+    output_ratio: 0.20
+    allowed_node_types: [uav, rsu]
+
+  - ms_id: lightweight_object_detection
+    category: edge_intelligence/computing
+    provides: [object_detection, lightweight_inference]
+    cpu_per_mb: 0.25
+    memory_mb: 512
+    input_semantic: keyframes
+    output_semantic: detection_result
+    output_ratio: 0.08
+    allowed_node_types: [uav, rsu]
+
+  - ms_id: semantic_compression
+    category: sensing/situation_awareness
+    provides: [semantic_compression, payload_reduction]
+    cpu_per_mb: 0.06
+    memory_mb: 128
+    input_semantic: detection_result
+    output_semantic: semantic_event
+    output_ratio: 0.05
+    allowed_node_types: [uav, rsu]
+
+  - ms_id: target_tracking_filter
+    category: sensing/situation_awareness
+    provides: [target_tracking, target_reacquisition]
+    cpu_per_mb: 0.16
+    memory_mb: 256
+    input_semantic: detection_result
+    output_semantic: target_track
+    output_ratio: 0.07
+    allowed_node_types: [uav, rsu]
+
+  - ms_id: situation_fusion
+    category: sensing/situation_awareness
+    provides: [situation_fusion, event_fusion]
+    cpu_per_mb: 0.12
+    memory_mb: 512
+    input_semantic: any
+    output_semantic: fused_situation
+    output_ratio: 0.10
+    allowed_node_types: [rsu, cloud_server]
+
+  - ms_id: edge_object_verification
+    category: edge_intelligence/computing
+    provides: [object_verification, high_accuracy_inference]
+    cpu_per_mb: 0.45
+    memory_mb: 1024
+    input_semantic: detection_result
+    output_semantic: verified_event
+    output_ratio: 0.20
+    allowed_node_types: [rsu, cloud_server]
+
+  - ms_id: conflict_prediction
+    category: trajectory/cooperative_control
+    provides: [conflict_prediction, detect_and_avoid]
+    cpu_per_mb: 0.10
+    memory_mb: 256
+    input_semantic: trajectory
+    output_semantic: conflict_risk
+    output_ratio: 0.05
+    allowed_node_types: [uav, rsu]
+
+  - ms_id: trajectory_replan
+    category: trajectory/cooperative_control
+    provides: [trajectory_replan, local_daa]
+    cpu_per_mb: 0.08
+    memory_mb: 256
+    input_semantic: target_track
+    output_semantic: trajectory
+    output_ratio: 0.08
+    allowed_node_types: [uav, rsu]
+
+  - ms_id: relay_selector
+    category: connectivity/C2
+    provides: [relay_select, link_relay]
+    cpu_per_mb: 0.03
+    memory_mb: 96
+    input_semantic: c2_status
+    output_semantic: relay_plan
+    output_ratio: 0.04
+    allowed_node_types: [uav, rsu]
+
+  - ms_id: inspection_report
+    category: mission_oriented_application
+    provides: [mission_report, report_generation]
+    cpu_per_mb: 0.05
+    memory_mb: 128
+    input_semantic: verified_event
+    output_semantic: mission_report
+    output_ratio: 0.10
+    allowed_node_types: [rsu, cloud_server]
+
+  - ms_id: eta_update_service
+    category: mission_oriented_application
+    provides: [eta_update, logistics_report]
+    cpu_per_mb: 0.04
+    memory_mb: 128
+    input_semantic: conformance_status
+    output_semantic: mission_report
+    output_ratio: 0.08
+    allowed_node_types: [rsu, cloud_server]
+
+  - ms_id: alert_publisher
+    category: mission_oriented_application
+    provides: [alert_publish, emergency_report]
+    cpu_per_mb: 0.04
+    memory_mb: 128
+    input_semantic: fused_situation
+    output_semantic: mission_report
+    output_ratio: 0.08
+    allowed_node_types: [rsu, cloud_server]
+
+  - ms_id: resilience_degradation
+    category: continuity/resilience
+    provides: [resilience, degradation]
+    cpu_per_mb: 0.02
+    memory_mb: 64
+    input_semantic: any
+    output_semantic: resilience_policy
+    output_ratio: 0.02
+    allowed_node_types: [uav, rsu]
+
+  - ms_id: service_checkpoint
+    category: continuity/resilience
+    provides: [checkpoint, service_checkpoint]
+    cpu_per_mb: 0.03
+    memory_mb: 128
+    storage_mb: 128
+    input_semantic: any
+    output_semantic: checkpoint_state
+    output_ratio: 0.03
+    allowed_node_types: [uav, rsu, cloud_server]
+    stateful: true

@@ -1,0 +1,26 @@
+experiment:
+  name: aso_airfogsim_local_map_smoke
+  mode: airfogsim
+  baselines:
+    - proposed
+  seeds: [0]
+  catalog_path: examples/service_catalog.yaml
+  intents_path: examples/task_intents.yaml
+  airfogsim_config_path: examples/config_local_map_agentic_service.yaml
+  smoke_max_rounds: 16
+  airfogsim_max_steps: 20
+
+intent_source:
+  smoke:
+    type: static_yaml
+  airfogsim:
+    type: poisson_low_altitude
+    arrival_prob: 0.4
+
+output:
+  root_dir: experiment_artifacts/raw_data/agentic_service_orchestration
+  write_manifest: true
+  write_per_run_json: true
+  write_summary_csv: true
+  write_aggregate_csv: true
+  overwrite: false

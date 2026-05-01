@@ -1,0 +1,95 @@
+intents:
+  - intent_id: urban_monitoring
+    source_node_id: UAV_0
+    category: mission_oriented_application
+    required_capabilities:
+      - video_preprocess
+      - lightweight_inference
+      - semantic_compression
+      - situation_fusion
+      - alert_publish
+    payload:
+      semantic_type: video
+      input_mb: 4.0
+    qos:
+      deadline_s: 2.0
+      priority: 0.8
+      accuracy_min: 0.7
+    context:
+      scenario: urban_monitoring
+      risk_level: 0.3
+    sink_node_id: UAV_0
+
+  - intent_id: logistics_governance
+    source_node_id: UAV_0
+    category: airspace_governance
+    required_capabilities:
+      - remote_id
+      - route_compliance
+      - flight_authorization
+      - conformance_monitoring
+      - eta_update
+    payload:
+      semantic_type: telemetry
+      input_mb: 0.2
+    qos:
+      deadline_s: 1.0
+      priority: 1.0
+      reliability_min: 0.99
+    context:
+      scenario: logistics_governance
+      risk_level: 0.9
+      airspace_event: true
+    sink_node_id: UAV_0
+
+  - intent_id: target_tracking_search
+    source_node_id: UAV_1
+    category: sensing/situation_awareness
+    required_capabilities:
+      - video_preprocess
+      - lightweight_inference
+      - target_tracking
+      - trajectory_replan
+      - situation_fusion
+      - alert_publish
+    payload:
+      semantic_type: video
+      input_mb: 6.0
+    qos:
+      deadline_s: 2.2
+      priority: 1.0
+      reliability_min: 0.95
+    context:
+      scenario: target_tracking_search
+      risk_level: 0.85
+      target_lost: true
+    sink_node_id: UAV_1
+
+  - intent_id: c2_continuity_emergency
+    source_node_id: UAV_1
+    category: continuity/resilience
+    required_capabilities:
+      - video_preprocess
+      - lightweight_inference
+      - c2_monitoring
+      - relay_select
+      - object_verification
+      - checkpoint
+      - resilience
+    payload:
+      semantic_type: video
+      input_mb: 6.0
+    qos:
+      deadline_s: 2.0
+      priority: 1.0
+      reliability_min: 0.95
+    context:
+      scenario: c2_continuity_emergency
+      risk_level: 0.95
+      link_degraded: true
+      shared_prefix_capabilities: [video_preprocess]
+      parallel_capability_groups:
+        - [lightweight_inference, object_verification]
+        - [c2_monitoring, relay_select]
+      fusion_capabilities: [checkpoint, resilience]
+    sink_node_id: UAV_1

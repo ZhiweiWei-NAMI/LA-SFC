@@ -1,0 +1,210 @@
+simulation:
+  vehicle_count: 100
+  max_simulation_time: 600
+  simulation_interval: 1
+  traffic_interval: 1
+
+sumo:
+  sumo_config: "../sumo_local_map/map.sumocfg"
+  sumo_osm: "../sumo_local_map/map.osm"
+  sumo_net: "../sumo_local_map/map.net.xml"
+  sumo_port: 8899
+  export_tripinfo: false
+  tripinfo_output: "../sumo_local_map/airfogsim_full_output.xml"
+
+visualization:
+  icon_path: "./icon"
+
+traffic:
+  traffic_mode: "replay"
+  tripinfo: "../sumo_local_map/unified_vehicle_trajectories.csv"
+  uav_traffic_file: "../sumo_local_map/unified_uav_trajectories.csv"
+  traffic_interval: 1
+  x_range: [5150, 7150]
+  y_range: [5300, 7300]
+  UAV_z_range: [100, 200]
+  UAV_speed_range: [10, 30]
+  max_n_vehicles: 100
+  max_n_UAVs: 20
+  active_uav_count: 20
+  vehicle_speed_scale: 1.0
+  uav_speed_scale: 1.0
+  RSU_positions:
+    - [5300, 5500, 0]
+    - [7000, 5500, 0]
+    - [5300, 7100, 0]
+    - [7000, 7100, 0]
+  max_n_cloudServers: 1
+  cloud_server_ids: ["cloudServer_0"]
+  cloud_server_positions:
+    - [6150, 6300, 0]
+  arrival_lambda: 1
+  distance_threshold: 50
+  nonfly_zone_coordinates: []
+
+task:
+  tti_threshold: 60.0
+  hard_ddl: 80.0
+  task_generation_model: "None"
+  task_generation_kwargs:
+    lambda: 0.5
+  task_min_cpu: 0.01
+  task_max_cpu: 10.0
+  task_min_size: 0.01
+  task_max_size: 50.0
+  task_min_required_returned_size: 0.0
+  task_max_required_returned_size: 50.0
+  task_min_deadline: 0.5
+  task_max_deadline: 5.0
+  task_min_priority: 0.5
+  task_max_priority: 1.0
+  cpu_model: "Uniform"
+  cpu_kwargs:
+    low: 0.2
+    high: 0.7
+  size_model: "Uniform"
+  size_kwargs:
+    low: 0.2
+    high: 0.7
+  deadline_model: "Uniform"
+  deadline_kwargs:
+    low: 0.5
+    high: 1.0
+  priority_model: "Uniform"
+  priority_kwargs:
+    low: 0.5
+    high: 1.0
+  required_returned_size_model: "Uniform"
+  required_returned_size_kwargs:
+    low: 0.0
+    high: 0.0
+
+task_profile:
+  task_node_gen_poss: 0.5
+  task_node_profiles: [{type: UAV, max_node_num: 20}, {type: vehicle, max_node_num: 100}]
+  vehicle:
+    lambda: 0.0
+    dag_edge_prob: 0.0
+  uav:
+    lambda: 0.0
+    dag_edge_prob: 0.0
+  rsu:
+    lambda: 0.0
+    dag_edge_prob: 0.0
+  cloud_server:
+    lambda: 0.0
+    dag_edge_prob: 0.0
+
+fog_profile:
+  vehicle:
+    cpu: 12
+    memory: 4096
+    storage: 4096
+  uav:
+    cpu: 8
+    memory: 4096
+    storage: 4096
+  rsu:
+    cpu: 80
+    memory: 32768
+    storage: 20000
+  cloud_server:
+    cpu: 200
+    memory: 131072
+    storage: 1000000
+
+state_attribute:
+  log_state: false
+  time_window: 3
+  fog_node_state_attributes: [position_x, position_y, position_z, speed, fog_profile, node_type]
+  task_node_state_attributes: [position_x, position_y, position_z, speed, task_profile, node_type]
+  task_state_attributes: [task_node_id, task_size, task_cpu, required_returned_size, task_deadline, task_priority, task_arrival_time, task_lifecycle_state]
+
+channel:
+  outage_model: "Rayleigh"
+  outage_snr_threshold: 10
+  V2V:
+    pathloss_model: "V2V_urban_tr37885"
+    shadowing_model: "3GPP_LogNormal"
+    fastfading_model: "Rayleigh"
+  V2I:
+    pathloss_model: "UMa_LOS_tr38901"
+    shadowing_model: "3GPP_LogNormal"
+    fastfading_model: "Rayleigh"
+  V2U:
+    pathloss_model: "free_space"
+    shadowing_model: "3GPP_LogNormal"
+    fastfading_model: "Rayleigh"
+  U2I:
+    pathloss_model: "free_space"
+    shadowing_model: "3GPP_LogNormal"
+    fastfading_model: "Rayleigh"
+  U2U:
+    pathloss_model: "free_space"
+    shadowing_model: "3GPP_LogNormal"
+    fastfading_model: "Rayleigh"
+  I2I:
+    pathloss_model: "free_space"
+    shadowing_model: "3GPP_LogNormal"
+    fastfading_model: "Rayleigh"
+
+sensing:
+  sensors_per_node: 4
+  node_type: [UAV, vehicle]
+  sensor_type_num: 4
+
+mission:
+  UAV_height: 100
+  TTL_range: [100, 200]
+  duration_range: [5, 10]
+  mission_size_range: [10, 20]
+  sensor_accuracy_range: [0, 1]
+  distance_threshold: 150
+  predictable_seconds: 2
+  mission_generation_model: "Poisson"
+  x_range: [5150, 7150]
+  y_range: [5300, 7300]
+  generation_model_args:
+    Poisson:
+      lambda: 0
+    Uniform:
+      low: 0
+      high: 1
+    Normal:
+      mean: 0
+      std: 1
+    Exponential:
+      beta: 1
+
+energy:
+  initial_energy_range: [48000, 52000]
+  fly_unit_cost: 2.5
+  hover_unit_cost: 1.2
+  sensing_unit_cost: 0.5
+  receive_unit_cost: 0.1
+  send_unit_cost: 0.1
+
+wired:
+  edges:
+    - {u: "RSU_0", v: "RSU_1", capacity_mbps: 500, prop_ms: 1.0}
+    - {u: "RSU_0", v: "RSU_2", capacity_mbps: 500, prop_ms: 1.0}
+    - {u: "RSU_0", v: "RSU_3", capacity_mbps: 350, prop_ms: 2.0}
+    - {u: "RSU_1", v: "RSU_2", capacity_mbps: 350, prop_ms: 2.0}
+    - {u: "RSU_1", v: "RSU_3", capacity_mbps: 500, prop_ms: 1.0}
+    - {u: "RSU_2", v: "RSU_3", capacity_mbps: 500, prop_ms: 1.0}
+    - {u: "RSU_0", v: "cloudServer_0", capacity_mbps: 300, prop_ms: 5.0}
+    - {u: "RSU_1", v: "cloudServer_0", capacity_mbps: 300, prop_ms: 5.0}
+    - {u: "RSU_2", v: "cloudServer_0", capacity_mbps: 300, prop_ms: 5.0}
+    - {u: "RSU_3", v: "cloudServer_0", capacity_mbps: 300, prop_ms: 5.0}
+
+storage:
+  capacity_bytes: {}
+
+service_orchestration:
+  enabled: true
+  catalog_path: "./service_catalog.yaml"
+  lazy_deploy: true
+  deployment_cost_enabled: true
+  regional_agent_enabled: true
+  matcher_policy: "adaptive_rule_based"
+  serving_policy: "proposed"

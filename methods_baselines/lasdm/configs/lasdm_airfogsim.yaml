@@ -1,0 +1,306 @@
+schema_version: lasdm.airfogsim.v1
+
+orchestrator:
+  score_weights:
+    health: 2.0
+    reliability: 2.0
+    accuracy: 1.0
+    trust: 1.0
+    region: 0.5
+    resource_headroom: 0.0
+    load: 0.0
+    cold_start: 0.0
+
+service_instances:
+  - instance_id: rsu0_preprocess_local
+    service_id: video_preprocess
+    node_id: RSU_0
+    node_type: rsu
+    region_id: RSU_0
+    capabilities: [video_preprocess, keyframe]
+    input_semantic: video
+    output_semantic: keyframes
+    capacity: {cpu: 80.0, memory: 32768.0, storage: 20000.0}
+    used: {cpu: 6.0, memory: 1024.0, storage: 512.0}
+    max_concurrency: 6
+    reliability_score: 0.93
+    accuracy_score: 0.915
+    trust_score: 0.955
+    cold_start_s: 0.12
+
+  - instance_id: uav0_preprocess_local
+    service_id: video_preprocess
+    node_id: UAV_0
+    node_type: uav
+    region_id: RSU_0
+    capabilities: [video_preprocess, keyframe]
+    input_semantic: video
+    output_semantic: keyframes
+    capacity: {cpu: 4.0, memory: 1024.0, storage: 1024.0}
+    used: {cpu: 0.5, memory: 384.0, storage: 256.0}
+    max_concurrency: 2
+    reliability_score: 0.93
+    accuracy_score: 0.91
+    trust_score: 0.96
+    cold_start_s: 0.08
+
+  - instance_id: rsu1_preprocess_balanced
+    service_id: video_preprocess
+    node_id: RSU_1
+    node_type: rsu
+    region_id: RSU_1
+    capabilities: [video_preprocess, keyframe]
+    input_semantic: video
+    output_semantic: keyframes
+    capacity: {cpu: 80.0, memory: 32768.0, storage: 20000.0}
+    used: {cpu: 4.0, memory: 1024.0, storage: 512.0}
+    max_concurrency: 6
+    reliability_score: 0.985
+    accuracy_score: 0.965
+    trust_score: 0.99
+    cold_start_s: 0.18
+
+  - instance_id: uav1_preprocess_remote
+    service_id: video_preprocess
+    node_id: UAV_1
+    node_type: uav
+    region_id: RSU_1
+    capabilities: [video_preprocess, keyframe]
+    input_semantic: video
+    output_semantic: keyframes
+    capacity: {cpu: 4.0, memory: 2048.0, storage: 4096.0}
+    used: {cpu: 0.4, memory: 512.0, storage: 512.0}
+    max_concurrency: 2
+    reliability_score: 0.975
+    accuracy_score: 0.955
+    trust_score: 0.985
+    cold_start_s: 0.15
+
+  - instance_id: rsu0_detect_local
+    service_id: object_detection
+    node_id: RSU_0
+    node_type: rsu
+    region_id: RSU_0
+    capabilities: [object_detection, lightweight_inference]
+    input_semantic: keyframes
+    output_semantic: detection_result
+    capacity: {cpu: 80.0, memory: 32768.0, storage: 20000.0}
+    used: {cpu: 8.0, memory: 2048.0, storage: 2048.0}
+    max_concurrency: 6
+    reliability_score: 0.925
+    accuracy_score: 0.915
+    trust_score: 0.955
+    cold_start_s: 0.18
+
+  - instance_id: rsu1_detect_balanced
+    service_id: object_detection
+    node_id: RSU_1
+    node_type: rsu
+    region_id: RSU_1
+    capabilities: [object_detection, lightweight_inference]
+    input_semantic: keyframes
+    output_semantic: detection_result
+    capacity: {cpu: 80.0, memory: 32768.0, storage: 20000.0}
+    used: {cpu: 4.0, memory: 1536.0, storage: 1024.0}
+    max_concurrency: 6
+    reliability_score: 0.985
+    accuracy_score: 0.965
+    trust_score: 0.99
+    cold_start_s: 0.25
+
+  - instance_id: cloud2_detect_high_quality
+    service_id: object_detection
+    node_id: cloudServer_0
+    node_type: cloud_server
+    region_id: cloud
+    capabilities: [object_detection, lightweight_inference]
+    input_semantic: keyframes
+    output_semantic: detection_result
+    capacity: {cpu: 100.0, memory: 65536.0, storage: 1000000.0}
+    used: {cpu: 96.0, memory: 8192.0, storage: 4096.0}
+    max_concurrency: 4
+    reliability_score: 0.995
+    accuracy_score: 0.985
+    trust_score: 0.99
+    cold_start_s: 2.5
+
+  - instance_id: rsu0_verify_local
+    service_id: object_verification
+    node_id: RSU_0
+    node_type: rsu
+    region_id: RSU_0
+    capabilities: [object_verification, high_accuracy_inference]
+    input_semantic: detection_result
+    output_semantic: verified_event
+    capacity: {cpu: 80.0, memory: 32768.0, storage: 20000.0}
+    used: {cpu: 8.0, memory: 2048.0, storage: 2048.0}
+    max_concurrency: 6
+    reliability_score: 0.93
+    accuracy_score: 0.92
+    trust_score: 0.955
+    cold_start_s: 0.22
+
+  - instance_id: rsu1_verify_balanced
+    service_id: object_verification
+    node_id: RSU_1
+    node_type: rsu
+    region_id: RSU_1
+    capabilities: [object_verification, high_accuracy_inference]
+    input_semantic: detection_result
+    output_semantic: verified_event
+    capacity: {cpu: 80.0, memory: 32768.0, storage: 20000.0}
+    used: {cpu: 4.0, memory: 2048.0, storage: 2048.0}
+    max_concurrency: 6
+    reliability_score: 0.985
+    accuracy_score: 0.975
+    trust_score: 0.99
+    cold_start_s: 0.35
+
+  - instance_id: cloud2_verify_high_quality
+    service_id: object_verification
+    node_id: cloudServer_0
+    node_type: cloud_server
+    region_id: cloud
+    capabilities: [object_verification, high_accuracy_inference]
+    input_semantic: detection_result
+    output_semantic: verified_event
+    capacity: {cpu: 100.0, memory: 65536.0, storage: 1000000.0}
+    used: {cpu: 96.0, memory: 16384.0, storage: 8192.0}
+    max_concurrency: 4
+    reliability_score: 0.998
+    accuracy_score: 0.992
+    trust_score: 0.995
+    cold_start_s: 3.0
+
+service_chains:
+  - sfc_id: inspection_sfc_0
+    source_node_id: UAV_0
+    sink_node_id: UAV_0
+    payload_semantic: video
+    payload_mb: 14.0
+    qos: &inspection_qos
+      deadline_s: 6.0
+      priority: 1.0
+      reliability_min: 0.92
+      accuracy_min: 0.91
+      max_energy_j: 25.0
+      continuity_min: 0.97
+    context: &inspection_context
+      preferred_region_id: RSU_0
+      min_trust: 0.94
+      risk_level: 0.75
+    nodes: &inspection_nodes
+      - node_id: preprocess
+        service_type: video_preprocess
+        required_capabilities: [video_preprocess]
+        input_semantic: video
+        output_semantic: keyframes
+        cpu_mb: 2.0
+        memory_mb: 512.0
+        metadata:
+          task_cpu: 16.0
+          output_ratio: 0.45
+      - node_id: detect
+        service_type: object_detection
+        required_capabilities: [object_detection]
+        input_semantic: keyframes
+        output_semantic: detection_result
+        cpu_mb: 8.0
+        memory_mb: 2048.0
+        metadata:
+          task_cpu: 42.0
+          output_ratio: 0.35
+      - node_id: verify
+        service_type: object_verification
+        required_capabilities: [object_verification]
+        input_semantic: detection_result
+        output_semantic: verified_event
+        cpu_mb: 8.0
+        memory_mb: 2048.0
+        metadata:
+          task_cpu: 42.0
+          required_returned_size: 0.0
+    edges: &inspection_edges
+      - {from: preprocess, to: detect}
+      - {from: detect, to: verify}
+
+  - sfc_id: inspection_sfc_1
+    source_node_id: UAV_0
+    sink_node_id: UAV_0
+    payload_semantic: video
+    payload_mb: 12.0
+    qos: *inspection_qos
+    context: *inspection_context
+    nodes: *inspection_nodes
+    edges: *inspection_edges
+
+  - sfc_id: inspection_sfc_2
+    source_node_id: UAV_1
+    sink_node_id: UAV_1
+    payload_semantic: video
+    payload_mb: 12.0
+    qos: *inspection_qos
+    context: *inspection_context
+    nodes: *inspection_nodes
+    edges: *inspection_edges
+
+  - sfc_id: inspection_sfc_3
+    source_node_id: UAV_1
+    sink_node_id: UAV_1
+    payload_semantic: video
+    payload_mb: 10.0
+    qos: *inspection_qos
+    context: *inspection_context
+    nodes: *inspection_nodes
+    edges: *inspection_edges
+
+experiment:
+  mode: offline
+  seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  baselines:
+    - fixed_sfc
+    - deployment_only
+    - nearest_edge
+    - cats_style
+    - centralized_greedy
+    - regional_distributed_greedy
+    - edge_only
+    - uav_only
+    - proposed
+  scenarios:
+    - name: normal
+      risk_level: 0.35
+      network_fault: none
+      load_multiplier: 1.0
+      deadline_s: 7.0
+    - name: high_mobility
+      risk_level: 0.75
+      network_fault: intermittent_v2u
+      load_multiplier: 1.3
+      deadline_s: 6.0
+    - name: load_burst
+      risk_level: 0.55
+      network_fault: none
+      load_multiplier: 2.0
+      deadline_s: 6.0
+    - name: link_fault
+      risk_level: 0.8
+      network_fault: rsu_congestion
+      load_multiplier: 1.5
+      deadline_s: 6.0
+    - name: airspace_event
+      risk_level: 0.95
+      network_fault: rsu_congestion
+      load_multiplier: 1.8
+      deadline_s: 6.0
+
+runtime:
+  env_adapter_import_path: airfogsim.lasdm.env_adapter.LASDMEnvAdapter
+  airfogsim_config_path: AirFogSim/examples/config_unified_physical.yaml
+  warmup_steps: 10
+  max_steps: 1000
+  step_interval_s: 1.0
+  airfogsim_config_overrides:
+    task:
+      tti_threshold: 4.0
+      hard_ddl: 8.0

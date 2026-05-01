@@ -1,0 +1,270 @@
+schema_version: lasdm.semantic_topology.runtime_repair.v1
+
+# This file is intended as an override/alternate config for the next run after
+# all-zero semantic runtime results.  It is not a paper-final stress setting.
+# First prove that the centralized full-information planner and proposed can
+# complete SFCs in a calibrated runtime; then reintroduce contention/mobility pressure.
+
+runtime_repair:
+  centralized_planner_success_guard:
+    enabled: true
+    baseline: centralized_planner
+    min_success_ratio: 0.50
+    calibration_scenario: semantic_runtime_calibration_easy
+    seeds: [0, 1]
+  fail_fast_on_all_zero_success: true
+  export_raw_traces_required: true
+  early_result_guard:
+    enabled: true
+    min_completed_per_group: 1
+    stage_count: 3
+    chain_independence_tolerance: 0.08
+    min_chain_success_ratio: 0.55
+    min_task_success_ratio: 0.55
+    zero_success_min_completed: 1
+    min_success_by_baseline:
+      topology_greedy: 0.50
+      semantic_greedy_no_exchange: 0.20
+      utility_prior_with_exchange: 0.25
+      proposed_semantic_topology_marl: 0.65
+      centralized_planner: 0.60
+
+runtime:
+  warmup_steps: 5
+  max_steps: 1500
+  step_interval_s: 1.0
+  airfogsim_config_overrides:
+    task:
+      # Keep the low-level task timeout above the largest SFC QoS deadline; otherwise
+      # AirFogSim can fail queued wireless tasks before the chain deadline is reached.
+      tti_threshold: 80.0
+      hard_ddl: 90.0
+
+training:
+  episodes: 200
+  max_steps: 100
+  train_seeds: [0, 1, 2, 3, 4]
+  eval_seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+marl:
+  runtime_ticks_per_marl_step: 1
+  runtime_max_ticks_after_action: 25
+  runtime_stop_when_progress: true
+  route_hop_floor_s: 0.10
+  # The two stress scenarios materialize up to 25 candidates per SFC function:
+  # real infrastructure instances plus semantic-high/topology-bad,
+  # semantic-medium/topology-good, semantic-low/topology-good, and stale
+  # remote decoys.  A horizon below that silently removes topology-good
+  # candidates from the IPPO action space, so 32 is the smallest power-of-two
+  # bound that covers the intended candidate conflict set.
+  semantic_top_k: 32
+  max_candidates: 32
+  min_semantic_similarity: -1.0
+  auto_exchange: true
+  include_remote_candidates: true
+  # Training-only imitation warm start.  The first episodes follow the
+  # runtime-derived utility_prior target, which combines semantic fit,
+  # topology/mobility risk, route hops, cold-start, and deadline slack.
+  # Later episodes use the learned policy with policy-gradient fine tuning.
+  # Evaluation loads only the saved checkpoint and does not call the expert;
+  # the actor logits are blended with runtime-derived candidate priors.
+  # The IPPO actor makes per-function choices, so the imitation target must use
+  # the same sequential decision shape instead of chain-level planner search.
+  ippo_centralized_critic: true
+  ippo_use_region_encoder: true
+  ippo_learnable_prior: true
+  ippo_prior_l2_coef: 0.001
+  ippo_critic_agent_count: 4
+  ippo_device: cuda
+  ippo_expert_policy: topology_greedy
+  ippo_expert_branch_width: 8
+  ippo_utility_prior_logit_weight: 2.5
+  ippo_route_unavailable_penalty: 20.0
+  ippo_behavior_clone_pretrain_episodes: 20
+  ippo_behavior_clone_steps_per_observation: 4
+  # Reward curves used in F7 must describe the learned policy, not expert
+  # actions during behavior-clone warmup.  Warmup still trains the network from
+  # full-information planner heuristic labels, but reward_curve.csv starts once policy actions
+  # are actually executed in the runtime.
+  ippo_reward_curve_policy_only: true
+  # Keep a light imitation term during PPO updates.  The runtime action has
+  # sequential SFC dependencies, while this compact IPPO implementation uses a
+  # small independent actor; the continued expert term prevents drifting away
+  # from the corrected source/load-aware utility target.
+  ippo_behavior_clone_finetune_steps_per_observation: 0
+  ippo_update_epochs: 4
+  ippo_minibatch_size: 128
+  ippo_entropy_coef: 0.01
+  # Expert penalties use the same observable runtime factors as the reward:
+  # high topology/mobility risk frequently causes graph timeouts under the two
+  # stress scenarios, while route hops and cold-start add direct delay.
+  ippo_expert_load_penalty: 0.50
+  ippo_expert_topology_risk_penalty: 1.40
+  ippo_expert_mobility_risk_penalty: 1.80
+  ippo_expert_route_hops_penalty: 0.80
+  ippo_expert_route_tx_penalty: 0.35
+  ippo_expert_route_unavailable_penalty: 2.50
+  ippo_expert_cold_start_penalty: 0.20
+  ippo_expert_deadline_violation_penalty: 1.50
+  ippo_expert_runtime_penalty: 0.25
+  ippo_expert_semantic_mismatch_penalty: 1.50
+  ippo_expert_utility_prior_weight: 2.00
+  topology_greedy_utility_prior_weight: 2.00
+  ippo_expert_stale_penalty: 0.35
+  reward:
+    success: 10.0
+    timeout: -5.0
+  # Save the checkpoint that performs best on a small live-runtime validation
+  # copy instead of blindly saving the final stochastic RL episode.  This is
+  # standard model selection: success/task-success dominate, latency is a
+  # secondary tie-breaker.
+  ippo_checkpoint_selection_interval: 20
+  ippo_checkpoint_selection_max_steps: 80
+  ippo_checkpoint_selection_seed_offsets: [1000]
+  # Use the checkpoint with the best live-runtime validation score across
+  # random restarts; evaluation still runs on held-out eval seeds.
+  ippo_eval_checkpoint_strategy: global_best_validation
+  ippo_training_progress_guard_enabled: true
+  ippo_training_guard_min_episodes: 5
+  ippo_training_guard_recent_window: 3
+  ippo_training_guard_min_recent_max_success: 0.05
+
+semantic_exchange:
+  encoder_backend: sbert
+  sbert_model_name: sentence-transformers/all-MiniLM-L6-v2
+  encoder_device: cuda
+  encoder_batch_size: 64
+  ttl_s: 8.0
+  fixed_delay_s: 0.05
+  per_hop_delay_s: 0.01
+  top_k_per_agent: 48
+  compressed_dim: 64
+  quantization_bits: 8
+
+semantic_topology_experiment:
+  task_classes:
+    urgent: {deadline_s: 5.0, ratio: 0.10, semantic_min_score: 0.68, allowed_node_types: [rsu]}
+    standard: {deadline_s: 12.0, ratio: 0.40, semantic_min_score: 0.62, allowed_node_types: [rsu, vehicle]}
+    normal: {deadline_s: 25.0, ratio: 0.40, semantic_min_score: 0.55, allowed_node_types: [rsu, vehicle, uav]}
+    batch: {deadline_s: 60.0, ratio: 0.10, semantic_min_score: 0.45, allowed_node_types: [rsu, vehicle, uav, cloud_server]}
+  scenarios:
+    - name: semantic_runtime_probe_preprocess_only
+      objective: single-function AirFogSim lifecycle probe for waiting/offloading/computing/done
+      preprocess_only: true
+      task_classes: {}
+      task_nodes: {vehicle: 1, uav: 0}
+      service_nodes: {rsu: 1, vehicle: 0, uav: 0, cloud_server: 0}
+      forced_source_node_type: vehicle
+      forced_service_node_id: RSU_0
+      arrival_rate_sfc_per_s: 0.05
+      exchange_ttl_s: 8.0
+      qos_deadline_s: 60.0
+      payload_mb_range: [0.05, 0.10]
+      service_cpu_scale: 5.0
+      local_catalog_visibility: 1.0
+    - name: semantic_runtime_calibration_easy
+      objective: verify candidate mapping, runtime ticking, bridge task injection, and graph completion before stress tests
+      task_nodes: {vehicle: 20, uav: 2}
+      service_nodes: {rsu: 4, vehicle: 16, uav: 2, cloud_server: 1}
+      arrival_rate_sfc_per_s: 0.20
+      max_concurrent_sfcs: 10
+      exchange_ttl_s: 8.0
+      qos_deadline_s: 20.0
+      payload_mb_range: [2.0, 4.0]
+      service_cpu_scale: 0.35
+      local_catalog_visibility: 1.0
+    - name: semantic_runtime_contention_stress
+      objective: semantic ambiguity with heterogeneous runtime contention
+      task_nodes: {vehicle: 40, uav: 4}
+      service_nodes: {rsu: 4, vehicle: 24, uav: 4, cloud_server: 1}
+      source_node_types: [vehicle, uav]
+      preprocess_only: false
+      forced_service_node_id: null
+      forced_service_region_id: null
+      arrival_rate_sfc_per_s: 0.80
+      max_concurrent_sfcs: 25
+      qos_deadline_s: 18.0
+      payload_mb_range: [0.20, 0.60]
+      service_cpu_scale: 1.5
+      output_ratio: 0.25
+      semantic_mismatch_penalty_s_per_unit: 4.0
+      local_catalog_visibility: 0.45
+      exchange_ttl_s: 6.0
+      exchange_radius_hops: 2
+      exchange_top_k: 64
+      semantic_compressed_dim: 64
+      wireless_rb_budget: 10
+      wireless_contention_factor: 1.0
+      candidate_decoys:
+        enabled: true
+        semantic_high_topology_bad: 2
+        semantic_medium_topology_good: 2
+        semantic_low_topology_good: 1
+        stale_remote_candidates: 1
+    - name: semantic_runtime_mobility_staleness_stress
+      objective: stale semantic exchange under mobility and topology churn
+      task_nodes: {vehicle: 30, uav: 5}
+      service_nodes: {rsu: 4, vehicle: 20, uav: 6, cloud_server: 1}
+      source_node_types: [vehicle, uav]
+      preprocess_only: false
+      forced_service_node_id: null
+      forced_service_region_id: null
+      arrival_rate_sfc_per_s: 0.60
+      max_concurrent_sfcs: 20
+      qos_deadline_s: 18.0
+      payload_mb_range: [0.15, 0.50]
+      service_cpu_scale: 1.4
+      output_ratio: 0.25
+      semantic_mismatch_penalty_s_per_unit: 4.0
+      local_catalog_visibility: 1.0
+      exchange_ttl_s: 10.0
+      exchange_radius_hops: 3
+      exchange_top_k: 128
+      semantic_compressed_dim: 64
+      wireless_rb_budget: 12
+      mobility_stress:
+        enabled: true
+        uav_speed_scale: 1.5
+        vehicle_speed_scale: 1.3
+        topology_churn_interval_s: 4.0
+      stale_candidate_injection:
+        enabled: true
+        stale_ratio: 0.20
+        stale_latency_penalty_s: 3.0
+      candidate_decoys:
+        enabled: true
+        semantic_high_topology_bad: 2
+        semantic_medium_topology_good: 2
+        semantic_low_topology_good: 1
+        stale_remote_candidates: 2
+    - name: distributed_service_discovery_calibrated
+      objective: remote candidate discovery after centralized planner calibration passes
+      task_nodes: {vehicle: 25, uav: 4}
+      service_nodes: {rsu: 4, vehicle: 16, uav: 4, cloud_server: 1}
+      arrival_rate_sfc_per_s: 0.50
+      max_concurrent_sfcs: 15
+      exchange_ttl_s: 6.0
+      qos_deadline_s: 16.0
+      payload_mb_range: [4.0, 8.0]
+    - name: semantic_ambiguity_calibrated
+      objective: semantic ranking with feasible graph completion
+      task_nodes: {vehicle: 25, uav: 4}
+      service_nodes: {rsu: 4, vehicle: 16, uav: 4, cloud_server: 1}
+      ambiguous_service_ratio: 0.35
+      arrival_rate_sfc_per_s: 0.50
+      max_concurrent_sfcs: 15
+      exchange_ttl_s: 6.0
+      qos_deadline_s: 16.0
+      payload_mb_range: [4.0, 8.0]
+
+semantic_topology_figure_sweeps:
+  ttl_radius:
+    ttl_s: [2.0, 6.0, 10.0]
+    exchange_radius_hops: [1, 2, 3]
+    eval_seeds: [0, 1, 2]
+    baselines: [utility_prior_with_exchange, proposed_semantic_topology_marl, centralized_planner]
+    rationale: >
+      TTL and exchange radius control distributed semantic discovery coverage.
+      Larger values should increase remote discovery but can increase stale
+      candidates and message bytes, so they are plotted as a discovery/overhead
+      trade-off rather than as raw performance tuning.
