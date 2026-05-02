@@ -73,9 +73,11 @@ def main() -> None:
             marl_cfg = dict(config.get("marl", {}) or {})
             max_candidates = int(marl_cfg.get("max_candidates", 16))
             critic_agents = int(marl_cfg.get("ippo_critic_agent_count", len(observations) or 4) or 4)
+            candidate_feature_dim = _observation_candidate_feature_dim(observations) or 31
             policy = IPPOPolicy(
                 observation_dim=obs_dim,
                 max_candidates=max_candidates,
+                candidate_feature_dim=candidate_feature_dim,
                 seed=args.seed,
                 lr=float(marl_cfg.get("ippo_lr", 3e-4) or 3e-4),
                 centralized_critic=bool(marl_cfg.get("ippo_centralized_critic", True)),
@@ -206,6 +208,8 @@ def build_offline_env(
         route_hop_floor_s=float(marl_cfg.get("route_hop_floor_s", 1.0) or 1.0),
         global_candidate_catalog=bool(marl_cfg.get("global_candidate_catalog", False)),
         region_agents=tuple(str(item) for item in topology_cfg.get("region_agents", []) or []),
+        sequential_capacity_enabled=bool(marl_cfg.get("sequential_capacity_enabled", True)),
+        sequential_deadline_pruning_enabled=bool(marl_cfg.get("sequential_deadline_pruning_enabled", True)),
     )
     semantic_env = SemanticTopologyMARLEnv(
         manager=manager,
@@ -263,8 +267,18 @@ def _build_reward_fn(marl_cfg: Mapping[str, Any]) -> SFCReward:
     values = {}
     for key, value in reward_cfg.items():
         if key in allowed:
-            values[key] = bool(value) if key == "dense_enabled" else float(value)
+            values[key] = float(value)
     return SFCReward(SFCRewardConfig(**values))
+
+
+def _observation_candidate_feature_dim(observations: Mapping[str, Mapping[str, Any]]) -> Optional[int]:
+    for observation in observations.values():
+        for candidate_set in observation.get("candidate_sets", []) or []:
+            features = candidate_set.get("candidate_features")
+            shape = getattr(features, "shape", None)
+            if shape is not None and len(shape) == 2 and int(shape[1]) > 0:
+                return int(shape[1])
+    return None
 
 
 def _load_yaml(path: str) -> Dict[str, Any]:

@@ -102,7 +102,7 @@ class GraphObservationBuilder:
 
     @property
     def candidate_feature_dim(self) -> int:
-        return 28
+        return 31
 
     def node_features(self, node: TopologyNode, agent_id: str) -> np.ndarray:
         one_hot = _one_hot(node.node_type, NODE_TYPES)
@@ -183,6 +183,21 @@ class GraphObservationBuilder:
             if temporal_enabled
             else 0.0
         )
+        resource_available_ratio = (
+            min(1.0, max(0.0, float(metadata.get("resource_available_ratio", 1.0) or 0.0)))
+            if topology_enabled
+            else 0.0
+        )
+        hops_from_prev = (
+            min(1.0, max(0.0, float(metadata.get("hops_from_prev_function_norm", metadata.get("route_hops_norm", 1.0)) or 0.0)))
+            if topology_enabled
+            else 0.0
+        )
+        remaining_deadline_ratio = (
+            min(1.0, max(0.0, float(metadata.get("remaining_deadline_ratio", 1.0) or 0.0)))
+            if topology_enabled
+            else 0.0
+        )
         node_type = str(candidate.node_type)
         return np.asarray(
             [
@@ -214,6 +229,9 @@ class GraphObservationBuilder:
                 wireless_pressure,
                 wireless_hops,
                 rb_slowdown,
+                resource_available_ratio,
+                hops_from_prev,
+                remaining_deadline_ratio,
             ],
             dtype=np.float32,
         )

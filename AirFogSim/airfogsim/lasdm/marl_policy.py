@@ -134,8 +134,15 @@ class TopologyGreedyPolicy(SemanticGreedyPolicy):
             for sfc_id, candidate_sets in grouped.items():
                 ordered_sets = sorted(candidate_sets, key=lambda item: int(item.get("sfc_node_index", 0) or 0))
                 current_source = str(ordered_sets[0].get("source_node_id", "")) if ordered_sets else ""
+                remaining_deadline_s, total_deadline_s = _chain_deadline_budget(ordered_sets)
                 for candidate_set in ordered_sets:
-                    best, best_candidate = self._best_candidate_with_context(candidate_set, current_source, planned_node_load)
+                    best, best_candidate = self._best_candidate_with_context(
+                        candidate_set,
+                        current_source,
+                        planned_node_load,
+                        remaining_deadline_s=remaining_deadline_s,
+                        total_deadline_s=total_deadline_s,
+                    )
                     if best is None:
                         break
                     sfc_node_id = str(candidate_set.get("sfc_node_id"))
@@ -145,6 +152,7 @@ class TopologyGreedyPolicy(SemanticGreedyPolicy):
                         if node_id:
                             current_source = node_id
                             planned_node_load[node_id] = planned_node_load.get(node_id, 0) + 1
+                            remaining_deadline_s = _consume_deadline_budget(remaining_deadline_s, best_candidate)
                     if not current_source:
                         current_source = str(candidate_set.get("source_node_id", ""))
         return actions
@@ -162,6 +170,8 @@ class TopologyGreedyPolicy(SemanticGreedyPolicy):
         candidate_set: Mapping[str, Any],
         source_node_id: str = "",
         planned_node_load: Optional[Mapping[str, int]] = None,
+        remaining_deadline_s: Optional[float] = None,
+        total_deadline_s: Optional[float] = None,
     ) -> Tuple[Optional[str], Optional[Mapping[str, Any]]]:
         best_id = None
         best_candidate: Optional[Mapping[str, Any]] = None
@@ -194,9 +204,22 @@ class TopologyGreedyPolicy(SemanticGreedyPolicy):
             effective_cpu = max(0.1, float(metadata.get("effective_cpu", 0.1) or 0.1))
             max_concurrency = max(1, int(float(metadata.get("max_concurrency", 1) or 1)))
             current_load = max(0, int(float(metadata.get("current_load", 0) or 0)))
-            available_slots = max(1, max_concurrency - current_load)
-            overload_count = max(0, planned_count + 1 - available_slots)
+            available_slots, available_ratio = _available_slots_after_plan(metadata, node_id, planned)
+            if available_slots <= 0:
+                continue
             budget = max(1.0, float(metadata.get("function_budget_s", 1.0) or 1.0))
+            remaining_for_candidate = _candidate_remaining_deadline(metadata, source, remaining_deadline_s)
+            expected_runtime_penalty = float(
+                _source_metric(
+                    metadata,
+                    "expected_runtime_penalty_s",
+                    source,
+                    metadata.get("expected_runtime_penalty_s", 0.0),
+                )
+                or 0.0
+            )
+            if remaining_for_candidate is not None and expected_runtime_penalty > max(0.0, remaining_for_candidate) + 1e-9:
+                continue
             score -= self.load_penalty * float(metadata.get("load_ratio", 0.0) or 0.0)
             score -= self.topology_risk_penalty * float(metadata.get("topology_risk", 0.0) or 0.0)
             score -= self.mobility_risk_penalty * float(metadata.get("mobility_risk", 0.0) or 0.0)
@@ -205,7 +228,7 @@ class TopologyGreedyPolicy(SemanticGreedyPolicy):
             if route_available <= 0.0:
                 score -= self.route_unavailable_penalty
             score -= self.cold_start_penalty * float(metadata.get("cold_start_s", candidate.get("cold_start_s", 0.0)) or 0.0)
-            score -= overload_count * (task_cpu / effective_cpu) / budget
+            score += 0.05 * available_ratio
             if deadline_slack < 0.0:
                 score -= self.deadline_violation_penalty * (1.0 + abs(deadline_slack) / budget)
             score -= self.runtime_penalty * expected_runtime_penalty / budget
@@ -232,6 +255,59 @@ def _source_metric(metadata: Mapping[str, Any], metric_name: str, source_node_id
     return default
 
 
+def _chain_deadline_budget(candidate_sets: Sequence[Mapping[str, Any]]) -> Tuple[Optional[float], Optional[float]]:
+    for candidate_set in candidate_sets:
+        for candidate in candidate_set.get("raw_candidates", []) or []:
+            metadata = dict(candidate.get("metadata", {}) or {})
+            total = float(metadata.get("chain_deadline_s", 0.0) or 0.0)
+            remaining = float(metadata.get("chain_remaining_deadline_s", total) or 0.0)
+            if total > 0.0:
+                return max(0.0, remaining), total
+    return None, None
+
+
+def _consume_deadline_budget(remaining_deadline_s: Optional[float], candidate: Optional[Mapping[str, Any]]) -> Optional[float]:
+    if remaining_deadline_s is None or candidate is None:
+        return remaining_deadline_s
+    metadata = dict(candidate.get("metadata", {}) or {})
+    spent = max(0.0, float(metadata.get("expected_runtime_penalty_s", 0.0) or 0.0))
+    return max(0.0, float(remaining_deadline_s) - spent)
+
+
+def _candidate_remaining_deadline(
+    metadata: Mapping[str, Any],
+    source_node_id: str,
+    remaining_deadline_s: Optional[float],
+) -> Optional[float]:
+    if remaining_deadline_s is not None:
+        return max(0.0, float(remaining_deadline_s))
+    value = _source_metric(metadata, "chain_remaining_deadline_s", source_node_id, metadata.get("chain_remaining_deadline_s"))
+    if value in (None, ""):
+        return None
+    return max(0.0, float(value))
+
+
+def _available_slots_after_plan(
+    metadata: Mapping[str, Any],
+    node_id: str,
+    planned_node_load: Mapping[str, int],
+) -> Tuple[int, float]:
+    max_concurrency = max(
+        1,
+        int(float(metadata.get("resource_capacity_total", metadata.get("max_concurrency", 1)) or 1)),
+    )
+    base_available_raw = metadata.get("resource_available_slots")
+    if base_available_raw in (None, ""):
+        current_load = max(0, int(float(metadata.get("current_load", 0) or 0)))
+        reserved = max(0, int(float(metadata.get("resource_reserved_count", 0) or 0)))
+        base_available = max(0, max_concurrency - current_load - reserved)
+    else:
+        base_available = max(0, int(float(base_available_raw) or 0))
+    planned = max(0, int(planned_node_load.get(str(node_id), 0) or 0))
+    available = max(0, base_available - planned)
+    return available, max(0.0, min(1.0, float(available) / float(max_concurrency)))
+
+
 class UtilityPriorPolicy(BaseMARLPolicy):
     """Training expert that follows the runtime-derived candidate utility prior."""
 
@@ -245,8 +321,15 @@ class UtilityPriorPolicy(BaseMARLPolicy):
             for sfc_id, candidate_sets in grouped.items():
                 ordered_sets = sorted(candidate_sets, key=lambda item: int(item.get("sfc_node_index", 0) or 0))
                 current_source = str(ordered_sets[0].get("source_node_id", "")) if ordered_sets else ""
+                remaining_deadline_s, total_deadline_s = _chain_deadline_budget(ordered_sets)
                 for candidate_set in ordered_sets:
-                    best, best_candidate = self._best_candidate(candidate_set, current_source, planned_node_load)
+                    best, best_candidate = self._best_candidate(
+                        candidate_set,
+                        current_source,
+                        planned_node_load,
+                        remaining_deadline_s=remaining_deadline_s,
+                        total_deadline_s=total_deadline_s,
+                    )
                     if best is None:
                         break
                     sfc_node_id = str(candidate_set.get("sfc_node_id"))
@@ -254,6 +337,7 @@ class UtilityPriorPolicy(BaseMARLPolicy):
                     if best_candidate is not None:
                         current_source = str(best_candidate.get("node_id", current_source))
                         planned_node_load[current_source] = planned_node_load.get(current_source, 0) + 1
+                        remaining_deadline_s = _consume_deadline_budget(remaining_deadline_s, best_candidate)
                     if not current_source:
                         current_source = str(candidate_set.get("source_node_id", ""))
         return actions
@@ -263,6 +347,8 @@ class UtilityPriorPolicy(BaseMARLPolicy):
         candidate_set: Mapping[str, Any],
         source_node_id: str = "",
         planned_node_load: Optional[Mapping[str, int]] = None,
+        remaining_deadline_s: Optional[float] = None,
+        total_deadline_s: Optional[float] = None,
     ) -> Tuple[Optional[str], Optional[Mapping[str, Any]]]:
         best_id = None
         best_candidate: Optional[Mapping[str, Any]] = None
@@ -277,15 +363,18 @@ class UtilityPriorPolicy(BaseMARLPolicy):
             score = float(utility)
             route_available = float(_source_metric(metadata, "route_available", source, metadata.get("route_available", 0.0)) or 0.0)
             node_id = str(candidate.get("node_id", ""))
-            planned_count = max(0, int(planned.get(node_id, 0) or 0))
-            task_cpu = max(0.0, float(metadata.get("task_cpu", 0.0) or 0.0))
-            effective_cpu = max(0.1, float(metadata.get("effective_cpu", 0.1) or 0.1))
-            max_concurrency = max(1, int(float(metadata.get("max_concurrency", 1) or 1)))
-            current_load = max(0, int(float(metadata.get("current_load", 0) or 0)))
-            available_slots = max(1, max_concurrency - current_load)
-            overload_count = max(0, planned_count + 1 - available_slots)
+            available_slots, available_ratio = _available_slots_after_plan(metadata, node_id, planned)
+            if available_slots <= 0:
+                continue
             budget = max(1.0, float(metadata.get("function_budget_s", 1.0) or 1.0))
-            score -= overload_count * (task_cpu / effective_cpu) / budget
+            expected_runtime_penalty = float(
+                _source_metric(metadata, "expected_runtime_penalty_s", source, metadata.get("expected_runtime_penalty_s", 0.0))
+                or 0.0
+            )
+            remaining_for_candidate = _candidate_remaining_deadline(metadata, source, remaining_deadline_s)
+            if remaining_for_candidate is not None and expected_runtime_penalty > max(0.0, remaining_for_candidate) + 1e-9:
+                continue
+            score += 0.05 * available_ratio
             score += 0.01 * float(candidate.get("semantic_score", 0.0) or 0.0)
             score += 0.01 * route_available
             if score > best_score:
@@ -329,6 +418,8 @@ class CrossRegionAuctionPolicy(UtilityPriorPolicy):
         candidate_set: Mapping[str, Any],
         source_node_id: str = "",
         planned_node_load: Optional[Mapping[str, int]] = None,
+        remaining_deadline_s: Optional[float] = None,
+        total_deadline_s: Optional[float] = None,
     ) -> Tuple[Optional[str], Optional[Mapping[str, Any]]]:
         best_id = None
         best_candidate: Optional[Mapping[str, Any]] = None
@@ -342,7 +433,18 @@ class CrossRegionAuctionPolicy(UtilityPriorPolicy):
             load_ratio = float(metadata.get("load_ratio", 0.0) or 0.0)
             route_hops = float(_source_metric(metadata, "route_hops", source, metadata.get("route_hops", 0.0)) or 0.0)
             route_available = float(_source_metric(metadata, "route_available", source, metadata.get("route_available", 0.0)) or 0.0)
+            available_slots, available_ratio = _available_slots_after_plan(metadata, str(candidate.get("node_id", "")), planned_node_load or {})
+            if available_slots <= 0:
+                continue
+            expected_runtime_penalty = float(
+                _source_metric(metadata, "expected_runtime_penalty_s", source, metadata.get("expected_runtime_penalty_s", 0.0))
+                or 0.0
+            )
+            remaining_for_candidate = _candidate_remaining_deadline(metadata, source, remaining_deadline_s)
+            if remaining_for_candidate is not None and expected_runtime_penalty > max(0.0, remaining_for_candidate) + 1e-9:
+                continue
             bid = float(utility)
+            bid += 0.05 * available_ratio
             bid -= self.load_price * load_ratio
             bid -= self.remote_price * route_hops
             bid -= self.stale_price * float(candidate.get("staleness_s", 0.0) or 0.0)
@@ -400,12 +502,14 @@ class CentralizedPlannerPolicy(UtilityPriorPolicy):
         best_path: List[Tuple[str, str, str, float]] = []
         initial_source = str(ordered_sets[0].get("source_node_id", ""))
         initial_planned = dict(planned_node_load or {})
+        initial_remaining_deadline_s, _total_deadline_s = _chain_deadline_budget(ordered_sets)
 
         def search(
             index: int,
             source: str,
             planned: Dict[str, int],
             wireless_load: float,
+            remaining_deadline_s: Optional[float],
             score: float,
             path: List[Tuple[str, str, str, float]],
         ) -> None:
@@ -416,7 +520,13 @@ class CentralizedPlannerPolicy(UtilityPriorPolicy):
                     best_path = list(path)
                 return
             candidate_set = ordered_sets[index]
-            contextual = self._contextual_candidate_set_for_planner(candidate_set, source, planned, wireless_load)
+            contextual = self._contextual_candidate_set_for_planner(
+                candidate_set,
+                source,
+                planned,
+                wireless_load,
+                remaining_deadline_s=remaining_deadline_s,
+            )
             sfc_node_id = str(contextual.get("sfc_node_id", ""))
             candidates = list(contextual.get("raw_candidates", []) or [])
             if not candidates:
@@ -443,6 +553,7 @@ class CentralizedPlannerPolicy(UtilityPriorPolicy):
                 instance_id = str(candidate.get("instance_id", ""))
                 metadata = dict(candidate.get("metadata", {}) or {})
                 wireless_hops = max(0.0, float(metadata.get("wireless_hops", 0.0) or 0.0))
+                next_remaining_deadline_s = _consume_deadline_budget(remaining_deadline_s, candidate)
                 next_planned = dict(planned)
                 if node_id:
                     next_planned[node_id] = next_planned.get(node_id, 0) + 1
@@ -451,11 +562,12 @@ class CentralizedPlannerPolicy(UtilityPriorPolicy):
                     node_id or source,
                     next_planned,
                     wireless_load + wireless_hops,
+                    next_remaining_deadline_s,
                     score + utility,
                     path + [(sfc_node_id, instance_id, node_id, wireless_hops)],
                 )
 
-        search(0, initial_source, initial_planned, float(planned_wireless_load), 0.0, [])
+        search(0, initial_source, initial_planned, float(planned_wireless_load), initial_remaining_deadline_s, 0.0, [])
         return best_path
 
     def _contextual_candidate_set_for_planner(
@@ -464,11 +576,12 @@ class CentralizedPlannerPolicy(UtilityPriorPolicy):
         source_node_id: str,
         planned_node_load: Mapping[str, int],
         planned_wireless_load: float = 0.0,
+        remaining_deadline_s: Optional[float] = None,
     ) -> Dict[str, Any]:
         source = str(source_node_id or candidate_set.get("source_node_id", ""))
         planned = dict(planned_node_load or {})
-        raw_candidates = [dict(candidate) for candidate in candidate_set.get("raw_candidates", []) or []]
-        for idx, candidate in enumerate(raw_candidates):
+        raw_candidates: List[Dict[str, Any]] = []
+        for candidate in [dict(item) for item in candidate_set.get("raw_candidates", []) or []]:
             metadata = dict(candidate.get("metadata", {}) or {})
             route_available = float(_source_metric(metadata, "route_available", source, metadata.get("route_available", 0.0)) or 0.0)
             route_hops = float(_source_metric(metadata, "route_hops", source, metadata.get("route_hops", 4.0)) or 0.0)
@@ -484,6 +597,9 @@ class CentralizedPlannerPolicy(UtilityPriorPolicy):
             max_concurrency = max(1, int(float(metadata.get("max_concurrency", 1) or 1)))
             current_load = max(0, int(float(metadata.get("current_load", 0) or 0)))
             planned_count = max(0, int(planned.get(node_id, 0) or 0))
+            available_slots, available_ratio = _available_slots_after_plan(metadata, node_id, planned)
+            if available_slots <= 0:
+                continue
             estimated_compute_s = max(0.0, float(metadata.get("estimated_compute_s", 0.0) or 0.0))
             budget = max(1.0, float(metadata.get("function_budget_s", 1.0) or 1.0))
             planned_queue_delay_s = (float(planned_count) / float(max_concurrency)) * estimated_compute_s
@@ -494,6 +610,12 @@ class CentralizedPlannerPolicy(UtilityPriorPolicy):
             expected_penalty = metadata.get("expected_runtime_penalty_s")
             if expected_penalty is not None:
                 metadata["expected_runtime_penalty_s"] = float(expected_penalty) + planned_queue_delay_s + planned_wireless_delay_s
+            remaining_for_candidate = _candidate_remaining_deadline(metadata, source, remaining_deadline_s)
+            if (
+                remaining_for_candidate is not None
+                and float(metadata.get("expected_runtime_penalty_s", 0.0) or 0.0) > max(0.0, remaining_for_candidate) + 1e-9
+            ):
+                continue
             metadata["actual_route_source_node_id"] = source
             metadata["route_available"] = route_available
             metadata["route_hops"] = route_hops
@@ -505,8 +627,10 @@ class CentralizedPlannerPolicy(UtilityPriorPolicy):
             metadata["planned_queue_delay_s"] = planned_queue_delay_s
             metadata["planned_wireless_delay_s"] = planned_wireless_delay_s
             metadata["load_ratio"] = min(1.0, float(current_load + planned_count) / float(max_concurrency))
+            metadata["resource_available_slots"] = available_slots
+            metadata["resource_available_ratio"] = available_ratio
             candidate["metadata"] = metadata
-            raw_candidates[idx] = candidate
+            raw_candidates.append(candidate)
         updated = dict(candidate_set)
         updated["raw_candidates"] = raw_candidates
         return updated
@@ -566,7 +690,7 @@ class IPPOPolicy(BaseMARLPolicy):
         hidden_dim: int = 128,
         lr: float = 3e-4,
         seed: int = 0,
-        candidate_feature_dim: int = 28,
+        candidate_feature_dim: int = 31,
         device: Optional[str] = None,
         route_unavailable_penalty: float = 20.0,
         utility_prior_logit_weight: float = 2.5,
@@ -966,8 +1090,15 @@ class IPPOPolicy(BaseMARLPolicy):
                 for _sfc_id, items in grouped.items():
                     current_source = str(items[0][1].get("source_node_id", "")) if items else ""
                     planned_node_load: Dict[str, int] = {}
+                    remaining_deadline_s, total_deadline_s = _chain_deadline_budget([item[1] for item in items])
                     for set_idx, candidate_set in sorted(items, key=lambda item: int(item[1].get("sfc_node_index", 0) or 0)):
-                        contextual = self._contextual_candidate_set(candidate_set, current_source, planned_node_load)
+                        contextual = self._contextual_candidate_set(
+                            candidate_set,
+                            current_source,
+                            planned_node_load,
+                            remaining_deadline_s=remaining_deadline_s,
+                            total_deadline_s=total_deadline_s,
+                        )
                         ids = list(contextual.get("candidate_ids", []) or [])
                         if not ids:
                             continue
@@ -998,6 +1129,7 @@ class IPPOPolicy(BaseMARLPolicy):
                             if node_id:
                                 current_source = node_id
                                 planned_node_load[node_id] = planned_node_load.get(node_id, 0) + 1
+                                remaining_deadline_s = _consume_deadline_budget(remaining_deadline_s, chosen_candidate)
                 if agent_action_count > 0:
                     centralized_action_count += agent_action_count
                     if value is not None:
@@ -1056,8 +1188,15 @@ class IPPOPolicy(BaseMARLPolicy):
                     continue
                 current_source = str(items[0][1].get("source_node_id", "")) if items else ""
                 planned_node_load: Dict[str, int] = {}
+                remaining_deadline_s, total_deadline_s = _chain_deadline_budget([item[1] for item in items])
                 for _set_idx, candidate_set in sorted(items, key=lambda item: int(item[1].get("sfc_node_index", 0) or 0)):
-                    contextual = self._contextual_candidate_set(candidate_set, current_source, planned_node_load)
+                    contextual = self._contextual_candidate_set(
+                        candidate_set,
+                        current_source,
+                        planned_node_load,
+                        remaining_deadline_s=remaining_deadline_s,
+                        total_deadline_s=total_deadline_s,
+                    )
                     sfc_node_id = str(contextual.get("sfc_node_id", ""))
                     chosen = self._chosen_action(actions, str(agent_id), str(sfc_id), sfc_node_id)
                     if not chosen:
@@ -1083,6 +1222,7 @@ class IPPOPolicy(BaseMARLPolicy):
                         if node_id:
                             current_source = node_id
                             planned_node_load[node_id] = planned_node_load.get(node_id, 0) + 1
+                            remaining_deadline_s = _consume_deadline_budget(remaining_deadline_s, chosen_candidate)
             if agent_action_count > 0:
                 if value is not None:
                     value_tensors.append(value.squeeze())
@@ -1225,8 +1365,15 @@ class IPPOPolicy(BaseMARLPolicy):
             for sfc_id, candidate_sets in grouped.items():
                 current_source = str(candidate_sets[0].get("source_node_id", "")) if candidate_sets else ""
                 planned_node_load: Dict[str, int] = {}
+                remaining_deadline_s, total_deadline_s = _chain_deadline_budget(candidate_sets)
                 for candidate_set in sorted(candidate_sets, key=lambda item: int(item.get("sfc_node_index", 0) or 0)):
-                    candidate_set = self._contextual_candidate_set(candidate_set, current_source, planned_node_load)
+                    candidate_set = self._contextual_candidate_set(
+                        candidate_set,
+                        current_source,
+                        planned_node_load,
+                        remaining_deadline_s=remaining_deadline_s,
+                        total_deadline_s=total_deadline_s,
+                    )
                     sfc_node_id = str(candidate_set.get("sfc_node_id", ""))
                     chosen = None
                     if isinstance(agent_payload.get(sfc_id), Mapping):
@@ -1251,6 +1398,7 @@ class IPPOPolicy(BaseMARLPolicy):
                         if node_id:
                             current_source = node_id
                             planned_node_load[node_id] = planned_node_load.get(node_id, 0) + 1
+                            remaining_deadline_s = _consume_deadline_budget(remaining_deadline_s, chosen_candidate)
         if not losses:
             self.last_supervised_loss = 0.0
             self.last_supervised_samples = 0
@@ -1297,8 +1445,15 @@ class IPPOPolicy(BaseMARLPolicy):
             for sfc_id, candidate_sets in grouped.items():
                 current_source = str(candidate_sets[0].get("source_node_id", "")) if candidate_sets else ""
                 planned_node_load: Dict[str, int] = {}
+                remaining_deadline_s, total_deadline_s = _chain_deadline_budget(candidate_sets)
                 for candidate_set in sorted(candidate_sets, key=lambda item: int(item.get("sfc_node_index", 0) or 0)):
-                    contextual = self._contextual_candidate_set(candidate_set, current_source, planned_node_load)
+                    contextual = self._contextual_candidate_set(
+                        candidate_set,
+                        current_source,
+                        planned_node_load,
+                        remaining_deadline_s=remaining_deadline_s,
+                        total_deadline_s=total_deadline_s,
+                    )
                     sfc_node_id = str(contextual.get("sfc_node_id", ""))
                     current_label = agent_payload.get(sfc_id, {}).get(sfc_node_id) if isinstance(agent_payload.get(sfc_id), Mapping) else None
                     if current_label:
@@ -1318,6 +1473,7 @@ class IPPOPolicy(BaseMARLPolicy):
                             if node_id:
                                 current_source = node_id
                                 planned_node_load[node_id] = planned_node_load.get(node_id, 0) + 1
+                                remaining_deadline_s = _consume_deadline_budget(remaining_deadline_s, chosen_candidate)
         return labels, relabels
 
     def _guarded_supervised_label(
@@ -1386,11 +1542,22 @@ class IPPOPolicy(BaseMARLPolicy):
         candidate_set: Mapping[str, Any],
         source_node_id: str,
         planned_node_load: Mapping[str, int],
+        remaining_deadline_s: Optional[float] = None,
+        total_deadline_s: Optional[float] = None,
     ) -> Dict[str, Any]:
         source = str(source_node_id or candidate_set.get("source_node_id", ""))
-        raw_candidates = [dict(candidate) for candidate in candidate_set.get("raw_candidates", []) or []]
-        features = np.asarray(candidate_set.get("candidate_features", []), dtype=np.float32).copy()
-        for idx, candidate in enumerate(raw_candidates[: self.max_candidates]):
+        original_candidates = [dict(candidate) for candidate in candidate_set.get("raw_candidates", []) or []]
+        original_ids = [str(item) for item in candidate_set.get("candidate_ids", []) or []]
+        original_features = np.asarray(candidate_set.get("candidate_features", []), dtype=np.float32)
+        if original_features.ndim != 2:
+            original_features = np.zeros((self.max_candidates, self.candidate_feature_dim), dtype=np.float32)
+        feature_dim = max(int(original_features.shape[1]), self.candidate_feature_dim)
+        features = np.zeros((self.max_candidates, feature_dim), dtype=np.float32)
+        candidate_mask = np.zeros((self.max_candidates,), dtype=np.float32)
+        raw_candidates: List[Dict[str, Any]] = []
+        candidate_ids: List[str] = []
+        pruned_count = 0
+        for idx, candidate in enumerate(original_candidates[: self.max_candidates]):
             metadata = dict(candidate.get("metadata", {}) or {})
             route_available = float(_source_metric(metadata, "route_available", source, metadata.get("route_available", 0.0)) or 0.0)
             route_hops = float(_source_metric(metadata, "route_hops", source, metadata.get("route_hops", 4.0)) or 0.0)
@@ -1405,21 +1572,34 @@ class IPPOPolicy(BaseMARLPolicy):
             wireless_hops = float(_source_metric(metadata, "wireless_hops", source, metadata.get("wireless_hops", 0.0)) or 0.0)
             rb_slowdown = float(_source_metric(metadata, "rb_slowdown", source, metadata.get("rb_slowdown", 1.0)) or 1.0)
             node_id = str(candidate.get("node_id", ""))
-            planned_count = max(0, int(planned_node_load.get(node_id, 0) or 0))
-            task_cpu = max(0.0, float(metadata.get("task_cpu", 0.0) or 0.0))
-            effective_cpu = max(0.1, float(metadata.get("effective_cpu", 0.1) or 0.1))
-            max_concurrency = max(1, int(float(metadata.get("max_concurrency", 1) or 1)))
-            current_load = max(0, int(float(metadata.get("current_load", 0) or 0)))
-            available_slots = max(1, max_concurrency - current_load)
-            overload_count = max(0, planned_count + 1 - available_slots)
-            budget = max(1.0, float(metadata.get("function_budget_s", 1.0) or 1.0))
-            utility -= overload_count * (task_cpu / effective_cpu) / budget
-            load_ratio = min(1.0, float(current_load + planned_count) / float(max_concurrency))
+            available_slots, available_ratio = _available_slots_after_plan(metadata, node_id, planned_node_load)
+            remaining_for_candidate = _candidate_remaining_deadline(metadata, source, remaining_deadline_s)
+            expected_runtime_penalty = float(metadata.get("expected_runtime_penalty_s", 0.0) or 0.0)
+            if available_slots <= 0 or (
+                remaining_for_candidate is not None
+                and expected_runtime_penalty > max(0.0, remaining_for_candidate) + 1e-9
+            ):
+                pruned_count += 1
+                continue
+            max_concurrency = max(
+                1,
+                int(float(metadata.get("resource_capacity_total", metadata.get("max_concurrency", 1)) or 1)),
+            )
+            load_ratio = min(1.0, 1.0 - available_ratio)
+            total_deadline = float(total_deadline_s or metadata.get("chain_deadline_s", 0.0) or 0.0)
+            remaining_ratio = (
+                max(0.0, min(1.0, float(remaining_for_candidate) / total_deadline))
+                if remaining_for_candidate is not None and total_deadline > 0.0
+                else max(0.0, min(1.0, float(metadata.get("remaining_deadline_ratio", 1.0) or 0.0)))
+            )
+            route_hops_norm = min(1.0, route_hops / 4.0)
 
             metadata["actual_route_source_node_id"] = source
             metadata["route_available"] = route_available
             metadata["route_hops"] = route_hops
-            metadata["route_hops_norm"] = min(1.0, route_hops / 4.0)
+            metadata["route_hops_norm"] = route_hops_norm
+            metadata["hops_from_prev_function"] = route_hops
+            metadata["hops_from_prev_function_norm"] = route_hops_norm
             metadata["utility_prior"] = utility
             metadata["deadline_slack_s"] = deadline_slack
             metadata["route_tx_time_s"] = route_tx_time
@@ -1428,21 +1608,35 @@ class IPPOPolicy(BaseMARLPolicy):
             metadata["wireless_hops"] = wireless_hops
             metadata["rb_slowdown"] = rb_slowdown
             metadata["load_ratio"] = load_ratio
+            metadata["resource_available_slots"] = available_slots
+            metadata["resource_available_ratio"] = available_ratio
+            metadata["resource_capacity_total"] = max_concurrency
+            metadata["remaining_deadline_ratio"] = remaining_ratio
+            metadata["chain_remaining_deadline_s"] = (
+                float(remaining_for_candidate) if remaining_for_candidate is not None else metadata.get("chain_remaining_deadline_s", 0.0)
+            )
+            metadata["sequential_deadline_feasible"] = 1.0
             candidate["metadata"] = metadata
-            raw_candidates[idx] = candidate
+            new_idx = len(raw_candidates)
+            raw_candidates.append(candidate)
+            candidate_ids.append(original_ids[idx] if idx < len(original_ids) else str(candidate.get("instance_id", "")))
+            candidate_mask[new_idx] = 1.0
 
-            if features.ndim == 2 and idx < features.shape[0] and features.shape[1] >= self.candidate_feature_dim:
+            if idx < original_features.shape[0]:
+                width = min(feature_dim, original_features.shape[1])
+                features[new_idx, :width] = original_features[idx, :width]
+            if features.shape[1] >= self.candidate_feature_dim:
                 if self.include_topology_features:
                     feature_utility = utility
                     if not self.include_semantic_features:
                         feature_utility -= float(candidate.get("semantic_score", metadata.get("semantic_score", 0.0)) or 0.0)
-                    features[idx, 5] = np.float32(load_ratio)
-                    features[idx, 14] = np.float32(metadata["route_hops_norm"])
-                    features[idx, 15] = np.float32(route_available)
-                    features[idx, 18] = np.float32(max(-1.0, min(1.0, feature_utility)))
-                    features[idx, 19] = np.float32(max(-1.0, min(1.0, deadline_slack / 20.0)))
-                    features[idx, 20] = np.float32(min(1.0, route_tx_time / 20.0))
-                    features[idx, 21] = np.float32(
+                    features[new_idx, 5] = np.float32(load_ratio)
+                    features[new_idx, 14] = np.float32(metadata["route_hops_norm"])
+                    features[new_idx, 15] = np.float32(route_available)
+                    features[new_idx, 18] = np.float32(max(-1.0, min(1.0, feature_utility)))
+                    features[new_idx, 19] = np.float32(max(-1.0, min(1.0, deadline_slack / 20.0)))
+                    features[new_idx, 20] = np.float32(min(1.0, route_tx_time / 20.0))
+                    features[new_idx, 21] = np.float32(
                         min(
                             1.0,
                             float(
@@ -1457,17 +1651,23 @@ class IPPOPolicy(BaseMARLPolicy):
                             / 40.0,
                         )
                     )
-                    features[idx, 22] = np.float32(min(1.0, float(metadata.get("estimated_compute_s", 0.0) or 0.0) / 20.0))
-                    features[idx, 23] = np.float32(1.0 if deadline_slack < 0.0 else 0.0)
-                    features[idx, 26] = np.float32(min(1.0, wireless_hops / 4.0))
+                    features[new_idx, 22] = np.float32(min(1.0, float(metadata.get("estimated_compute_s", 0.0) or 0.0) / 20.0))
+                    features[new_idx, 23] = np.float32(1.0 if deadline_slack < 0.0 else 0.0)
+                    features[new_idx, 26] = np.float32(min(1.0, wireless_hops / 4.0))
+                    features[new_idx, 28] = np.float32(available_ratio)
+                    features[new_idx, 29] = np.float32(route_hops_norm)
+                    features[new_idx, 30] = np.float32(remaining_ratio)
                 if self.include_temporal_features:
-                    features[idx, 12] = np.float32(max(-1.0, min(1.0, float(metadata.get("mobility_risk", 0.0) or 0.0))))
-                    features[idx, 24] = np.float32(min(1.0, expected_rb_wait / 20.0))
-                    features[idx, 25] = np.float32(min(1.0, wireless_pressure / 8.0))
-                    features[idx, 27] = np.float32(min(1.0, rb_slowdown / 8.0))
+                    features[new_idx, 12] = np.float32(max(-1.0, min(1.0, float(metadata.get("mobility_risk", 0.0) or 0.0))))
+                    features[new_idx, 24] = np.float32(min(1.0, expected_rb_wait / 20.0))
+                    features[new_idx, 25] = np.float32(min(1.0, wireless_pressure / 8.0))
+                    features[new_idx, 27] = np.float32(min(1.0, rb_slowdown / 8.0))
         updated = dict(candidate_set)
         updated["raw_candidates"] = raw_candidates
+        updated["candidate_ids"] = candidate_ids
         updated["candidate_features"] = features
+        updated["candidate_mask"] = candidate_mask
+        updated["sequential_pruned_count"] = pruned_count
         return updated
 
     def _candidate_by_id(self, candidate_set: Mapping[str, Any], instance_id: str) -> Optional[Mapping[str, Any]]:

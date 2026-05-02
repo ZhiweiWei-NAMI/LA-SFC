@@ -59,6 +59,8 @@ class MARLEnvConfig:
     route_hop_floor_s: float = 1.0
     global_candidate_catalog: bool = False
     region_agents: Tuple[str, ...] = ()
+    sequential_capacity_enabled: bool = True
+    sequential_deadline_pruning_enabled: bool = True
 
 
 @dataclass
@@ -575,6 +577,18 @@ class SemanticTopologyMARLEnv:
                     "expected_runtime_penalty_s",
                     "deadline_slack_s",
                     "utility_prior",
+                    "chain_deadline_s",
+                    "chain_remaining_deadline_s",
+                    "remaining_deadline_ratio",
+                    "remaining_function_count",
+                    "resource_capacity_total",
+                    "resource_reserved_count",
+                    "resource_available_slots",
+                    "resource_available_ratio",
+                    "capacity_exhausted",
+                    "hops_from_prev_function",
+                    "hops_from_prev_function_norm",
+                    "sequential_deadline_feasible",
                 ):
                     metadata[f"{field}_by_source"] = {
                         source: float(fields.get(field, 0.0) or 0.0) for source, fields in source_metrics.items()
@@ -669,7 +683,16 @@ class SemanticTopologyMARLEnv:
         semantic_min_score = max(0.0, float(chain_context.get("semantic_min_score", 0.0) or 0.0))
         semantic_shortfall = max(0.0, semantic_min_score - semantic_score)
         deadline_s = float(getattr(getattr(chain, "qos", None), "deadline_s", 0.0) or 0.0)
-        function_budget_s = deadline_s / max(1, len(getattr(chain, "nodes", {}) or {})) if deadline_s > 0.0 else 0.0
+        elapsed_s = 0.0
+        if getattr(chain, "submit_time", None) is not None:
+            elapsed_s = max(0.0, self._time() - float(chain.submit_time or 0.0))
+        remaining_deadline_s = max(0.0, deadline_s - elapsed_s) if deadline_s > 0.0 else 0.0
+        remaining_function_count = self._remaining_function_count(chain, sfc_node_id)
+        function_budget_s = (
+            remaining_deadline_s / max(1, remaining_function_count)
+            if remaining_deadline_s > 0.0
+            else 0.0
+        )
         mismatch_unit = float(chain_context.get("semantic_mismatch_penalty_s_per_unit", 0.0) or 0.0)
         mismatch_cost_s = mismatch_unit * max(0.0, 1.0 - semantic_score) ** 2
         cold_start_s = float(metadata.get("cold_start_s", 0.0) or 0.0)
@@ -683,6 +706,11 @@ class SemanticTopologyMARLEnv:
         )
         max_concurrency = max(1, int(float(metadata.get("max_concurrency", 1) or 1)))
         load_ratio = max(0.0, min(1.0, float(metadata.get("load_ratio", 0.0) or 0.0)))
+        reserved_count = self._node_capacity_reservations().get(str(candidate.node_id), 0)
+        if not self.config.sequential_capacity_enabled:
+            reserved_count = 0
+        resource_available_slots = max(0, max_concurrency - int(current_load) - int(reserved_count))
+        resource_available_ratio = max(0.0, min(1.0, float(resource_available_slots) / float(max_concurrency)))
         effective_cpu = max(0.1, (capacity_cpu / float(max_concurrency)) * max(0.1, 1.0 - 0.5 * load_ratio))
         estimated_compute_s = max(0.0, task_cpu / effective_cpu) if task_cpu > 0.0 else 0.0
         expected_penalty_s = (
@@ -704,9 +732,53 @@ class SemanticTopologyMARLEnv:
         fields["estimated_compute_s"] = estimated_compute_s
         fields["expected_runtime_penalty_s"] = expected_penalty_s
         fields["function_budget_s"] = function_budget_s
+        fields["chain_deadline_s"] = deadline_s
+        fields["chain_elapsed_s"] = elapsed_s
+        fields["chain_remaining_deadline_s"] = remaining_deadline_s
+        fields["remaining_function_count"] = remaining_function_count
+        fields["remaining_deadline_ratio"] = (
+            max(0.0, min(1.0, remaining_deadline_s / deadline_s)) if deadline_s > 0.0 else 1.0
+        )
+        fields["resource_capacity_total"] = max_concurrency
+        fields["resource_reserved_count"] = reserved_count
+        fields["resource_available_slots"] = resource_available_slots
+        fields["resource_available_ratio"] = resource_available_ratio
+        fields["capacity_exhausted"] = 1.0 if resource_available_slots <= 0 else 0.0
+        fields["hops_from_prev_function"] = hop_count
+        fields["hops_from_prev_function_norm"] = min(1.0, float(hop_count) / 4.0)
         fields["deadline_slack_s"] = function_budget_s - expected_penalty_s if function_budget_s > 0.0 else 0.0
+        fields["sequential_deadline_feasible"] = (
+            1.0
+            if not self.config.sequential_deadline_pruning_enabled
+            or remaining_deadline_s <= 0.0
+            or expected_penalty_s <= remaining_deadline_s + 1e-9
+            else 0.0
+        )
         fields["utility_prior"] = semantic_score - (expected_penalty_s / max(1.0, function_budget_s or 1.0))
         return fields
+
+    def _remaining_function_count(self, chain: LASDMServiceChain, sfc_node_id: Optional[str]) -> int:
+        order = list(chain.topological_order())
+        if not order:
+            return 1
+        if sfc_node_id in order:
+            return max(1, len(order) - order.index(str(sfc_node_id)))
+        return max(1, len(order))
+
+    def _node_capacity_reservations(self) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        outputs = getattr(self.runtime_bridge, "node_outputs", {}) or {}
+        for chain in self.manager.chains.values():
+            if chain.status != GraphStatus.RUNNING:
+                continue
+            for node_id in chain.topological_order():
+                output = outputs.get((chain.sfc_id, node_id))
+                if not isinstance(output, Mapping):
+                    continue
+                host = str(output.get("node_id", "") or "")
+                if host:
+                    counts[host] = counts.get(host, 0) + 1
+        return counts
 
     def _sfc_node_task_cpu(self, chain: LASDMServiceChain, sfc_node_id: Optional[str]) -> float:
         if not sfc_node_id or sfc_node_id not in chain.nodes:
@@ -1009,6 +1081,18 @@ class SemanticTopologyMARLEnv:
             "expected_runtime_penalty_s": "expected_runtime_penalty_s_by_source",
             "deadline_slack_s": "deadline_slack_s_by_source",
             "utility_prior": "utility_prior_by_source",
+            "chain_deadline_s": "chain_deadline_s_by_source",
+            "chain_remaining_deadline_s": "chain_remaining_deadline_s_by_source",
+            "remaining_deadline_ratio": "remaining_deadline_ratio_by_source",
+            "remaining_function_count": "remaining_function_count_by_source",
+            "resource_capacity_total": "resource_capacity_total_by_source",
+            "resource_reserved_count": "resource_reserved_count_by_source",
+            "resource_available_slots": "resource_available_slots_by_source",
+            "resource_available_ratio": "resource_available_ratio_by_source",
+            "capacity_exhausted": "capacity_exhausted_by_source",
+            "hops_from_prev_function": "hops_from_prev_function_by_source",
+            "hops_from_prev_function_norm": "hops_from_prev_function_norm_by_source",
+            "sequential_deadline_feasible": "sequential_deadline_feasible_by_source",
         }
         for field, mapping_name in source_fields.items():
             mapping = metadata.get(mapping_name)
@@ -1109,6 +1193,8 @@ def _reward_aux_from_decisions(decisions: Sequence[LASDMDecision]) -> Dict[str, 
     wireless_pressures = []
     wireless_hops = []
     route_available_values = []
+    resource_available_ratios = []
+    remaining_deadline_ratios = []
     semantic_group_counts: Dict[str, int] = {}
     route_unavailable = 0
     for item in selected:
@@ -1133,6 +1219,8 @@ def _reward_aux_from_decisions(decisions: Sequence[LASDMDecision]) -> Dict[str, 
         wireless_hops.append(_to_float(metadata.get("wireless_hops"), 0.0))
         route_available = _to_float(metadata.get("route_available"), _to_float(item.get("route_available"), 1.0))
         route_available_values.append(1.0 if route_available > 0.0 else 0.0)
+        resource_available_ratios.append(_to_float(metadata.get("resource_available_ratio"), 1.0))
+        remaining_deadline_ratios.append(_to_float(metadata.get("remaining_deadline_ratio"), 1.0))
         semantic_group = str(metadata.get("semantic_group", item.get("semantic_group", "unknown")) or "unknown")
         semantic_group_counts[semantic_group] = semantic_group_counts.get(semantic_group, 0) + 1
         if route_available <= 0.0:
@@ -1154,6 +1242,8 @@ def _reward_aux_from_decisions(decisions: Sequence[LASDMDecision]) -> Dict[str, 
         "wireless_pressure": _mean(wireless_pressures),
         "wireless_hops": _mean(wireless_hops),
         "selected_route_available_mean": _mean(route_available_values),
+        "selected_resource_available_ratio_mean": _mean(resource_available_ratios),
+        "selected_remaining_deadline_ratio_mean": _mean(remaining_deadline_ratios),
         "selected_deadline_slack_mean": _mean(deadline_slacks),
         "selected_expected_runtime_penalty_mean": _mean(expected_penalties),
         "selected_topology_risk_mean": _mean(topology_risks),

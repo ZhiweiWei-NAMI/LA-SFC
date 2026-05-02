@@ -370,6 +370,10 @@ def train_semantic_ippo_runtime(
         selection_max_steps = int(marl_cfg.get("ippo_checkpoint_selection_max_steps", max_steps) or max_steps)
         raw_seed_offsets = marl_cfg.get("ippo_checkpoint_selection_seed_offsets", [0, 1000])
         selection_seed_offsets = [int(item) for item in raw_seed_offsets] if isinstance(raw_seed_offsets, Sequence) and not isinstance(raw_seed_offsets, str) else [0, 1000]
+        selection_mode = str(marl_cfg.get("ippo_checkpoint_selection_mode", "raw") or "raw")
+        selection_metric = str(marl_cfg.get("ippo_checkpoint_selection_metric", "success_ratio") or "success_ratio")
+        selection_window = max(1, int(marl_cfg.get("ippo_checkpoint_selection_robust_window", 1) or 1))
+        selection_std_penalty = float(marl_cfg.get("ippo_checkpoint_selection_std_penalty", 0.0) or 0.0)
         best_state: Optional[Dict[str, Any]] = None
         best_score = -float("inf")
         best_metadata: Dict[str, Any] = {}
@@ -397,7 +401,6 @@ def train_semantic_ippo_runtime(
         per_function_rollout_samples = bool(marl_cfg.get("ippo_per_function_rollout_samples", False))
         share_reward_across_functions = bool(marl_cfg.get("ippo_share_reward_across_function_samples", True))
         per_function_reward_mode = str(marl_cfg.get("ippo_per_function_reward_mode", "shared") or "shared")
-        dense_reward_config = dict(marl_cfg.get("reward", {}) or {})
         for episode in range(int(episodes)):
             pretrain_episode = episode < bc_pretrain_episodes
             if pretrain_episode:
@@ -468,7 +471,6 @@ def train_semantic_ippo_runtime(
                                 per_function_samples=per_function_rollout_samples,
                                 share_reward_across_functions=share_reward_across_functions,
                                 per_function_reward_mode=per_function_reward_mode,
-                                dense_reward_config=dense_reward_config,
                                 reward_aux=info.get("reward_aux", {}),
                             )
                         )
@@ -567,24 +569,72 @@ def train_semantic_ippo_runtime(
                         selection_max_steps,
                         baseline,
                     )
-                    validation_score = _ippo_checkpoint_selection_score(validation_metrics)
+                    raw_validation_score = _ippo_checkpoint_selection_score(validation_metrics, metric=selection_metric)
+                    checkpoint_source = "bc" if bc_boundary else "ppo"
                     selection_row = {
                         "episode": episode,
                         "seed": seed,
                         "scenario": "validation_suite",
                         "role": ",".join(str(item) for item in roles),
                         "validation_seed": ",".join(str(item) for item in validation_seeds),
-                        "selection_score": validation_score,
+                        "checkpoint_source": checkpoint_source,
+                        "selection_metric": selection_metric,
+                        "raw_selection_score": raw_validation_score,
                         **validation_metrics,
                     }
                     selection_rows.append(selection_row)
+                    robust_selection_score = _ippo_robust_checkpoint_selection_score(
+                        selection_rows,
+                        window=selection_window,
+                        std_penalty=selection_std_penalty,
+                    )
+                    selection_score = (
+                        robust_selection_score
+                        if selection_mode in {"robust", "bc_or_ppo_robust", "robust_bc_or_ppo"}
+                        else raw_validation_score
+                    )
+                    selection_row.update(
+                        {
+                            "selection_score": selection_score,
+                            "robust_selection_score": robust_selection_score,
+                            "selection_mode": selection_mode,
+                            "robust_window": selection_window,
+                            "robust_std_penalty": selection_std_penalty,
+                            "bc_reference_score": bc_metadata.get("raw_selection_score", ""),
+                            "bc_reference_success_ratio": bc_metadata.get("success_ratio", ""),
+                            "bc_reference_min_success_ratio": bc_metadata.get("min_success_ratio", ""),
+                        }
+                    )
+                    if bc_boundary:
+                        bc_metadata = dict(selection_row)
+                        selection_row.update(
+                            {
+                                "bc_reference_score": selection_row.get("raw_selection_score", ""),
+                                "bc_reference_success_ratio": selection_row.get("success_ratio", ""),
+                                "bc_reference_min_success_ratio": selection_row.get("min_success_ratio", ""),
+                            }
+                        )
+                    seed_non_decrease_count = _ippo_validation_seed_non_decrease_count(
+                        selection_row,
+                        bc_metadata,
+                        tolerance=float(
+                            marl_cfg.get("ippo_checkpoint_selection_seed_non_decrease_tolerance", 0.0) or 0.0
+                        ),
+                    )
+                    selection_row["validation_seed_success_non_decrease_count"] = seed_non_decrease_count
+                    selection_row["validation_seed_success_non_decrease_required"] = int(
+                        marl_cfg.get("ippo_checkpoint_selection_min_seed_non_decrease_count", 0) or 0
+                    )
+                    eligible_for_best = _ippo_checkpoint_eligible_for_best(selection_row, bc_metadata, marl_cfg)
+                    selection_row["eligible_for_best_checkpoint"] = int(eligible_for_best)
+                    if bc_boundary:
+                        bc_metadata = dict(selection_row)
                     _write_csv_dynamic(seed_dir / "checkpoint_selection.csv", selection_rows)
-                    if validation_score > best_score:
-                        best_score = validation_score
+                    if eligible_for_best and selection_score > best_score:
+                        best_score = selection_score
                         best_state = copy.deepcopy(policy.model.state_dict())
                         best_metadata = dict(selection_row)
                     if bc_boundary:
-                        bc_metadata = dict(selection_row)
                         try:
                             policy.torch.save(policy.model.state_dict(), bc_checkpoint_path)
                             bc_checkpoint_saved = bc_checkpoint_path.exists()
@@ -963,8 +1013,25 @@ def _semantic_policy_for_eval(
         policy_config = _config_with_baseline_updates(config, baseline)
         baseline_checkpoint_root = _checkpoint_root_for_baseline(checkpoint_root, baseline)
         strategy = str(dict(config.get("marl", {}) or {}).get("ippo_eval_checkpoint_strategy", "exact_seed"))
+        marl_cfg = dict(config.get("marl", {}) or {})
         if strategy == "global_best_validation":
-            checkpoint, summary_path = _best_validation_checkpoint(baseline_checkpoint_root)
+            if (
+                baseline == "proposed_semantic_topology_marl"
+                and bool(marl_cfg.get("ippo_eval_prefer_ppo_for_proposed", False))
+            ):
+                min_count = int(marl_cfg.get("ippo_eval_min_proposed_ppo_selected_count", 0) or 0)
+                ppo_count = _selected_checkpoint_source_count(baseline_checkpoint_root, "ppo")
+                if min_count > 0 and ppo_count < min_count:
+                    raise RuntimeError(
+                        "proposed_semantic_topology_marl failed PPO-uplift selection: "
+                        f"selected PPO checkpoints={ppo_count}, required={min_count}"
+                    )
+                checkpoint, summary_path = _best_validation_checkpoint(
+                    baseline_checkpoint_root,
+                    checkpoint_source="ppo",
+                )
+            else:
+                checkpoint, summary_path = _best_validation_checkpoint(baseline_checkpoint_root)
         elif strategy == "exact_seed":
             checkpoint = baseline_checkpoint_root / f"ippo_seed_{seed}" / "ippo_policy.pt"
             summary_path = baseline_checkpoint_root / f"ippo_seed_{seed}" / "train_summary.json"
@@ -1474,22 +1541,100 @@ def _evaluate_ippo_policy_selection_suite(
         "timed_out": sum(int(row.get("timed_out", 0) or 0) for row in rows),
         "failed": sum(int(row.get("failed", 0) or 0) for row in rows),
         "succeeded": sum(int(row.get("succeeded", 0) or 0) for row in rows),
+        "validation_case_count": len(rows),
         "validation_details": rows,
     }
 
 
-def _ippo_checkpoint_selection_score(metrics: Mapping[str, Any]) -> float:
-    """Model-selection objective aligned with paper metrics: success first, latency second."""
+def _ippo_checkpoint_selection_score(metrics: Mapping[str, Any], metric: str = "success_ratio") -> float:
+    """Checkpoint selector. Formal runs use SFC completion success ratio."""
 
+    metric_name = str(metric or "success_ratio")
     success = float(metrics.get("success_ratio", 0.0) or 0.0)
+    if metric_name in {"success_ratio", "completion_rate"}:
+        return success
     min_success = float(metrics.get("min_success_ratio", success) or 0.0)
+    if metric_name == "min_success_ratio":
+        return min_success
+    if metric_name != "composite":
+        raise ValueError(f"Unknown IPPO checkpoint selection metric: {metric_name}")
     qos = float(metrics.get("qos_hit_ratio", 0.0) or 0.0)
     task_success = float(metrics.get("task_success_ratio", 0.0) or 0.0)
     finish = float(metrics.get("avg_graph_finish_time", 0.0) or 0.0)
-    timed_out = float(metrics.get("timed_out", 0.0) or 0.0)
-    failed = float(metrics.get("failed", 0.0) or 0.0)
+    case_count = max(1.0, float(metrics.get("validation_case_count", 1.0) or 1.0))
+    timed_out = float(metrics.get("timed_out", 0.0) or 0.0) / case_count
+    failed = float(metrics.get("failed", 0.0) or 0.0) / case_count
     latency_penalty = 0.01 * finish if finish > 0.0 else 0.0
     return 100.0 * min_success + 50.0 * success + 10.0 * task_success + 5.0 * qos - latency_penalty - timed_out - failed
+
+
+def _ippo_robust_checkpoint_selection_score(
+    rows: Sequence[Mapping[str, Any]],
+    window: int = 1,
+    std_penalty: float = 0.0,
+) -> float:
+    """Trailing-window score used to avoid selecting one-off validation spikes."""
+
+    tail = list(rows)[-max(1, int(window)) :]
+    values = [float(row.get("raw_selection_score", row.get("selection_score", 0.0)) or 0.0) for row in tail]
+    if not values:
+        return -float("inf")
+    return mean(values) - float(std_penalty) * (pstdev(values) if len(values) > 1 else 0.0)
+
+
+def _ippo_checkpoint_eligible_for_best(
+    row: Mapping[str, Any],
+    bc_row: Mapping[str, Any],
+    marl_cfg: Mapping[str, Any],
+) -> bool:
+    """Gate PPO checkpoints against the BC checkpoint unless explicitly disabled.
+
+    Per-validation-seed non-decrease is logged as a robustness diagnostic, not
+    as a hard gate. A policy can improve the robust aggregate by fixing the
+    worst cases while slightly moving individual validation seeds.
+    """
+
+    source = str(row.get("checkpoint_source", "ppo") or "ppo")
+    if source == "bc":
+        return True
+    require_bc_improvement = bool(marl_cfg.get("ippo_checkpoint_selection_require_ppo_improves_bc", False))
+    if not require_bc_improvement or not bc_row:
+        return True
+    improvement_ratio = float(marl_cfg.get("ippo_checkpoint_selection_ppo_min_score_ratio", 1.0) or 1.0)
+    current_score = float(row.get("selection_score", row.get("robust_selection_score", -float("inf"))) or -float("inf"))
+    bc_score = float(bc_row.get("selection_score", bc_row.get("raw_selection_score", -float("inf"))) or -float("inf"))
+    return current_score >= bc_score * improvement_ratio
+
+
+def _ippo_validation_seed_non_decrease_count(
+    row: Mapping[str, Any],
+    bc_row: Mapping[str, Any],
+    tolerance: float = 0.0,
+) -> int:
+    current = _ippo_validation_success_by_seed(row)
+    baseline = _ippo_validation_success_by_seed(bc_row)
+    if not current or not baseline:
+        return 0
+    count = 0
+    for seed, success in current.items():
+        if seed in baseline and success + float(tolerance) >= baseline[seed]:
+            count += 1
+    return count
+
+
+def _ippo_validation_success_by_seed(row: Mapping[str, Any]) -> Dict[str, float]:
+    details = row.get("validation_details", []) if isinstance(row, Mapping) else []
+    if not isinstance(details, Sequence) or isinstance(details, (str, bytes)):
+        return {}
+    grouped: Dict[str, List[float]] = {}
+    for item in details:
+        if not isinstance(item, Mapping):
+            continue
+        seed = str(item.get("validation_seed", ""))
+        if not seed:
+            continue
+        grouped.setdefault(seed, []).append(float(item.get("success_ratio", 0.0) or 0.0))
+    return {seed: mean(values) for seed, values in grouped.items() if values}
 
 
 def _ippo_policy_kwargs(
@@ -1516,9 +1661,11 @@ def _ippo_policy_kwargs(
     )
     critic_dim = int(checkpoint_critic_dim or (int(obs_dim) * max(1, critic_agents)))
     device = str(marl_cfg.get("ippo_device", "") or "")
+    candidate_feature_dim = _checkpoint_candidate_feature_dim(state or {}) or _observation_candidate_feature_dim(observations or {}) or 31
     return {
         "observation_dim": int(obs_dim),
         "max_candidates": int(max_candidates),
+        "candidate_feature_dim": int(candidate_feature_dim),
         "seed": int(seed),
         "lr": float(marl_cfg.get("ippo_lr", 3e-4) or 3e-4),
         "utility_prior_logit_weight": float(marl_cfg.get("ippo_utility_prior_logit_weight", 2.5) or 2.5),
@@ -1554,6 +1701,34 @@ def _checkpoint_observation_dim(state: Mapping[str, Any]) -> Optional[int]:
     return None
 
 
+def _observation_candidate_feature_dim(observations: Mapping[str, Mapping[str, Any]]) -> Optional[int]:
+    for observation in observations.values():
+        for candidate_set in observation.get("candidate_sets", []) or []:
+            features = candidate_set.get("candidate_features")
+            shape = getattr(features, "shape", None)
+            if shape is not None and len(shape) == 2 and int(shape[1]) > 0:
+                return int(shape[1])
+    return None
+
+
+def _checkpoint_candidate_feature_dim(state: Mapping[str, Any]) -> Optional[int]:
+    if not isinstance(state, Mapping):
+        return None
+    hidden_dim = None
+    body_weight = state.get("body.0.weight")
+    body_shape = getattr(body_weight, "shape", None)
+    if body_shape is not None and len(body_shape) >= 1:
+        hidden_dim = int(body_shape[0])
+    for key in ("region_candidate_actor.0.weight", "candidate_actor.0.weight"):
+        weight = state.get(key)
+        shape = getattr(weight, "shape", None)
+        if shape is None or len(shape) < 2:
+            continue
+        if hidden_dim is not None and int(shape[1]) > hidden_dim:
+            return int(shape[1]) - hidden_dim
+    return None
+
+
 def _checkpoint_action_dim(state: Mapping[str, Any]) -> Optional[int]:
     weight = state.get("actor.weight") if isinstance(state, Mapping) else None
     shape = getattr(weight, "shape", None)
@@ -1584,12 +1759,15 @@ def _read_checkpoint_summary_seed(path: Path) -> Optional[int]:
     return None
 
 
-def _best_validation_checkpoint(checkpoint_root: Path) -> Tuple[Path, Path]:
+def _best_validation_checkpoint(checkpoint_root: Path, checkpoint_source: Optional[str] = None) -> Tuple[Path, Path]:
     candidates: List[Tuple[float, Path, Path]] = []
     for summary_path in sorted(checkpoint_root.glob("ippo_seed_*/train_summary.json")):
         try:
             payload = json.loads(summary_path.read_text(encoding="utf-8"))
         except Exception:
+            continue
+        best = dict(payload.get("best_selection", {}) or {})
+        if checkpoint_source and str(best.get("checkpoint_source", "") or "") != str(checkpoint_source):
             continue
         checkpoint_path = Path(str(payload.get("checkpoint_path") or summary_path.with_name("ippo_policy.pt")))
         if not checkpoint_path.is_absolute():
@@ -1602,13 +1780,26 @@ def _best_validation_checkpoint(checkpoint_root: Path) -> Tuple[Path, Path]:
         try:
             score_value = float(score)
         except Exception:
-            best = dict(payload.get("best_selection", {}) or {})
             score_value = _ippo_checkpoint_selection_score(best) if best else -float("inf")
         candidates.append((score_value, checkpoint_path, summary_path))
     if not candidates:
-        raise RuntimeError(f"No valid IPPO checkpoints found under {checkpoint_root}")
+        suffix = f" with checkpoint_source={checkpoint_source}" if checkpoint_source else ""
+        raise RuntimeError(f"No valid IPPO checkpoints found under {checkpoint_root}{suffix}")
     candidates.sort(key=lambda item: item[0], reverse=True)
     return candidates[0][1], candidates[0][2]
+
+
+def _selected_checkpoint_source_count(checkpoint_root: Path, checkpoint_source: str) -> int:
+    count = 0
+    for summary_path in sorted(checkpoint_root.glob("ippo_seed_*/train_summary.json")):
+        try:
+            payload = json.loads(summary_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        best = dict(payload.get("best_selection", {}) or {})
+        if str(best.get("checkpoint_source", "") or "") == str(checkpoint_source):
+            count += 1
+    return count
 
 
 def _write_runtime_trace_files(

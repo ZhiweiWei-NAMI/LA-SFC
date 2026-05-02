@@ -6,19 +6,12 @@ from typing import Any, Dict, Mapping, Optional
 
 @dataclass(frozen=True)
 class SFCRewardConfig:
-    success: float = 10.0
-    timeout: float = -5.0
-    dense_enabled: bool = False
-    route_available: float = 0.0
-    deadline_slack: float = 0.0
-    runtime_penalty: float = 0.0
-    topology_risk: float = 0.0
-    mobility_risk: float = 0.0
-    stale_remote: float = 0.0
+    success: float = 1.0
+    timeout: float = 0.0
 
 
 class SFCReward:
-    """Reward shaping for SFC-oriented semantic-topology MARL."""
+    """Basic completion success-rate reward for SFC-oriented MARL."""
 
     def __init__(self, config: Optional[SFCRewardConfig] = None):
         self.config = config or SFCRewardConfig()
@@ -39,26 +32,14 @@ def compute_sfc_reward(
     config: SFCRewardConfig,
 ) -> float:
     success_delta = _delta(previous_summary, current_summary, "succeeded")
+    failed_delta = _delta(previous_summary, current_summary, "failed")
     timeout_delta = _delta(previous_summary, current_summary, "timed_out")
-    active = max(
-        1.0,
-        float(current_summary.get("submitted", 0.0) or 0.0)
-        - float(current_summary.get("succeeded", 0.0) or 0.0)
-        - float(current_summary.get("failed", 0.0) or 0.0)
-        - float(current_summary.get("timed_out", 0.0) or 0.0),
-    )
-    sparse = float((config.success * success_delta + config.timeout * timeout_delta) / active)
-    if not config.dense_enabled:
-        return sparse
-    dense = (
-        config.route_available * _clip(_aux(aux, "selected_route_available_mean"), 0.0, 1.0)
-        + config.deadline_slack * _clip(_aux(aux, "selected_deadline_slack_mean") / 20.0, -1.0, 1.0)
-        + config.runtime_penalty * _clip(_aux(aux, "selected_expected_runtime_penalty_mean"), 0.0, 60.0)
-        + config.topology_risk * _clip(_aux(aux, "selected_topology_risk_mean"), 0.0, 1.0)
-        + config.mobility_risk * _clip(_aux(aux, "selected_mobility_risk_mean"), 0.0, 1.0)
-        + config.stale_remote * _clip(_aux(aux, "selected_stale_remote_ratio"), 0.0, 1.0)
-    )
-    return float(sparse + dense)
+    completed_delta = success_delta + failed_delta + timeout_delta
+    if completed_delta <= 0.0:
+        return 0.0
+    success_rate = success_delta / completed_delta
+    failure_rate = (failed_delta + timeout_delta) / completed_delta
+    return float(config.success * success_rate + config.timeout * failure_rate)
 
 
 def reward_aux_from_observations(observations: Mapping[str, Mapping[str, Any]], overhead_bytes: float = 0.0) -> Dict[str, float]:
@@ -88,16 +69,6 @@ def reward_aux_from_observations(observations: Mapping[str, Mapping[str, Any]], 
 def _delta(previous: Mapping[str, Any], current: Mapping[str, Any], key: str) -> float:
     return float(current.get(key, 0.0) or 0.0) - float(previous.get(key, 0.0) or 0.0)
 
-
-def _aux(aux: Mapping[str, Any], key: str) -> float:
-    try:
-        return float(aux.get(key, 0.0) or 0.0)
-    except Exception:
-        return 0.0
-
-
-def _clip(value: float, lower: float, upper: float) -> float:
-    return max(float(lower), min(float(upper), float(value)))
 
 
 def _mean(values: list[float]) -> float:

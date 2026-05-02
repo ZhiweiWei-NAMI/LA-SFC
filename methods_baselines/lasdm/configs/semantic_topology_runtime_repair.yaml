@@ -51,6 +51,8 @@ marl:
   runtime_max_ticks_after_action: 25
   runtime_stop_when_progress: true
   route_hop_floor_s: 0.10
+  sequential_capacity_enabled: true
+  sequential_deadline_pruning_enabled: true
   # The two stress scenarios materialize up to 25 candidates per SFC function:
   # real infrastructure instances plus semantic-high/topology-bad,
   # semantic-medium/topology-good, semantic-low/topology-good, and stale
@@ -126,9 +128,9 @@ marl:
   ippo_rollout_episodes_per_update: 4
   ippo_per_function_rollout_samples: true
   ippo_share_reward_across_function_samples: true
-  ippo_per_function_reward_mode: local_dense
+  ippo_per_function_reward_mode: shared
   ippo_max_grad_norm: 0.5
-  ippo_return_norm_enabled: true
+  ippo_return_norm_enabled: false
   ippo_return_norm_momentum: 0.95
   ippo_return_norm_eps: 0.000001
   ippo_lr: 0.0002
@@ -152,27 +154,33 @@ marl:
   topology_greedy_utility_prior_weight: 2.00
   ippo_expert_stale_penalty: 0.35
   reward:
-    success: 10.0
-    timeout: -5.0
-    dense_enabled: true
-    route_available: 0.10
-    deadline_slack: 0.05
-    runtime_penalty: -0.05
-    topology_risk: -0.05
-    mobility_risk: -0.05
-    stale_remote: -0.03
+    success: 1.0
+    timeout: 0.0
   # Save the checkpoint that performs best on a small live-runtime validation
   # copy instead of blindly saving the final stochastic RL episode.  This is
   # standard model selection: success/task-success dominate, latency is a
   # secondary tie-breaker.
   ippo_checkpoint_selection_interval: 20
-  ippo_checkpoint_selection_early_interval: 4
+  ippo_checkpoint_selection_early_interval: 20
   ippo_checkpoint_selection_early_until_episode: 40
   ippo_checkpoint_selection_max_steps: 80
-  ippo_checkpoint_selection_seed_offsets: [1000]
+  ippo_checkpoint_selection_seed_offsets: [1000, 1001, 1002, 1003, 1004]
+  ippo_checkpoint_selection_metric: success_ratio
+  ippo_checkpoint_selection_mode: raw
+  ippo_checkpoint_selection_robust_window: 1
+  ippo_checkpoint_selection_std_penalty: 0.0
+  ippo_checkpoint_selection_require_ppo_improves_bc: true
+  ippo_checkpoint_selection_ppo_min_score_ratio: 1.0
+  ippo_checkpoint_selection_min_seed_non_decrease_count: 3
+  ippo_checkpoint_selection_seed_non_decrease_tolerance: 0.0
   # Use the checkpoint with the best live-runtime validation score across
   # random restarts; evaluation still runs on held-out eval seeds.
   ippo_eval_checkpoint_strategy: global_best_validation
+  # BC is a topology-greedy student initialization. For the final proposed
+  # method, only a PPO-finetuned checkpoint can be selected when the majority
+  # of training seeds passed the BC-uplift gate.
+  ippo_eval_prefer_ppo_for_proposed: true
+  ippo_eval_min_proposed_ppo_selected_count: 3
   ippo_training_progress_guard_enabled: true
   ippo_training_guard_min_episodes: 5
   ippo_training_guard_recent_window: 3
