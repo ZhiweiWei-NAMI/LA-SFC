@@ -705,6 +705,7 @@ class SemanticTopologyMARLEnv:
             else float(metadata.get("capacity_cpu", 0.0) or 0.0),
         )
         max_concurrency = max(1, int(float(metadata.get("max_concurrency", 1) or 1)))
+        current_load = max(0, int(float(metadata.get("current_load", 0) or 0)))
         load_ratio = max(0.0, min(1.0, float(metadata.get("load_ratio", 0.0) or 0.0)))
         reserved_count = self._node_capacity_reservations().get(str(candidate.node_id), 0)
         if not self.config.sequential_capacity_enabled:
@@ -750,7 +751,7 @@ class SemanticTopologyMARLEnv:
         fields["sequential_deadline_feasible"] = (
             1.0
             if not self.config.sequential_deadline_pruning_enabled
-            or remaining_deadline_s <= 0.0
+            or deadline_s <= 0.0
             or expected_penalty_s <= remaining_deadline_s + 1e-9
             else 0.0
         )
