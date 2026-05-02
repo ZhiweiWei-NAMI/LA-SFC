@@ -27,7 +27,13 @@ from airfogsim.lasdm.benchmark_adapter import run_lasdm_benchmark_suite
 from airfogsim.lasdm.env_adapter import LASDMEnvAdapter
 from airfogsim.lasdm.graph_observation import flatten_observation
 from airfogsim.lasdm.marl_policy import IPPOPolicy, policy_from_name
-from airfogsim.lasdm.marl_trainer import PPORolloutStep, TrainingMetrics, ppo_update_policy, write_reward_curve
+from airfogsim.lasdm.marl_trainer import (
+    PPORolloutStep,
+    TrainingMetrics,
+    ppo_update_policy,
+    rollout_steps_from_policy_step,
+    write_reward_curve,
+)
 from airfogsim.lasdm.runtime_bridge import LASDMRuntimeBridge
 from airfogsim.lasdm.topology_builder import TopologyBuilder
 
@@ -359,12 +365,19 @@ def train_semantic_ippo_runtime(
         bc_finetune_steps = int(marl_cfg.get("ippo_behavior_clone_finetune_steps_per_observation", 0) or 0)
         reward_curve_policy_only = bool(marl_cfg.get("ippo_reward_curve_policy_only", False))
         selection_interval = int(marl_cfg.get("ippo_checkpoint_selection_interval", 0) or 0)
+        early_selection_interval = int(marl_cfg.get("ippo_checkpoint_selection_early_interval", 0) or 0)
+        early_selection_until = int(marl_cfg.get("ippo_checkpoint_selection_early_until_episode", 0) or 0)
         selection_max_steps = int(marl_cfg.get("ippo_checkpoint_selection_max_steps", max_steps) or max_steps)
         raw_seed_offsets = marl_cfg.get("ippo_checkpoint_selection_seed_offsets", [0, 1000])
         selection_seed_offsets = [int(item) for item in raw_seed_offsets] if isinstance(raw_seed_offsets, Sequence) and not isinstance(raw_seed_offsets, str) else [0, 1000]
         best_state: Optional[Dict[str, Any]] = None
         best_score = -float("inf")
         best_metadata: Dict[str, Any] = {}
+        bc_checkpoint_path = seed_dir / "ippo_bc_policy.pt"
+        bc_checkpoint_saved = False
+        bc_checkpoint_error = ""
+        bc_metadata: Dict[str, Any] = {}
+        bc_selection_rows: List[Dict[str, Any]] = []
         selection_rows: List[Dict[str, Any]] = []
         reward_rows: List[TrainingMetrics] = []
         progress_rows: List[Dict[str, Any]] = []
@@ -378,8 +391,24 @@ def train_semantic_ippo_runtime(
         normalize_returns = bool(marl_cfg.get("ippo_return_norm_enabled", marl_cfg.get("ippo_normalize_returns", True)))
         return_norm_momentum = float(marl_cfg.get("ippo_return_norm_momentum", 0.95) or 0.95)
         return_norm_eps = float(marl_cfg.get("ippo_return_norm_eps", 1e-6) or 1e-6)
+        bc_label_strategy = str(marl_cfg.get("ippo_bc_label_strategy", "expert") or "expert")
+        bc_stale_relabel_margin = float(marl_cfg.get("ippo_bc_stale_relabel_margin", 0.05) or 0.0)
+        bc_deadline_relabel_margin = float(marl_cfg.get("ippo_bc_deadline_relabel_margin", 0.05) or 0.0)
+        per_function_rollout_samples = bool(marl_cfg.get("ippo_per_function_rollout_samples", False))
+        share_reward_across_functions = bool(marl_cfg.get("ippo_share_reward_across_function_samples", True))
+        per_function_reward_mode = str(marl_cfg.get("ippo_per_function_reward_mode", "shared") or "shared")
+        dense_reward_config = dict(marl_cfg.get("reward", {}) or {})
         for episode in range(int(episodes)):
-            scenario = scenarios[episode % len(scenarios)]
+            pretrain_episode = episode < bc_pretrain_episodes
+            if pretrain_episode:
+                scenario = _ippo_bc_scenario_for_episode(scenarios, marl_cfg, episode)
+            else:
+                scenario = _ippo_training_scenario_for_episode(
+                    scenarios,
+                    marl_cfg,
+                    episode - bc_pretrain_episodes,
+                    max(1, int(episodes) - bc_pretrain_episodes),
+                )
             role = roles[episode % len(roles)]
             env, air_env = _build_semantic_runtime_env(config, scenario, role, seed, baseline, max_steps)
             episode_steps: List[PPORolloutStep] = []
@@ -395,12 +424,28 @@ def train_semantic_ippo_runtime(
                         **_ippo_policy_kwargs(policy_config, obs_dim, max_candidates, seed, observations=observations)
                     )
                 total = 0.0
-                pretrain_episode = episode < bc_pretrain_episodes
                 bc_steps = bc_pretrain_steps if pretrain_episode else bc_finetune_steps
+                bc_loss_weighted_sum = 0.0
+                bc_sample_count = 0
+                bc_relabel_count = 0
+                bc_quality_rows: List[Dict[str, Any]] = []
                 for step in range(int(max_steps)):
                     expert_actions = expert_policy.act(observations, deterministic=True)
                     for _ in range(max(0, bc_steps)):
-                        policy.supervised_update(observations, expert_actions)
+                        policy.supervised_update(
+                            observations,
+                            expert_actions,
+                            label_strategy=bc_label_strategy,
+                            stale_relabel_margin=bc_stale_relabel_margin,
+                            deadline_relabel_margin=bc_deadline_relabel_margin,
+                        )
+                        bc_loss_weighted_sum += float(getattr(policy, "last_supervised_loss", 0.0)) * float(
+                            getattr(policy, "last_supervised_samples", 0) or 0
+                        )
+                        bc_sample_count += int(getattr(policy, "last_supervised_samples", 0) or 0)
+                        bc_relabel_count += int(getattr(policy, "last_supervised_relabels", 0) or 0)
+                    if bc_steps > 0:
+                        bc_quality_rows.append(_ippo_bc_quality_metrics(policy, observations, expert_actions))
                     current_observations = observations
                     if pretrain_episode:
                         policy_step = None
@@ -412,20 +457,21 @@ def train_semantic_ippo_runtime(
                     mean_reward = sum(rewards.values()) / max(1, len(rewards))
                     total += mean_reward
                     if policy_step is not None:
-                        step_log_prob = _mean_tensor(policy_step.log_prob_tensors)
-                        step_value = _mean_tensor(policy_step.value_tensors)
-                        if step_log_prob is not None and step_value is not None:
-                            episode_steps.append(
-                                PPORolloutStep(
-                                    observations=current_observations,
-                                    actions=policy_step.actions,
-                                    reward=float(mean_reward),
-                                    old_log_prob=_tensor_float(step_log_prob),
-                                    old_value=_tensor_float(step_value),
-                                    done=bool(done or step + 1 >= int(max_steps)),
-                                    episode=int(episode),
-                                )
+                        episode_steps.extend(
+                            rollout_steps_from_policy_step(
+                                policy,
+                                current_observations,
+                                policy_step.actions,
+                                mean_reward=float(mean_reward),
+                                done=bool(done or step + 1 >= int(max_steps)),
+                                episode=int(episode),
+                                per_function_samples=per_function_rollout_samples,
+                                share_reward_across_functions=share_reward_across_functions,
+                                per_function_reward_mode=per_function_reward_mode,
+                                dense_reward_config=dense_reward_config,
+                                reward_aux=info.get("reward_aux", {}),
                             )
+                        )
                     summary_dict = info.get("summary", {})
                     episode_summary = dict(summary_dict)
                     episode_step_count = step + 1
@@ -493,11 +539,18 @@ def train_semantic_ippo_runtime(
                     _write_runtime_trace_files(seed_dir, "semantic_runtime_train", baseline, scenario, role, seed, env)
                     wrote_episode_traces = True
                 selection_allowed = (episode + 1) >= bc_pretrain_episodes
+                bc_boundary = bc_pretrain_episodes > 0 and (episode + 1) == bc_pretrain_episodes
+                active_selection_interval = selection_interval
+                if early_selection_interval > 0 and (episode + 1) <= max(0, early_selection_until):
+                    active_selection_interval = early_selection_interval
+                selection_due = (
+                    active_selection_interval > 0
+                    and ((episode + 1) % active_selection_interval == 0 or episode == episodes - 1 or bc_boundary)
+                )
                 if (
                     policy is not None
                     and selection_allowed
-                    and selection_interval > 0
-                    and ((episode + 1) % selection_interval == 0 or episode == episodes - 1)
+                    and selection_due
                 ):
                     _close_env(air_env)
                     air_env = None
@@ -530,22 +583,48 @@ def train_semantic_ippo_runtime(
                         best_score = validation_score
                         best_state = copy.deepcopy(policy.model.state_dict())
                         best_metadata = dict(selection_row)
+                    if bc_boundary:
+                        bc_metadata = dict(selection_row)
+                        try:
+                            policy.torch.save(policy.model.state_dict(), bc_checkpoint_path)
+                            bc_checkpoint_saved = bc_checkpoint_path.exists()
+                            bc_checkpoint_error = ""
+                        except Exception as exc:
+                            bc_checkpoint_saved = False
+                            bc_checkpoint_error = str(exc)
+                        bc_selection_rows.append(
+                            {
+                                **selection_row,
+                                "checkpoint_path": str(bc_checkpoint_path) if bc_checkpoint_saved else "",
+                                "checkpoint_saved": bc_checkpoint_saved,
+                                "checkpoint_sha256": _sha256_file(bc_checkpoint_path) if bc_checkpoint_saved else "",
+                                "checkpoint_error": bc_checkpoint_error,
+                            }
+                        )
+                        _write_csv_dynamic(seed_dir / "bc_checkpoint_selection.csv", bc_selection_rows)
                 if episode == episodes - 1 and not wrote_episode_traces:
                     env.write_traces(str(seed_dir))
                     _write_runtime_trace_files(seed_dir, "semantic_runtime_train", baseline, scenario, role, seed, env)
-                progress_rows.append(
-                    _runtime_training_progress_row(
-                        seed=seed,
-                        episode=episode,
-                        scenario=scenario,
-                        role=role,
-                        pretrain_episode=pretrain_episode,
-                        bc_steps=bc_steps,
-                        step_count=episode_step_count,
-                        total_reward=total,
-                        summary=episode_summary,
-                    )
+                progress_row = _runtime_training_progress_row(
+                    seed=seed,
+                    episode=episode,
+                    scenario=scenario,
+                    role=role,
+                    pretrain_episode=pretrain_episode,
+                    bc_steps=bc_steps,
+                    step_count=episode_step_count,
+                    total_reward=total,
+                    summary=episode_summary,
                 )
+                progress_row.update(
+                    {
+                        "bc_loss": bc_loss_weighted_sum / max(1, bc_sample_count),
+                        "bc_samples": bc_sample_count,
+                        "bc_relabels": bc_relabel_count,
+                        **_mean_metric_rows(bc_quality_rows, prefix="bc_"),
+                    }
+                )
+                progress_rows.append(progress_row)
                 write_reward_curve(seed_dir / "reward_curve.csv", reward_rows)
                 _write_csv_dynamic(seed_dir / "train_progress.csv", progress_rows)
                 _write_csv_dynamic(seed_dir / "ppo_diagnostics.csv", ppo_diagnostic_rows)
@@ -560,6 +639,8 @@ def train_semantic_ippo_runtime(
                 _close_env(air_env)
         write_reward_curve(seed_dir / "reward_curve.csv", reward_rows)
         _write_csv_dynamic(seed_dir / "checkpoint_selection.csv", selection_rows)
+        if bc_selection_rows:
+            _write_csv_dynamic(seed_dir / "bc_checkpoint_selection.csv", bc_selection_rows)
         checkpoint_path = seed_dir / "ippo_policy.pt"
         checkpoint_saved = False
         checkpoint_error = ""
@@ -582,6 +663,11 @@ def train_semantic_ippo_runtime(
             "checkpoint_path": str(checkpoint_path) if checkpoint_saved else "",
             "checkpoint_sha256": _sha256_file(checkpoint_path) if checkpoint_saved else "",
             "checkpoint_error": checkpoint_error,
+            "bc_checkpoint_saved": bc_checkpoint_saved,
+            "bc_checkpoint_path": str(bc_checkpoint_path) if bc_checkpoint_saved else "",
+            "bc_checkpoint_sha256": _sha256_file(bc_checkpoint_path) if bc_checkpoint_saved else "",
+            "bc_checkpoint_error": bc_checkpoint_error,
+            "bc_selection": bc_metadata,
             "behavior_clone_pretrain_episodes": bc_pretrain_episodes,
             "behavior_clone_pretrain_steps_per_observation": bc_pretrain_steps,
             "behavior_clone_finetune_steps_per_observation": bc_finetune_steps,
@@ -590,6 +676,8 @@ def train_semantic_ippo_runtime(
             "ippo_centralized_critic": bool(marl_cfg.get("ippo_centralized_critic", True)),
             "ippo_critic_agent_count": int(marl_cfg.get("ippo_critic_agent_count", 4) or 4),
             "checkpoint_selection_interval": selection_interval,
+            "checkpoint_selection_early_interval": early_selection_interval,
+            "checkpoint_selection_early_until_episode": early_selection_until,
             "checkpoint_selection_max_steps": selection_max_steps,
             "checkpoint_selection_seed_offsets": selection_seed_offsets,
             "best_selection_score": best_score if best_metadata else "",
@@ -1080,6 +1168,212 @@ def _runtime_ippo_episode_update(
     )
 
 
+def _ippo_bc_quality_metrics(
+    policy: IPPOPolicy,
+    observations: Mapping[str, Mapping[str, Any]],
+    expert_actions: Mapping[str, Any],
+) -> Dict[str, Any]:
+    torch = policy.torch
+    was_training = bool(policy.model.training)
+    policy.model.eval()
+    top1 = 0
+    top3 = 0
+    count = 0
+    utility_gaps: List[float] = []
+    route_available: List[float] = []
+    deadline_feasible: List[float] = []
+    stale_remote: List[float] = []
+    high_topology_bad: List[float] = []
+    selected_ranks: List[float] = []
+    with torch.no_grad():
+        for agent_id, observation in observations.items():
+            if policy.use_region_encoder:
+                obs_tensor = policy.model.region_context_tensor(observation, policy.device)
+                logits = None
+            else:
+                obs_tensor = torch.tensor(
+                    policy._fit_dim(flatten_observation(observation)),
+                    dtype=torch.float32,
+                    device=policy.device,
+                ).unsqueeze(0)
+                logits = policy.model.actor_logits(obs_tensor)
+            agent_payload = expert_actions.get(str(agent_id), {}) if isinstance(expert_actions, Mapping) else {}
+            if not isinstance(agent_payload, Mapping):
+                continue
+            grouped: Dict[str, List[Mapping[str, Any]]] = {}
+            for candidate_set in observation.get("candidate_sets", []) or []:
+                grouped.setdefault(str(candidate_set.get("sfc_id", "")), []).append(candidate_set)
+            for sfc_id, candidate_sets in grouped.items():
+                current_source = str(candidate_sets[0].get("source_node_id", "")) if candidate_sets else ""
+                planned_node_load: Dict[str, int] = {}
+                for candidate_set in sorted(candidate_sets, key=lambda item: int(item.get("sfc_node_index", 0) or 0)):
+                    contextual = policy._contextual_candidate_set(candidate_set, current_source, planned_node_load)
+                    ids = list(contextual.get("candidate_ids", []) or [])
+                    mask_len = min(len(ids), policy.max_candidates)
+                    if mask_len <= 0:
+                        continue
+                    sfc_node_id = str(contextual.get("sfc_node_id", ""))
+                    target_id = None
+                    if isinstance(agent_payload.get(sfc_id), Mapping):
+                        target_id = agent_payload.get(sfc_id, {}).get(sfc_node_id)
+                    if not target_id or str(target_id) not in ids[:mask_len]:
+                        continue
+                    base_logits = None if logits is None else logits[0, :mask_len]
+                    scores = policy._candidate_scores(obs_tensor, base_logits, contextual, mask_len)
+                    scores = policy._apply_route_penalty(scores, contextual, mask_len)
+                    order = torch.argsort(scores, descending=True).detach().cpu().tolist()
+                    selected_idx = int(order[0])
+                    target_idx = int(ids[:mask_len].index(str(target_id)))
+                    selected_id = str(ids[selected_idx])
+                    selected_candidate = policy._candidate_by_id(contextual, selected_id)
+                    target_candidate = policy._candidate_by_id(contextual, str(target_id))
+                    raw_candidates = list(contextual.get("raw_candidates", []) or [])[:mask_len]
+                    if selected_candidate is None or target_candidate is None or not raw_candidates:
+                        continue
+                    utility_values = [_ippo_candidate_utility(item) for item in raw_candidates]
+                    best_utility = max(utility_values) if utility_values else 0.0
+                    selected_utility = _ippo_candidate_utility(selected_candidate)
+                    top1 += int(selected_id == str(target_id))
+                    top3 += int(target_idx in order[: min(3, len(order))])
+                    count += 1
+                    utility_gaps.append(best_utility - selected_utility)
+                    route_available.append(_ippo_route_available(selected_candidate))
+                    deadline_feasible.append(
+                        1.0 if _ippo_metadata_float(selected_candidate, "deadline_slack_s", 0.0) >= 0.0 else 0.0
+                    )
+                    stale_remote.append(_ippo_candidate_stale(selected_candidate))
+                    high_topology_bad.append(
+                        1.0 if _ippo_candidate_group(selected_candidate) == "semantic_high_topology_bad" else 0.0
+                    )
+                    selected_ranks.append(float(_ippo_rank_desc(utility_values, selected_idx)))
+                    node_id = str(target_candidate.get("node_id", ""))
+                    if node_id:
+                        current_source = node_id
+                        planned_node_load[node_id] = planned_node_load.get(node_id, 0) + 1
+    if was_training:
+        policy.model.train()
+    return {
+        "candidate_choice_samples": count,
+        "top1_accuracy": top1 / max(1, count),
+        "top3_accuracy": top3 / max(1, count),
+        "policy_utility_gap_mean": mean(utility_gaps) if utility_gaps else 0.0,
+        "selected_route_available_ratio": mean(route_available) if route_available else 0.0,
+        "selected_deadline_feasible_ratio": mean(deadline_feasible) if deadline_feasible else 0.0,
+        "selected_stale_remote_ratio": mean(stale_remote) if stale_remote else 0.0,
+        "selected_high_topology_bad_ratio": mean(high_topology_bad) if high_topology_bad else 0.0,
+        "selected_candidate_rank_mean": mean(selected_ranks) if selected_ranks else 0.0,
+    }
+
+
+def _mean_metric_rows(rows: Sequence[Mapping[str, Any]], prefix: str = "") -> Dict[str, Any]:
+    values: Dict[str, List[float]] = {}
+    for row in rows:
+        for key, value in row.items():
+            try:
+                values.setdefault(str(key), []).append(float(value))
+            except (TypeError, ValueError):
+                continue
+    return {f"{prefix}{key}": mean(items) for key, items in values.items() if items}
+
+
+def _ippo_candidate_utility(candidate: Mapping[str, Any]) -> float:
+    metadata = dict(candidate.get("metadata", {}) or {})
+    return float(metadata.get("utility_prior", candidate.get("utility_prior", 0.0)) or 0.0)
+
+
+def _ippo_metadata_float(candidate: Mapping[str, Any], key: str, default: float) -> float:
+    metadata = dict(candidate.get("metadata", {}) or {})
+    return float(metadata.get(key, candidate.get(key, default)) or default)
+
+
+def _ippo_candidate_group(candidate: Mapping[str, Any]) -> str:
+    metadata = dict(candidate.get("metadata", {}) or {})
+    return str(metadata.get("semantic_group", candidate.get("semantic_group", "")) or "")
+
+
+def _ippo_candidate_stale(candidate: Mapping[str, Any]) -> float:
+    return 1.0 if _ippo_candidate_group(candidate) == "stale_remote_candidates" else 0.0
+
+
+def _ippo_route_available(candidate: Mapping[str, Any]) -> float:
+    return 1.0 if _ippo_metadata_float(candidate, "route_available", 1.0) > 0.0 else 0.0
+
+
+def _ippo_rank_desc(values: Sequence[float], index: int) -> int:
+    if index < 0 or index >= len(values):
+        return len(values)
+    ranked = sorted(range(len(values)), key=lambda idx: values[idx], reverse=True)
+    return ranked.index(index) + 1 if index in ranked else len(values)
+
+
+def _ippo_training_scenario_for_episode(
+    scenarios: Sequence[Mapping[str, Any]],
+    marl_cfg: Mapping[str, Any],
+    episode: int,
+    total_episodes: int,
+) -> Mapping[str, Any]:
+    if not scenarios:
+        return {"name": "default"}
+    if not bool(marl_cfg.get("ippo_curriculum_enabled", False)):
+        return scenarios[int(episode) % len(scenarios)]
+    phases = list(marl_cfg.get("ippo_curriculum", []) or [])
+    if not phases:
+        return scenarios[int(episode) % len(scenarios)]
+    scenario_by_name = {str(item.get("name", "")): item for item in scenarios}
+    cursor = 0
+    normalized: List[Tuple[int, List[Mapping[str, Any]]]] = []
+    remaining_fraction = 1.0
+    unspecified: List[Mapping[str, Any]] = []
+    for phase in phases:
+        if not isinstance(phase, Mapping):
+            continue
+        names = [str(item) for item in (phase.get("scenarios", []) or [])]
+        phase_scenarios = [scenario_by_name[name] for name in names if name in scenario_by_name]
+        if not phase_scenarios:
+            continue
+        if "episodes" in phase:
+            phase_episodes = max(0, int(phase.get("episodes", 0) or 0))
+            normalized.append((phase_episodes, phase_scenarios))
+            continue
+        if "fraction" in phase:
+            fraction = max(0.0, min(1.0, float(phase.get("fraction", 0.0) or 0.0)))
+            remaining_fraction = max(0.0, remaining_fraction - fraction)
+            normalized.append((max(1, int(round(max(1, total_episodes) * fraction))), phase_scenarios))
+            continue
+        unspecified.append(phase)
+    if unspecified:
+        share = remaining_fraction / max(1, len(unspecified))
+        for phase in unspecified:
+            names = [str(item) for item in (phase.get("scenarios", []) or [])]
+            phase_scenarios = [scenario_by_name[name] for name in names if name in scenario_by_name]
+            if phase_scenarios:
+                normalized.append((max(1, int(round(max(1, total_episodes) * share))), phase_scenarios))
+    for phase_episodes, phase_scenarios in normalized:
+        if phase_episodes <= 0:
+            continue
+        if int(episode) < cursor + phase_episodes:
+            return phase_scenarios[(int(episode) - cursor) % len(phase_scenarios)]
+        cursor += phase_episodes
+    return scenarios[int(episode) % len(scenarios)]
+
+
+def _ippo_bc_scenario_for_episode(
+    scenarios: Sequence[Mapping[str, Any]],
+    marl_cfg: Mapping[str, Any],
+    episode: int,
+) -> Mapping[str, Any]:
+    if not scenarios:
+        return {"name": "default"}
+    names = [str(item) for item in (marl_cfg.get("ippo_bc_scenarios", []) or [])]
+    if not names:
+        return scenarios[int(episode) % len(scenarios)]
+    scenario_by_name = {str(item.get("name", "")): item for item in scenarios}
+    bc_scenarios = [scenario_by_name[name] for name in names if name in scenario_by_name]
+    if not bc_scenarios:
+        return scenarios[int(episode) % len(scenarios)]
+    return bc_scenarios[int(episode) % len(bc_scenarios)]
+
+
 def _scheduled_ippo_entropy_coef(marl_cfg: Mapping[str, Any], episode: int) -> float:
     fallback = float(marl_cfg.get("ippo_entropy_coef", 0.01) or 0.01)
     if "ippo_entropy_coef_start" not in marl_cfg or "ippo_entropy_coef_end" not in marl_cfg:
@@ -1196,20 +1490,6 @@ def _ippo_checkpoint_selection_score(metrics: Mapping[str, Any]) -> float:
     failed = float(metrics.get("failed", 0.0) or 0.0)
     latency_penalty = 0.01 * finish if finish > 0.0 else 0.0
     return 100.0 * min_success + 50.0 * success + 10.0 * task_success + 5.0 * qos - latency_penalty - timed_out - failed
-
-
-def _mean_tensor(items: Sequence[Any]) -> Optional[Any]:
-    if not items:
-        return None
-    first = items[0]
-    torch = getattr(first, "new_tensor", None)
-    if torch is None:
-        return None
-    return sum(item.reshape(()) for item in items) / float(len(items))
-
-
-def _tensor_float(item: Any) -> float:
-    return float(item.detach().cpu().item())
 
 
 def _ippo_policy_kwargs(

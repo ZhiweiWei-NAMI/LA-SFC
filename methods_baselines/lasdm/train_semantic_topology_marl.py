@@ -552,6 +552,10 @@ def apply_semantic_scenario_overrides(
         chain["nodes"] = [dict(node) for node in chain.get("nodes", []) if str(node.get("node_id")) == "preprocess"]
         chain["edges"] = []
 
+    target_sfc_length = scenario.get("sfc_length", scenario.get("chain_length"))
+    if target_sfc_length is not None:
+        _apply_sfc_length_override(chain, int(target_sfc_length))
+
     output_ratio = scenario.get("output_ratio")
     if output_ratio is not None:
         ratio = max(0.0, float(output_ratio))
@@ -582,6 +586,43 @@ def apply_semantic_scenario_overrides(
         chain["source_node_id"] = str(forced_source)
         chain["sink_node_id"] = str(scenario.get("forced_sink_node_id", scenario.get("sink_node_id", forced_source)))
     return chain
+
+
+def _apply_sfc_length_override(chain: Dict[str, Any], target_length: int) -> None:
+    """Extend the inspection pipeline for chain-length sweeps."""
+
+    nodes = [dict(node) for node in chain.get("nodes", []) or []]
+    edges = [dict(edge) for edge in chain.get("edges", []) or []]
+    if target_length <= 0 or len(nodes) >= target_length:
+        chain["nodes"] = nodes
+        chain["edges"] = edges
+        return
+    while len(nodes) < target_length:
+        last = nodes[-1] if nodes else {}
+        previous_id = str(last.get("node_id", "verify"))
+        index = len(nodes) + 1
+        node_id = "archive" if "archive" not in {str(node.get("node_id")) for node in nodes} else f"archive_{index}"
+        input_semantic = str(last.get("output_semantic", "verified_event"))
+        output_semantic = "archived_event" if node_id == "archive" else f"archived_event_{index}"
+        nodes.append(
+            {
+                "node_id": node_id,
+                "service_type": "event_archive",
+                "required_capabilities": ["event_archive"],
+                "input_semantic": input_semantic,
+                "output_semantic": output_semantic,
+                "cpu_mb": 4.0,
+                "memory_mb": 1024.0,
+                "metadata": {
+                    "task_cpu": 24.0,
+                    "output_ratio": 0.10,
+                    "required_returned_size": 0.0,
+                },
+            }
+        )
+        edges.append({"from": previous_id, "to": node_id})
+    chain["nodes"] = nodes
+    chain["edges"] = edges
 
 
 def _scenario_preferred_region(scenario: Mapping[str, Any], request_index: int, source_node_id: str) -> str:

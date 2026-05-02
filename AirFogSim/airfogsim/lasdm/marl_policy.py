@@ -917,6 +917,9 @@ class IPPOPolicy(BaseMARLPolicy):
             self.learnable_logit_blend,
         ).to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=float(lr))
+        self.last_supervised_loss = 0.0
+        self.last_supervised_samples = 0
+        self.last_supervised_relabels = 0
 
     def act(self, observations: Mapping[str, Mapping[str, Any]], deterministic: bool = False) -> Dict[str, Dict[str, Dict[str, str]]]:
         return self.act_with_logprobs(observations, deterministic=deterministic).actions
@@ -1015,6 +1018,7 @@ class IPPOPolicy(BaseMARLPolicy):
         self,
         observations: Mapping[str, Mapping[str, Any]],
         actions: Mapping[str, Any],
+        action_filter: Optional[Mapping[str, str]] = None,
     ) -> Optional[PolicyEvaluation]:
         log_prob_tensors: List[Any] = []
         value_tensors: List[Any] = []
@@ -1022,7 +1026,12 @@ class IPPOPolicy(BaseMARLPolicy):
         action_count = 0
         torch = self.torch
         centralized_value = self._centralized_value_tensor(observations) if self.centralized_critic else None
+        filter_agent = str(action_filter.get("agent_id", "")) if action_filter else ""
+        filter_sfc = str(action_filter.get("sfc_id", "")) if action_filter else ""
+        filter_node = str(action_filter.get("sfc_node_id", "")) if action_filter else ""
         for agent_id, observation in observations.items():
+            if filter_agent and str(agent_id) != filter_agent:
+                continue
             if self.use_region_encoder:
                 obs_tensor = self.model.region_context_tensor(observation, self.device)
                 logits = None
@@ -1043,6 +1052,8 @@ class IPPOPolicy(BaseMARLPolicy):
             for set_idx, candidate_set in enumerate(observation.get("candidate_sets", []) or []):
                 grouped.setdefault(str(candidate_set.get("sfc_id", "")), []).append((set_idx, candidate_set))
             for sfc_id, items in grouped.items():
+                if filter_sfc and str(sfc_id) != filter_sfc:
+                    continue
                 current_source = str(items[0][1].get("source_node_id", "")) if items else ""
                 planned_node_load: Dict[str, int] = {}
                 for _set_idx, candidate_set in sorted(items, key=lambda item: int(item[1].get("sfc_node_index", 0) or 0)):
@@ -1055,16 +1066,17 @@ class IPPOPolicy(BaseMARLPolicy):
                     mask_len = min(len(ids), self.max_candidates)
                     if str(chosen) not in ids[:mask_len]:
                         continue
-                    action_idx = ids[:mask_len].index(str(chosen))
-                    base_logits = None if logits is None else logits[0, :mask_len]
-                    candidate_logits = self._candidate_scores(obs_tensor, base_logits, contextual, mask_len)
-                    candidate_logits = self._apply_route_penalty(candidate_logits, contextual, mask_len)
-                    dist = torch.distributions.Categorical(logits=candidate_logits)
-                    target = torch.tensor(action_idx, device=candidate_logits.device)
-                    log_prob_tensors.append(dist.log_prob(target))
-                    entropy_tensors.append(dist.entropy())
-                    action_count += 1
-                    agent_action_count += 1
+                    if not filter_node or sfc_node_id == filter_node:
+                        action_idx = ids[:mask_len].index(str(chosen))
+                        base_logits = None if logits is None else logits[0, :mask_len]
+                        candidate_logits = self._candidate_scores(obs_tensor, base_logits, contextual, mask_len)
+                        candidate_logits = self._apply_route_penalty(candidate_logits, contextual, mask_len)
+                        dist = torch.distributions.Categorical(logits=candidate_logits)
+                        target = torch.tensor(action_idx, device=candidate_logits.device)
+                        log_prob_tensors.append(dist.log_prob(target))
+                        entropy_tensors.append(dist.entropy())
+                        action_count += 1
+                        agent_action_count += 1
                     chosen_candidate = self._candidate_by_id(contextual, str(chosen))
                     if chosen_candidate is not None:
                         node_id = str(chosen_candidate.get("node_id", ""))
@@ -1173,10 +1185,25 @@ class IPPOPolicy(BaseMARLPolicy):
             snapshot["logit_blend"] = self.model.logit_blend_snapshot()
         return snapshot
 
-    def supervised_update(self, observations: Mapping[str, Mapping[str, Any]], expert_actions: Mapping[str, Any]) -> int:
+    def supervised_update(
+        self,
+        observations: Mapping[str, Mapping[str, Any]],
+        expert_actions: Mapping[str, Any],
+        label_strategy: str = "expert",
+        stale_relabel_margin: float = 0.05,
+        deadline_relabel_margin: float = 0.05,
+    ) -> int:
         """Behavior-clone one batch of expert candidate choices from observations."""
 
         torch = self.torch
+        expert_actions, relabels = self._supervised_action_labels(
+            observations,
+            expert_actions,
+            label_strategy=label_strategy,
+            stale_relabel_margin=stale_relabel_margin,
+            deadline_relabel_margin=deadline_relabel_margin,
+        )
+        self.last_supervised_relabels = relabels
         losses = []
         for agent_id, observation in observations.items():
             agent_payload = expert_actions.get(str(agent_id), {}) if isinstance(expert_actions, Mapping) else {}
@@ -1225,15 +1252,134 @@ class IPPOPolicy(BaseMARLPolicy):
                             current_source = node_id
                             planned_node_load[node_id] = planned_node_load.get(node_id, 0) + 1
         if not losses:
+            self.last_supervised_loss = 0.0
+            self.last_supervised_samples = 0
             return 0
         loss = sum(losses) / len(losses)
         prior_l2 = self.prior_regularization_loss()
         if prior_l2 is not None and self.prior_l2_coef > 0.0:
             loss = loss + self.prior_l2_coef * prior_l2
+        self.last_supervised_loss = float(loss.detach().cpu().item())
+        self.last_supervised_samples = len(losses)
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
         return len(losses)
+
+    def _supervised_action_labels(
+        self,
+        observations: Mapping[str, Mapping[str, Any]],
+        expert_actions: Mapping[str, Any],
+        label_strategy: str,
+        stale_relabel_margin: float,
+        deadline_relabel_margin: float,
+    ) -> Tuple[Dict[str, Dict[str, Dict[str, str]]], int]:
+        strategy = str(label_strategy or "expert")
+        labels: Dict[str, Dict[str, Dict[str, str]]] = {}
+        for agent_id, payload in dict(expert_actions or {}).items():
+            if not isinstance(payload, Mapping):
+                continue
+            for sfc_id, assignments in payload.items():
+                if isinstance(assignments, Mapping):
+                    labels.setdefault(str(agent_id), {}).setdefault(str(sfc_id), {}).update(
+                        {str(node_id): str(instance_id) for node_id, instance_id in assignments.items()}
+                    )
+        if strategy in {"expert", "none"}:
+            return labels, 0
+        relabels = 0
+        for agent_id, observation in observations.items():
+            agent_payload = labels.get(str(agent_id), {})
+            if not isinstance(agent_payload, Mapping):
+                continue
+            grouped: Dict[str, List[Mapping[str, Any]]] = {}
+            for candidate_set in observation.get("candidate_sets", []) or []:
+                grouped.setdefault(str(candidate_set.get("sfc_id", "")), []).append(candidate_set)
+            for sfc_id, candidate_sets in grouped.items():
+                current_source = str(candidate_sets[0].get("source_node_id", "")) if candidate_sets else ""
+                planned_node_load: Dict[str, int] = {}
+                for candidate_set in sorted(candidate_sets, key=lambda item: int(item.get("sfc_node_index", 0) or 0)):
+                    contextual = self._contextual_candidate_set(candidate_set, current_source, planned_node_load)
+                    sfc_node_id = str(contextual.get("sfc_node_id", ""))
+                    current_label = agent_payload.get(sfc_id, {}).get(sfc_node_id) if isinstance(agent_payload.get(sfc_id), Mapping) else None
+                    if current_label:
+                        guarded = self._guarded_supervised_label(
+                            contextual,
+                            str(current_label),
+                            strategy=strategy,
+                            stale_relabel_margin=float(stale_relabel_margin),
+                            deadline_relabel_margin=float(deadline_relabel_margin),
+                        )
+                        if guarded and guarded != str(current_label):
+                            labels.setdefault(str(agent_id), {}).setdefault(str(sfc_id), {})[sfc_node_id] = guarded
+                            relabels += 1
+                        chosen_candidate = self._candidate_by_id(contextual, guarded or str(current_label))
+                        if chosen_candidate is not None:
+                            node_id = str(chosen_candidate.get("node_id", ""))
+                            if node_id:
+                                current_source = node_id
+                                planned_node_load[node_id] = planned_node_load.get(node_id, 0) + 1
+        return labels, relabels
+
+    def _guarded_supervised_label(
+        self,
+        candidate_set: Mapping[str, Any],
+        current_label: str,
+        strategy: str,
+        stale_relabel_margin: float,
+        deadline_relabel_margin: float,
+    ) -> str:
+        ids = list(candidate_set.get("candidate_ids", []) or [])[: self.max_candidates]
+        raw_candidates = list(candidate_set.get("raw_candidates", []) or [])[: self.max_candidates]
+        if current_label not in ids or not raw_candidates:
+            return current_label
+        labeled_candidate = self._candidate_by_id(candidate_set, current_label)
+        if labeled_candidate is None:
+            return current_label
+        if strategy == "utility_best":
+            return str(ids[max(range(len(raw_candidates)), key=lambda idx: self._bc_candidate_utility(raw_candidates[idx]))])
+        label_utility = self._bc_candidate_utility(labeled_candidate)
+        replacement = current_label
+        replacement_utility = label_utility
+        for candidate_id, candidate in zip(ids, raw_candidates):
+            candidate_utility = self._bc_candidate_utility(candidate)
+            if self._bc_route_available(candidate) <= 0.0:
+                continue
+            stale_guard = self._bc_candidate_stale(labeled_candidate) > 0.0 and self._bc_candidate_stale(candidate) <= 0.0
+            deadline_guard = (
+                self._bc_deadline_feasible(labeled_candidate) <= 0.0 and self._bc_deadline_feasible(candidate) > 0.0
+            )
+            if stale_guard and candidate_utility + float(stale_relabel_margin) >= label_utility:
+                if candidate_utility >= replacement_utility - float(stale_relabel_margin):
+                    replacement = str(candidate_id)
+                    replacement_utility = candidate_utility
+            if deadline_guard and candidate_utility + float(deadline_relabel_margin) >= label_utility:
+                if candidate_utility >= replacement_utility - float(deadline_relabel_margin):
+                    replacement = str(candidate_id)
+                    replacement_utility = candidate_utility
+        return replacement
+
+    @staticmethod
+    def _bc_candidate_utility(candidate: Mapping[str, Any]) -> float:
+        metadata = dict(candidate.get("metadata", {}) or {})
+        return float(metadata.get("utility_prior", candidate.get("utility_prior", 0.0)) or 0.0)
+
+    @staticmethod
+    def _bc_candidate_stale(candidate: Mapping[str, Any]) -> float:
+        metadata = dict(candidate.get("metadata", {}) or {})
+        semantic_group = str(metadata.get("semantic_group", candidate.get("semantic_group", "")) or "")
+        stale = semantic_group == "stale_remote_candidates" or bool(candidate.get("stale", False))
+        stale = stale or float(candidate.get("staleness_s", metadata.get("staleness_s", 0.0)) or 0.0) > 0.0
+        return 1.0 if stale else 0.0
+
+    @staticmethod
+    def _bc_deadline_feasible(candidate: Mapping[str, Any]) -> float:
+        metadata = dict(candidate.get("metadata", {}) or {})
+        return 1.0 if float(metadata.get("deadline_slack_s", candidate.get("deadline_slack_s", 0.0)) or 0.0) >= 0.0 else 0.0
+
+    @staticmethod
+    def _bc_route_available(candidate: Mapping[str, Any]) -> float:
+        metadata = dict(candidate.get("metadata", {}) or {})
+        return 1.0 if float(metadata.get("route_available", candidate.get("route_available", 1.0)) or 0.0) > 0.0 else 0.0
 
     def _contextual_candidate_set(
         self,

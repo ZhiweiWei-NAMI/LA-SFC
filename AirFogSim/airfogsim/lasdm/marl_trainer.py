@@ -35,6 +35,7 @@ class PPORolloutStep:
     old_value: float
     done: bool
     episode: int = 0
+    action_filter: Optional[Mapping[str, str]] = None
 
 
 class HeuristicEvaluator:
@@ -99,6 +100,10 @@ class IPPOTrainer:
         entropy_coef_start: Optional[float] = None,
         entropy_coef_end: Optional[float] = None,
         entropy_decay_episodes: int = 0,
+        per_function_rollout_samples: bool = False,
+        share_reward_across_function_samples: bool = True,
+        per_function_reward_mode: str = "shared",
+        dense_reward_config: Optional[Mapping[str, Any]] = None,
     ):
         self.env = env
         self.policy = policy
@@ -120,6 +125,10 @@ class IPPOTrainer:
         self.entropy_coef_start = None if entropy_coef_start is None else float(entropy_coef_start)
         self.entropy_coef_end = None if entropy_coef_end is None else float(entropy_coef_end)
         self.entropy_decay_episodes = max(0, int(entropy_decay_episodes))
+        self.per_function_rollout_samples = bool(per_function_rollout_samples)
+        self.share_reward_across_function_samples = bool(share_reward_across_function_samples)
+        self.per_function_reward_mode = str(per_function_reward_mode or "shared")
+        self.dense_reward_config = dict(dense_reward_config or {})
 
     def train(self, episodes: int = 10, max_steps: int = 100, output_dir: Optional[str] = None) -> List[TrainingMetrics]:
         rows: List[TrainingMetrics] = []
@@ -137,20 +146,20 @@ class IPPOTrainer:
                 observations, rewards, done, info = self.env.step(policy_step.actions)
                 mean_reward = sum(rewards.values()) / max(1, len(rewards))
                 total += mean_reward
-                step_log_prob = _mean_tensor(policy_step.log_prob_tensors)
-                step_value = _mean_tensor(policy_step.value_tensors)
-                if step_log_prob is not None and step_value is not None:
-                    episode_steps.append(
-                        PPORolloutStep(
-                            observations=current_observations,
-                            actions=policy_step.actions,
-                            reward=float(mean_reward),
-                            old_log_prob=_tensor_float(step_log_prob),
-                            old_value=_tensor_float(step_value),
-                            done=bool(done or step + 1 >= int(max_steps)),
-                            episode=int(episode),
-                        )
+                episode_steps.extend(
+                    rollout_steps_from_policy_step(
+                        self.policy,
+                        current_observations,
+                        policy_step.actions,
+                        mean_reward=float(mean_reward),
+                        done=bool(done or step + 1 >= int(max_steps)),
+                        episode=int(episode),
+                        per_function_samples=self.per_function_rollout_samples,
+                        share_reward_across_functions=self.share_reward_across_function_samples,
+                        per_function_reward_mode=self.per_function_reward_mode,
+                        dense_reward_config=self.dense_reward_config,
                     )
+                )
                 summary = info.get("summary", {})
                 rows.append(
                     TrainingMetrics(
@@ -253,6 +262,186 @@ def write_ppo_diagnostics(path: str | Path, rows: Sequence[Mapping[str, Any]]) -
                 writer.writerow(dict(row))
 
 
+def rollout_steps_from_policy_step(
+    policy: IPPOPolicy,
+    observations: Mapping[str, Mapping[str, Any]],
+    actions: Mapping[str, Any],
+    mean_reward: float,
+    done: bool,
+    episode: int,
+    per_function_samples: bool = False,
+    share_reward_across_functions: bool = True,
+    per_function_reward_mode: str = "shared",
+    dense_reward_config: Optional[Mapping[str, Any]] = None,
+    reward_aux: Optional[Mapping[str, Any]] = None,
+) -> List[PPORolloutStep]:
+    torch = policy.torch
+    if not per_function_samples:
+        with torch.no_grad():
+            evaluation = policy.evaluate_actions(observations, actions)
+        if evaluation is None:
+            return []
+        return [
+            PPORolloutStep(
+                observations=observations,
+                actions=actions,
+                reward=float(mean_reward),
+                old_log_prob=_tensor_float(evaluation.log_prob_tensor),
+                old_value=_tensor_float(evaluation.value_tensor),
+                done=bool(done),
+                episode=int(episode),
+            )
+        ]
+    scopes = _action_scopes(actions)
+    if not scopes:
+        return []
+    reward_mode = str(per_function_reward_mode or "shared")
+    dense_cfg = dict(dense_reward_config or {})
+    shared_reward = float(mean_reward)
+    if reward_mode == "local_dense":
+        shared_reward -= _aggregate_dense_reward(reward_aux or {}, dense_cfg)
+    base_reward = shared_reward / float(len(scopes)) if bool(share_reward_across_functions) else shared_reward
+    rollout_steps: List[PPORolloutStep] = []
+    with torch.no_grad():
+        for scope in scopes:
+            evaluation = policy.evaluate_actions(observations, actions, action_filter=scope)
+            if evaluation is None:
+                continue
+            sample_reward = base_reward
+            if reward_mode == "local_dense":
+                candidate = _selected_candidate_for_scope(policy, observations, actions, scope)
+                sample_reward += _candidate_dense_reward(candidate, dense_cfg)
+            rollout_steps.append(
+                PPORolloutStep(
+                    observations=observations,
+                    actions=actions,
+                    reward=sample_reward,
+                    old_log_prob=_tensor_float(evaluation.log_prob_tensor),
+                    old_value=_tensor_float(evaluation.value_tensor),
+                    done=bool(done),
+                    episode=int(episode),
+                    action_filter=dict(scope),
+                )
+            )
+    return rollout_steps
+
+
+def _action_scopes(actions: Mapping[str, Any]) -> List[Dict[str, str]]:
+    scopes: List[Dict[str, str]] = []
+    for agent_id, agent_payload in sorted(dict(actions or {}).items(), key=lambda item: str(item[0])):
+        if not isinstance(agent_payload, Mapping):
+            continue
+        for sfc_id, assignments in sorted(dict(agent_payload).items(), key=lambda item: str(item[0])):
+            if not isinstance(assignments, Mapping):
+                continue
+            for sfc_node_id in sorted(str(item) for item in assignments.keys()):
+                scopes.append({"agent_id": str(agent_id), "sfc_id": str(sfc_id), "sfc_node_id": str(sfc_node_id)})
+    return scopes
+
+
+def _selected_candidate_for_scope(
+    policy: IPPOPolicy,
+    observations: Mapping[str, Mapping[str, Any]],
+    actions: Mapping[str, Any],
+    scope: Mapping[str, str],
+) -> Optional[Mapping[str, Any]]:
+    agent_id = str(scope.get("agent_id", ""))
+    sfc_filter = str(scope.get("sfc_id", ""))
+    node_filter = str(scope.get("sfc_node_id", ""))
+    observation = observations.get(agent_id)
+    if not isinstance(observation, Mapping):
+        return None
+    grouped: Dict[str, List[Mapping[str, Any]]] = {}
+    for candidate_set in observation.get("candidate_sets", []) or []:
+        grouped.setdefault(str(candidate_set.get("sfc_id", "")), []).append(candidate_set)
+    candidate_sets = grouped.get(sfc_filter, [])
+    current_source = str(candidate_sets[0].get("source_node_id", "")) if candidate_sets else ""
+    planned_node_load: Dict[str, int] = {}
+    for candidate_set in sorted(candidate_sets, key=lambda item: int(item.get("sfc_node_index", 0) or 0)):
+        contextual = policy._contextual_candidate_set(candidate_set, current_source, planned_node_load)
+        sfc_node_id = str(contextual.get("sfc_node_id", ""))
+        chosen = policy._chosen_action(actions, agent_id, sfc_filter, sfc_node_id)
+        if not chosen:
+            continue
+        selected = policy._candidate_by_id(contextual, str(chosen))
+        if sfc_node_id == node_filter:
+            return selected
+        if selected is not None:
+            node_id = str(selected.get("node_id", ""))
+            if node_id:
+                current_source = node_id
+                planned_node_load[node_id] = planned_node_load.get(node_id, 0) + 1
+    return None
+
+
+def _candidate_dense_reward(candidate: Optional[Mapping[str, Any]], dense_cfg: Mapping[str, Any]) -> float:
+    if not candidate or not bool(dense_cfg.get("dense_enabled", False)):
+        return 0.0
+    return float(
+        _dense_weight(dense_cfg, "route_available")
+        * _clip(_route_available(candidate), 0.0, 1.0)
+        + _dense_weight(dense_cfg, "deadline_slack")
+        * _clip(_metadata_float(candidate, "deadline_slack_s", 0.0) / 20.0, -1.0, 1.0)
+        + _dense_weight(dense_cfg, "runtime_penalty")
+        * _clip(_metadata_float(candidate, "expected_runtime_penalty_s", 0.0), 0.0, 60.0)
+        + _dense_weight(dense_cfg, "topology_risk")
+        * _clip(_metadata_float(candidate, "topology_risk", 0.0), 0.0, 1.0)
+        + _dense_weight(dense_cfg, "mobility_risk")
+        * _clip(_metadata_float(candidate, "mobility_risk", 0.0), 0.0, 1.0)
+        + _dense_weight(dense_cfg, "stale_remote")
+        * _clip(_candidate_stale(candidate), 0.0, 1.0)
+    )
+
+
+def _aggregate_dense_reward(aux: Mapping[str, Any], dense_cfg: Mapping[str, Any]) -> float:
+    if not bool(dense_cfg.get("dense_enabled", False)):
+        return 0.0
+    return float(
+        _dense_weight(dense_cfg, "route_available") * _clip(_float_value(aux.get("selected_route_available_mean")), 0.0, 1.0)
+        + _dense_weight(dense_cfg, "deadline_slack")
+        * _clip(_float_value(aux.get("selected_deadline_slack_mean")) / 20.0, -1.0, 1.0)
+        + _dense_weight(dense_cfg, "runtime_penalty")
+        * _clip(_float_value(aux.get("selected_expected_runtime_penalty_mean")), 0.0, 60.0)
+        + _dense_weight(dense_cfg, "topology_risk") * _clip(_float_value(aux.get("selected_topology_risk_mean")), 0.0, 1.0)
+        + _dense_weight(dense_cfg, "mobility_risk") * _clip(_float_value(aux.get("selected_mobility_risk_mean")), 0.0, 1.0)
+        + _dense_weight(dense_cfg, "stale_remote") * _clip(_float_value(aux.get("selected_stale_remote_ratio")), 0.0, 1.0)
+    )
+
+
+def _dense_weight(config: Mapping[str, Any], key: str) -> float:
+    return _float_value(config.get(key), 0.0)
+
+
+def _metadata_float(candidate: Mapping[str, Any], key: str, default: float) -> float:
+    metadata = dict(candidate.get("metadata", {}) or {})
+    return _float_value(metadata.get(key, candidate.get(key, default)), default)
+
+
+def _route_available(candidate: Mapping[str, Any]) -> float:
+    return 1.0 if _metadata_float(candidate, "route_available", 1.0) > 0.0 else 0.0
+
+
+def _candidate_stale(candidate: Mapping[str, Any]) -> float:
+    metadata = dict(candidate.get("metadata", {}) or {})
+    stale = str(metadata.get("semantic_group", candidate.get("semantic_group", "")) or "") == "stale_remote_candidates"
+    stale = stale or bool(candidate.get("stale", False))
+    stale = stale or _float_value(candidate.get("staleness_s", metadata.get("staleness_s", 0.0))) > 0.0
+    return 1.0 if stale else 0.0
+
+
+def _float_value(value: Any, default: float = 0.0) -> float:
+    try:
+        if value in (None, ""):
+            return float(default)
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _clip(value: float, lower: float, upper: float) -> float:
+    return max(float(lower), min(float(upper), float(value)))
+
+
 def ppo_update_policy(
     policy: IPPOPolicy,
     rollout: Sequence[PPORolloutStep],
@@ -343,7 +532,11 @@ def ppo_update_policy(
             evaluations = []
             valid_indices = []
             for raw_index in batch_indices.tolist():
-                evaluation = policy.evaluate_actions(rollout[raw_index].observations, rollout[raw_index].actions)
+                evaluation = policy.evaluate_actions(
+                    rollout[raw_index].observations,
+                    rollout[raw_index].actions,
+                    action_filter=rollout[raw_index].action_filter,
+                )
                 if evaluation is not None:
                     evaluations.append(evaluation)
                     valid_indices.append(raw_index)
@@ -389,7 +582,11 @@ def ppo_update_policy(
                 post_evaluations = []
                 post_old_log_probs = []
                 for raw_index in valid_indices:
-                    post_eval = policy.evaluate_actions(rollout[raw_index].observations, rollout[raw_index].actions)
+                    post_eval = policy.evaluate_actions(
+                        rollout[raw_index].observations,
+                        rollout[raw_index].actions,
+                        action_filter=rollout[raw_index].action_filter,
+                    )
                     if post_eval is not None:
                         post_evaluations.append(post_eval)
                         post_old_log_probs.append(old_log_probs[raw_index])

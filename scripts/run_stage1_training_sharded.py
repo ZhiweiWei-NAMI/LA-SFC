@@ -29,6 +29,12 @@ def main() -> int:
         default=1,
         help="Number of variants to train at once. Seeds inside each variant still run in parallel.",
     )
+    parser.add_argument(
+        "--seed-concurrency",
+        type=int,
+        default=1,
+        help="Number of seed shards to train at once inside each variant batch.",
+    )
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--skip-completed", action="store_true")
     parser.add_argument("--poll-s", type=float, default=60.0)
@@ -67,36 +73,41 @@ def main() -> int:
             )
         if not pending:
             continue
-        processes = [start_shard(seed, variant, root, log_dir, args.episodes, args.max_steps) for variant, seed in pending]
-        all_processes.extend(processes)
-        (root / "stage1_training_pids.json").write_text(
-            json.dumps(
-                [{"seed": item["seed"], "variant": item["variant"], "pid": item["proc"].pid} for item in all_processes],
-                indent=2,
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
-        print(
-            "started stage1 training shards: "
-            + ", ".join(f"{item['variant']} seed {item['seed']} pid {item['proc'].pid}" for item in processes),
-            flush=True,
-        )
-        batch_failed = monitor_shards(processes, args.poll_s)
-        failed.extend(batch_failed)
-        for item in processes:
-            code = item["proc"].wait()
-            item["log"].close()
-            failed_keys = {(entry.get("variant"), entry.get("seed")) for entry in failed}
-            if code != 0 and (item["variant"], item["seed"]) not in failed_keys:
-                failed.append(
-                    {
-                        "seed": item["seed"],
-                        "variant": item["variant"],
-                        "returncode": code,
-                        "log": str(log_dir / f"stage1_{item['variant']}_seed_{item['seed']}.log"),
-                    }
-                )
+        seed_concurrency = max(1, int(args.seed_concurrency or 1))
+        for pending_start in range(0, len(pending), seed_concurrency):
+            pending_chunk = pending[pending_start : pending_start + seed_concurrency]
+            processes = [start_shard(seed, variant, root, log_dir, args.episodes, args.max_steps) for variant, seed in pending_chunk]
+            all_processes.extend(processes)
+            (root / "stage1_training_pids.json").write_text(
+                json.dumps(
+                    [{"seed": item["seed"], "variant": item["variant"], "pid": item["proc"].pid} for item in all_processes],
+                    indent=2,
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            print(
+                "started stage1 training shards: "
+                + ", ".join(f"{item['variant']} seed {item['seed']} pid {item['proc'].pid}" for item in processes),
+                flush=True,
+            )
+            batch_failed = monitor_shards(processes, args.poll_s)
+            failed.extend(batch_failed)
+            for item in processes:
+                code = item["proc"].wait()
+                item["log"].close()
+                failed_keys = {(entry.get("variant"), entry.get("seed")) for entry in failed}
+                if code != 0 and (item["variant"], item["seed"]) not in failed_keys:
+                    failed.append(
+                        {
+                            "seed": item["seed"],
+                            "variant": item["variant"],
+                            "returncode": code,
+                            "log": str(log_dir / f"stage1_{item['variant']}_seed_{item['seed']}.log"),
+                        }
+                    )
+            if failed:
+                break
         if failed:
             break
 

@@ -49,6 +49,12 @@ def main() -> int:
     parser.add_argument("--baselines", nargs="+", default=DEFAULT_BASELINES)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--poll-s", type=float, default=60.0)
+    parser.add_argument(
+        "--seed-concurrency",
+        type=int,
+        default=2,
+        help="Number of eval seed shards to run at once.",
+    )
     parser.add_argument("--combine-only", action="store_true", help="Reuse existing shard outputs and only write final summaries.")
     parser.add_argument("--copy-run-dirs", action="store_true", help="Copy per-run raw directories into the final output.")
     parser.add_argument("--include-traces", action="store_true", help="Combine large trace files into the final output.")
@@ -74,36 +80,45 @@ def main() -> int:
         ]
         failed = validate_existing_shards(processes)
     else:
-        processes = [
-            start_shard(seed, shards, checkpoint_root, args.baselines, log_dir)
-            for seed in args.seeds
-        ]
-        (root / "stage2_eval_pids.json").write_text(
-            json.dumps(
-                [{"seed": item["seed"], "pid": item["proc"].pid} for item in processes],
-                indent=2,
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
-        print(
-            "started stage2 eval shards: "
-            + ", ".join(f"seed {item['seed']} pid {item['proc'].pid}" for item in processes),
-            flush=True,
-        )
+        processes = []
+        seed_concurrency = max(1, int(args.seed_concurrency or 1))
+        failed = []
+        for seed_start in range(0, len(args.seeds), seed_concurrency):
+            batch = list(args.seeds[seed_start : seed_start + seed_concurrency])
+            batch_processes = [
+                start_shard(seed, shards, checkpoint_root, args.baselines, log_dir)
+                for seed in batch
+            ]
+            processes.extend(batch_processes)
+            (root / "stage2_eval_pids.json").write_text(
+                json.dumps(
+                    [{"seed": item["seed"], "pid": item["proc"].pid} for item in processes],
+                    indent=2,
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            print(
+                "started stage2 eval shards: "
+                + ", ".join(f"seed {item['seed']} pid {item['proc'].pid}" for item in batch_processes),
+                flush=True,
+            )
 
-        failed = monitor_shards(processes, args.poll_s)
-        for item in processes:
-            code = item["proc"].wait()
-            item["log"].close()
-            if code != 0 and item["seed"] not in {entry["seed"] for entry in failed}:
-                failed.append(
-                    {
-                        "seed": item["seed"],
-                        "returncode": code,
-                        "log": str(log_dir / f"seed_{item['seed']}.log"),
-                    }
-                )
+            batch_failed = monitor_shards(batch_processes, args.poll_s)
+            failed.extend(batch_failed)
+            for item in batch_processes:
+                code = item["proc"].wait()
+                item["log"].close()
+                if code != 0 and item["seed"] not in {entry["seed"] for entry in failed}:
+                    failed.append(
+                        {
+                            "seed": item["seed"],
+                            "returncode": code,
+                            "log": str(log_dir / f"seed_{item['seed']}.log"),
+                        }
+                    )
+            if failed:
+                break
 
     manifest: dict[str, Any] = {
         "completed": False,

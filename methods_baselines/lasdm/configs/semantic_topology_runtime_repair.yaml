@@ -85,6 +85,12 @@ marl:
   ippo_route_unavailable_penalty: 20.0
   ippo_behavior_clone_pretrain_episodes: 20
   ippo_behavior_clone_steps_per_observation: 4
+  ippo_bc_scenarios:
+    - semantic_runtime_calibration_easy
+    - semantic_ambiguity_calibrated
+    - semantic_runtime_contention_stress
+    - semantic_runtime_mobility_staleness_stress
+    - distributed_service_discovery_calibrated
   # Reward curves used in F7 must describe the learned policy, not expert
   # actions during behavior-clone warmup.  Warmup still trains the network from
   # full-information planner heuristic labels, but reward_curve.csv starts once policy actions
@@ -94,7 +100,20 @@ marl:
   # sequential SFC dependencies, while this compact IPPO implementation uses a
   # small independent actor; the continued expert term prevents drifting away
   # from the corrected source/load-aware utility target.
-  ippo_behavior_clone_finetune_steps_per_observation: 0
+  ippo_behavior_clone_finetune_steps_per_observation: 1
+  ippo_bc_label_strategy: expert
+  ippo_bc_stale_relabel_margin: 0.05
+  ippo_bc_deadline_relabel_margin: 0.05
+  ippo_curriculum_enabled: true
+  ippo_curriculum:
+    - fraction: 0.20
+      scenarios: [semantic_runtime_calibration_easy]
+    - fraction: 0.20
+      scenarios: [semantic_ambiguity_calibrated]
+    - fraction: 0.30
+      scenarios: [semantic_runtime_contention_stress, distributed_service_discovery_calibrated]
+    - fraction: 0.30
+      scenarios: [semantic_runtime_mobility_staleness_stress]
   ippo_gamma: 0.99
   ippo_clip_eps: 0.12
   ippo_gae_lambda: 0.95
@@ -105,6 +124,9 @@ marl:
   ippo_actor_loss_coef: 4.0
   ippo_target_kl: 0.02
   ippo_rollout_episodes_per_update: 4
+  ippo_per_function_rollout_samples: true
+  ippo_share_reward_across_function_samples: true
+  ippo_per_function_reward_mode: local_dense
   ippo_max_grad_norm: 0.5
   ippo_return_norm_enabled: true
   ippo_return_norm_momentum: 0.95
@@ -144,6 +166,8 @@ marl:
   # standard model selection: success/task-success dominate, latency is a
   # secondary tie-breaker.
   ippo_checkpoint_selection_interval: 20
+  ippo_checkpoint_selection_early_interval: 4
+  ippo_checkpoint_selection_early_until_episode: 40
   ippo_checkpoint_selection_max_steps: 80
   ippo_checkpoint_selection_seed_offsets: [1000]
   # Use the checkpoint with the best live-runtime validation score across
