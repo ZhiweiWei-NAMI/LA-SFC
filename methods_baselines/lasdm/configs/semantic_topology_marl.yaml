@@ -333,6 +333,11 @@ marl:
   ippo_lr: 0.0002
   masac_gamma: 0.99
   masac_alpha: 0.05
+  masac_auto_alpha: true
+  masac_alpha_lr: 0.0001
+  masac_target_entropy_scale: 0.90
+  masac_alpha_min: 0.005
+  masac_alpha_max: 0.25
   masac_tau: 0.005
   masac_q_lr: 0.0002
   masac_batch_size: 128
@@ -345,8 +350,8 @@ marl:
   masac_actor_update_during_bc: false
   masac_replay_sample_strategy: scenario_balanced
   masac_training_scenario_sampling: balanced
-  ippo_checkpoint_selection_interval: 20
-  ippo_checkpoint_selection_max_steps: 80
+  ippo_checkpoint_selection_interval: 100
+  ippo_checkpoint_selection_max_steps: 120
   ippo_checkpoint_selection_seed_offsets: [1000]
   ippo_checkpoint_selection_metric: success_min_blend
   masac_checkpoint_selection_require_sac_improves_bc: true
@@ -381,7 +386,7 @@ topology:
     full_hybrid: [rsu, cloud_server, vehicle, uav]
 
 training:
-  episodes: 200
+  episodes: 500
   max_steps: 100
   eval_seeds: [0,1,2,3,4,5,6,7,8,9]
   train_seeds: [0,1,2,3,4]

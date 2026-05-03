@@ -1761,12 +1761,27 @@ class MASACPolicy(IPPOPolicy):
         *args: Any,
         q_lr: Optional[float] = None,
         alpha: float = 0.05,
+        auto_alpha: bool = False,
+        alpha_lr: Optional[float] = None,
+        target_entropy: Optional[float] = None,
+        target_entropy_scale: float = 0.90,
+        alpha_min: float = 0.005,
+        alpha_max: float = 0.25,
         tau: float = 0.005,
         **kwargs: Any,
     ):
         super().__init__(*args, **kwargs)
         self.tau = float(tau)
-        self.fixed_alpha = float(alpha)
+        self.auto_alpha = bool(auto_alpha)
+        self.alpha_min = max(1e-8, float(alpha_min))
+        self.alpha_max = max(self.alpha_min, float(alpha_max))
+        self.fixed_alpha = min(max(float(alpha), self.alpha_min), self.alpha_max)
+        self.alpha_lr = float(alpha_lr if alpha_lr is not None else kwargs.get("lr", 3e-4))
+        self.target_entropy = None if target_entropy is None else float(target_entropy)
+        self.target_entropy_scale = max(0.0, float(target_entropy_scale))
+        self.log_alpha = self.nn.Parameter(
+            self.torch.tensor(math.log(self.fixed_alpha), dtype=self.torch.float32, device=self.device)
+        )
         hidden_dim = int(getattr(self.model, "hidden_dim", 128))
         q_input_dim = hidden_dim * self.max_critic_agents + hidden_dim + self.candidate_feature_dim
         self.q1 = self._build_q_network(q_input_dim, hidden_dim).to(self.device)
@@ -1781,6 +1796,9 @@ class MASACPolicy(IPPOPolicy):
             list(self.q1.parameters()) + list(self.q2.parameters()),
             lr=float(q_lr if q_lr is not None else kwargs.get("lr", 3e-4)),
         )
+        self.alpha_optimizer = (
+            self.torch.optim.Adam([self.log_alpha], lr=float(self.alpha_lr)) if self.auto_alpha else None
+        )
 
     def _build_q_network(self, input_dim: int, hidden_dim: int) -> Any:
         return self.nn.Sequential(
@@ -1793,7 +1811,30 @@ class MASACPolicy(IPPOPolicy):
 
     @property
     def alpha_tensor(self) -> Any:
+        if self.auto_alpha:
+            return self.log_alpha.exp().clamp(self.alpha_min, self.alpha_max)
         return self.torch.tensor(float(self.fixed_alpha), dtype=self.torch.float32, device=self.device)
+
+    def _alpha_log_bounds(self) -> Tuple[float, float]:
+        return math.log(self.alpha_min), math.log(self.alpha_max)
+
+    def _target_entropy_for_count(self, candidate_count: int) -> float:
+        if self.target_entropy is not None:
+            return float(self.target_entropy)
+        return float(self.target_entropy_scale) * math.log(max(2, int(candidate_count)))
+
+    def update_alpha(self, entropy: Any, target_entropy: Any) -> Any:
+        zero = self.torch.tensor(0.0, dtype=self.torch.float32, device=self.device)
+        if not self.auto_alpha or self.alpha_optimizer is None:
+            return zero
+        alpha_loss = self.log_alpha * (entropy.detach() - target_entropy.detach())
+        self.alpha_optimizer.zero_grad()
+        alpha_loss.backward()
+        self.alpha_optimizer.step()
+        with self.torch.no_grad():
+            lower, upper = self._alpha_log_bounds()
+            self.log_alpha.data.clamp_(lower, upper)
+        return alpha_loss.detach()
 
     def sac_state_dict(self) -> Dict[str, Any]:
         return {
@@ -1803,7 +1844,15 @@ class MASACPolicy(IPPOPolicy):
             "q2": self.q2.state_dict(),
             "target_q1": self.target_q1.state_dict(),
             "target_q2": self.target_q2.state_dict(),
-            "alpha": float(self.fixed_alpha),
+            "alpha": float(self.alpha_tensor.detach().cpu().item()),
+            "fixed_alpha": float(self.fixed_alpha),
+            "auto_alpha": bool(self.auto_alpha),
+            "log_alpha": float(self.log_alpha.detach().cpu().item()),
+            "alpha_lr": float(self.alpha_lr),
+            "alpha_min": float(self.alpha_min),
+            "alpha_max": float(self.alpha_max),
+            "target_entropy": self.target_entropy,
+            "target_entropy_scale": float(self.target_entropy_scale),
             "tau": float(self.tau),
         }
 
@@ -1815,7 +1864,27 @@ class MASACPolicy(IPPOPolicy):
             self.q2.load_state_dict(state["q2"], strict=True)
             self.target_q1.load_state_dict(state.get("target_q1", state["q1"]), strict=True)
             self.target_q2.load_state_dict(state.get("target_q2", state["q2"]), strict=True)
-            self.fixed_alpha = float(state.get("alpha", self.fixed_alpha) or self.fixed_alpha)
+            self.auto_alpha = bool(state.get("auto_alpha", self.auto_alpha))
+            self.alpha_min = max(1e-8, float(state.get("alpha_min", self.alpha_min) or self.alpha_min))
+            self.alpha_max = max(self.alpha_min, float(state.get("alpha_max", self.alpha_max) or self.alpha_max))
+            self.alpha_lr = float(state.get("alpha_lr", self.alpha_lr) or self.alpha_lr)
+            self.target_entropy = state.get("target_entropy", self.target_entropy)
+            if self.target_entropy is not None:
+                self.target_entropy = float(self.target_entropy)
+            self.target_entropy_scale = float(
+                state.get("target_entropy_scale", self.target_entropy_scale) or self.target_entropy_scale
+            )
+            self.fixed_alpha = min(
+                max(float(state.get("fixed_alpha", state.get("alpha", self.fixed_alpha)) or self.fixed_alpha), self.alpha_min),
+                self.alpha_max,
+            )
+            log_alpha = state.get("log_alpha", math.log(float(state.get("alpha", self.fixed_alpha) or self.fixed_alpha)))
+            with self.torch.no_grad():
+                self.log_alpha.data.fill_(float(log_alpha))
+                lower, upper = self._alpha_log_bounds()
+                self.log_alpha.data.clamp_(lower, upper)
+            if self.auto_alpha and self.alpha_optimizer is None:
+                self.alpha_optimizer = self.torch.optim.Adam([self.log_alpha], lr=float(self.alpha_lr))
             self.tau = float(state.get("tau", self.tau) or self.tau)
 
     def soft_update_targets(self, tau: Optional[float] = None) -> None:
@@ -1911,10 +1980,11 @@ class MASACPolicy(IPPOPolicy):
             len(values),
         )
 
-    def masac_actor_loss(self, observations: Mapping[str, Mapping[str, Any]]) -> Tuple[Any, Any, int]:
+    def masac_actor_loss(self, observations: Mapping[str, Mapping[str, Any]]) -> Tuple[Any, Any, Any, int]:
         losses: List[Any] = []
         entropies: List[Any] = []
-        alpha = self.alpha_tensor
+        target_entropies: List[Any] = []
+        alpha = self.alpha_tensor.detach()
         for item in self._masac_candidate_items(observations, target=False, detach_encoder=False):
             logits = item["logits"]
             log_probs = self.torch.log_softmax(logits, dim=-1)
@@ -1922,12 +1992,20 @@ class MASACPolicy(IPPOPolicy):
             q_min = self.torch.minimum(item["q1"], item["q2"]).detach()
             losses.append((probs * (alpha * log_probs - q_min)).sum())
             entropies.append(-(probs * log_probs).sum())
+            target_entropies.append(
+                self.torch.tensor(
+                    self._target_entropy_for_count(int(logits.numel())),
+                    dtype=self.torch.float32,
+                    device=self.device,
+                )
+            )
         if not losses:
             zero = self.torch.tensor(0.0, dtype=self.torch.float32, device=self.device)
-            return zero, zero, 0
+            return zero, zero, zero, 0
         return (
             self.torch.stack([item.reshape(()) for item in losses]).mean(),
             self.torch.stack([item.reshape(()) for item in entropies]).mean(),
+            self.torch.stack([item.reshape(()) for item in target_entropies]).mean(),
             len(losses),
         )
 

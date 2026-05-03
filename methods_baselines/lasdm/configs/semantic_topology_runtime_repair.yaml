@@ -41,7 +41,7 @@ runtime:
       hard_ddl: 90.0
 
 training:
-  episodes: 200
+  episodes: 500
   max_steps: 100
   train_seeds: [0, 1, 2, 3, 4]
   eval_seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
@@ -119,6 +119,11 @@ marl:
       scenarios: [semantic_runtime_mobility_staleness_stress]
   masac_gamma: 0.99
   masac_alpha: 0.05
+  masac_auto_alpha: true
+  masac_alpha_lr: 0.0001
+  masac_target_entropy_scale: 0.90
+  masac_alpha_min: 0.005
+  masac_alpha_max: 0.25
   masac_tau: 0.005
   masac_q_lr: 0.0003
   masac_batch_size: 128
@@ -171,10 +176,10 @@ marl:
   # copy instead of blindly saving the final stochastic RL episode.  This is
   # standard model selection: success/task-success dominate, latency is a
   # secondary tie-breaker.
-  ippo_checkpoint_selection_interval: 20
-  ippo_checkpoint_selection_early_interval: 20
+  ippo_checkpoint_selection_interval: 100
+  ippo_checkpoint_selection_early_interval: 100
   ippo_checkpoint_selection_early_until_episode: 40
-  ippo_checkpoint_selection_max_steps: 80
+  ippo_checkpoint_selection_max_steps: 120
   ippo_checkpoint_selection_seed_offsets: [1000, 1001, 1002, 1003, 1004]
   ippo_checkpoint_selection_metric: success_min_blend
   ippo_checkpoint_selection_mode: raw

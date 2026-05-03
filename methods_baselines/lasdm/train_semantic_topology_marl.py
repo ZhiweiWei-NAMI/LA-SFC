@@ -74,6 +74,7 @@ def main() -> None:
             max_candidates = int(marl_cfg.get("max_candidates", 16))
             critic_agents = int(marl_cfg.get("ippo_critic_agent_count", len(observations) or 4) or 4)
             candidate_feature_dim = _observation_candidate_feature_dim(observations) or 31
+            target_entropy_raw = marl_cfg.get("masac_target_entropy", None)
             policy = MASACPolicy(
                 observation_dim=obs_dim,
                 max_candidates=max_candidates,
@@ -82,6 +83,12 @@ def main() -> None:
                 lr=float(marl_cfg.get("ippo_lr", 3e-4) or 3e-4),
                 q_lr=float(marl_cfg.get("masac_q_lr", marl_cfg.get("ippo_lr", 3e-4)) or 3e-4),
                 alpha=float(marl_cfg.get("masac_alpha", 0.05) or 0.05),
+                auto_alpha=bool(marl_cfg.get("masac_auto_alpha", False)),
+                alpha_lr=float(marl_cfg.get("masac_alpha_lr", marl_cfg.get("masac_q_lr", 3e-4)) or 3e-4),
+                target_entropy=None if target_entropy_raw in (None, "") else float(target_entropy_raw),
+                target_entropy_scale=float(marl_cfg.get("masac_target_entropy_scale", 0.90) or 0.90),
+                alpha_min=float(marl_cfg.get("masac_alpha_min", 0.005) or 0.005),
+                alpha_max=float(marl_cfg.get("masac_alpha_max", 0.25) or 0.25),
                 tau=float(marl_cfg.get("masac_tau", 0.005) or 0.005),
                 centralized_critic=bool(marl_cfg.get("ippo_centralized_critic", True)),
                 critic_observation_dim=obs_dim * max(1, critic_agents),

@@ -288,26 +288,32 @@ def masac_update_policy(
 
         actor_losses = []
         entropy_values = []
+        target_entropy_values = []
         actor_candidate_sets = 0
         if update_actor:
             for transition in batch:
-                actor_loss, entropy, count = policy.masac_actor_loss(transition.observations)
+                actor_loss, entropy, target_entropy, count = policy.masac_actor_loss(transition.observations)
                 if int(count) <= 0:
                     continue
                 actor_losses.append(actor_loss.reshape(()))
                 entropy_values.append(entropy.reshape(()))
+                target_entropy_values.append(target_entropy.reshape(()))
                 actor_candidate_sets += int(count)
         if update_actor and actor_losses:
             actor_loss = torch.stack(actor_losses).mean()
             entropy_mean = torch.stack(entropy_values).mean()
+            target_entropy_mean = torch.stack(target_entropy_values).mean()
             policy.optimizer.zero_grad()
             actor_loss.backward()
             actor_grad_norm = torch.nn.utils.clip_grad_norm_(policy.model.parameters(), float(max_grad_norm))
             policy.optimizer.step()
+            alpha_loss = policy.update_alpha(entropy_mean, target_entropy_mean)
         else:
             actor_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
             entropy_mean = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
+            target_entropy_mean = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
             actor_grad_norm = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
+            alpha_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
         policy.soft_update_targets(float(tau))
         with torch.no_grad():
             td_error = (q1_values - targets).abs().mean()
@@ -316,7 +322,10 @@ def masac_update_policy(
             "critic_loss": float(critic_loss.detach().cpu().item()),
             "actor_loss": float(actor_loss.detach().cpu().item()),
             "entropy": float(entropy_mean.detach().cpu().item()),
+            "target_entropy": float(target_entropy_mean.detach().cpu().item()),
+            "alpha_loss": float(alpha_loss.detach().cpu().item()),
             "alpha": float(policy.alpha_tensor.detach().cpu().item()),
+            "auto_alpha": float(1.0 if getattr(policy, "auto_alpha", False) else 0.0),
             "td_error": float(td_error.detach().cpu().item()),
             "q_min_mean": float(q_min_mean.detach().cpu().item()),
             "q_target_mean": float(targets.mean().detach().cpu().item()),

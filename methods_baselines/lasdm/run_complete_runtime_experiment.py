@@ -395,6 +395,12 @@ def train_semantic_ippo_runtime(
         sac_replay_warmup_steps = int(marl_cfg.get("masac_replay_warmup_steps", 128) or 128)
         sac_updates_per_env_step = int(marl_cfg.get("masac_updates_per_env_step", 1) or 1)
         sac_tau = float(marl_cfg.get("masac_tau", 0.005) or 0.005)
+        sac_auto_alpha = bool(marl_cfg.get("masac_auto_alpha", False))
+        sac_alpha_lr = float(marl_cfg.get("masac_alpha_lr", marl_cfg.get("masac_q_lr", 3e-4)) or 3e-4)
+        sac_target_entropy = _float_metric(marl_cfg.get("masac_target_entropy", None))
+        sac_target_entropy_scale = float(marl_cfg.get("masac_target_entropy_scale", 0.90) or 0.90)
+        sac_alpha_min = float(marl_cfg.get("masac_alpha_min", 0.005) or 0.005)
+        sac_alpha_max = float(marl_cfg.get("masac_alpha_max", 0.25) or 0.25)
         sac_reward_scale = float(marl_cfg.get("masac_reward_scale", 1.0) or 1.0)
         max_grad_norm = float(marl_cfg.get("masac_max_grad_norm", 1.0) or 1.0)
         sac_replay_sample_strategy = str(marl_cfg.get("masac_replay_sample_strategy", "uniform") or "uniform")
@@ -428,6 +434,12 @@ def train_semantic_ippo_runtime(
                         **_ippo_policy_kwargs(policy_config, obs_dim, max_candidates, seed, observations=observations),
                         q_lr=float(marl_cfg.get("masac_q_lr", marl_cfg.get("ippo_lr", 3e-4)) or 3e-4),
                         alpha=float(marl_cfg.get("masac_alpha", 0.05) or 0.05),
+                        auto_alpha=sac_auto_alpha,
+                        alpha_lr=sac_alpha_lr,
+                        target_entropy=sac_target_entropy,
+                        target_entropy_scale=sac_target_entropy_scale,
+                        alpha_min=sac_alpha_min,
+                        alpha_max=sac_alpha_max,
                         tau=sac_tau,
                     )
                 total = 0.0
@@ -730,6 +742,12 @@ def train_semantic_ippo_runtime(
             "masac_replay_size": len(replay_buffer),
             "masac_batch_size": sac_batch_size,
             "masac_alpha": float(marl_cfg.get("masac_alpha", 0.05) or 0.05),
+            "masac_auto_alpha": sac_auto_alpha,
+            "masac_alpha_lr": sac_alpha_lr,
+            "masac_target_entropy": sac_target_entropy if sac_target_entropy is not None else "",
+            "masac_target_entropy_scale": sac_target_entropy_scale,
+            "masac_alpha_min": sac_alpha_min,
+            "masac_alpha_max": sac_alpha_max,
             "masac_tau": sac_tau,
             "masac_replay_sample_strategy": sac_replay_sample_strategy,
             "masac_replay_include_bc_expert": sac_replay_include_bc_expert,
@@ -1077,6 +1095,12 @@ def _semantic_policy_for_eval(
             **_ippo_policy_kwargs(policy_config, obs_dim, action_dim, seed, observations=observations, state=actor_state),
             q_lr=float(marl_cfg.get("masac_q_lr", marl_cfg.get("ippo_lr", 3e-4)) or 3e-4),
             alpha=float(marl_cfg.get("masac_alpha", 0.05) or 0.05),
+            auto_alpha=bool(marl_cfg.get("masac_auto_alpha", False)),
+            alpha_lr=float(marl_cfg.get("masac_alpha_lr", marl_cfg.get("masac_q_lr", 3e-4)) or 3e-4),
+            target_entropy=_float_metric(marl_cfg.get("masac_target_entropy", None)),
+            target_entropy_scale=float(marl_cfg.get("masac_target_entropy_scale", 0.90) or 0.90),
+            alpha_min=float(marl_cfg.get("masac_alpha_min", 0.005) or 0.005),
+            alpha_max=float(marl_cfg.get("masac_alpha_max", 0.25) or 0.25),
             tau=float(marl_cfg.get("masac_tau", 0.005) or 0.005),
         )
         strict = _checkpoint_has_critic_body(actor_state)

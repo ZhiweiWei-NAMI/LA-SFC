@@ -53,7 +53,7 @@ runtime:
         storage: 4096
 
 training:
-  episodes: 200
+  episodes: 500
   max_steps: 100
   train_seeds: [0, 1, 2, 3, 4]
   eval_seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
@@ -95,6 +95,12 @@ marl:
   ippo_behavior_clone_pretrain_episodes: 40
   ippo_behavior_clone_steps_per_observation: 4
   masac_training_scenario_sampling: balanced
+  masac_alpha: 0.05
+  masac_auto_alpha: true
+  masac_alpha_lr: 0.0001
+  masac_target_entropy_scale: 0.90
+  masac_alpha_min: 0.005
+  masac_alpha_max: 0.25
   masac_replay_include_bc_expert: true
   masac_actor_update_during_bc: false
   masac_replay_sample_strategy: scenario_balanced
@@ -122,12 +128,15 @@ marl:
   reward:
     success: 10.0
     timeout: -5.0
+    semantic_score: 0.50
+    cold_start: -0.05
+    runtime_penalty: -0.10
   # Save the checkpoint that performs best on a small live-runtime validation
   # copy instead of blindly saving the final stochastic RL episode.  This is
   # standard model selection: success/task-success dominate, latency is a
   # secondary tie-breaker.
-  ippo_checkpoint_selection_interval: 20
-  ippo_checkpoint_selection_max_steps: 80
+  ippo_checkpoint_selection_interval: 100
+  ippo_checkpoint_selection_max_steps: 120
   ippo_checkpoint_selection_seed_offsets: [1000]
   ippo_checkpoint_selection_metric: success_min_blend
   masac_checkpoint_selection_require_sac_improves_bc: true
