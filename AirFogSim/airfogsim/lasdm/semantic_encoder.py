@@ -226,6 +226,11 @@ def sfc_node_text(sfc_node: Any, payload_semantic: str = "") -> str:
     return " ; ".join(part for part in parts if part and part.strip())
 
 
+def semantic_value_text(value: Any) -> str:
+    text = str(value or "any").strip() or "any"
+    return f"semantic payload {text}"
+
+
 def normalize_vector(vector: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     vector = np.asarray(vector, dtype=np.float32)
     norm = float(np.linalg.norm(vector))

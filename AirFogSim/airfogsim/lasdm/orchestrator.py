@@ -13,6 +13,7 @@ class LASDMDecision:
     assignments: Dict[str, str] = field(default_factory=dict)
     node_mapping: Dict[str, str] = field(default_factory=dict)
     routes: Dict[str, List[str]] = field(default_factory=dict)
+    resource_allocations: Dict[str, Dict[str, float]] = field(default_factory=dict)
     score: float = 0.0
     rejected_reason: Optional[SFCFailureReason] = None
     diagnostics: Dict[str, Any] = field(default_factory=dict)
@@ -27,6 +28,7 @@ class LASDMDecision:
             "assignments": dict(self.assignments),
             "node_mapping": dict(self.node_mapping),
             "routes": {key: list(value) for key, value in self.routes.items()},
+            "resource_allocations": {key: dict(value) for key, value in self.resource_allocations.items()},
             "score": self.score,
             "rejected_reason": self.rejected_reason.value if self.rejected_reason else None,
             "diagnostics": dict(self.diagnostics),

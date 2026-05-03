@@ -11,6 +11,9 @@ class SFCRewardConfig:
     route_unavailable: float = -2.0
     deadline_slack: float = 0.05
     semantic_score: float = 0.50
+    semantic_link_label: float = 0.25
+    semantic_cumulative: float = 0.50
+    semantic_link_mismatch: float = -1.00
     utility_prior: float = 1.0
     stale_remote: float = -0.75
     topology_risk: float = -0.50
@@ -76,6 +79,9 @@ def _selected_candidate_dense_reward(aux: Mapping[str, Any], config: SFCRewardCo
     reward += float(config.route_unavailable) * float(aux.get("route_unavailable_ratio", 0.0) or 0.0)
     reward += float(config.deadline_slack) * _positive_clip(float(aux.get("selected_deadline_slack_mean", 0.0) or 0.0), 20.0)
     reward += float(config.semantic_score) * float(aux.get("mean_semantic_top_score", 0.0) or 0.0)
+    reward += float(config.semantic_link_label) * float(aux.get("selected_semantic_link_label_score_mean", 0.0) or 0.0)
+    reward += float(config.semantic_cumulative) * float(aux.get("selected_semantic_cumulative_quality_mean", 0.0) or 0.0)
+    reward += float(config.semantic_link_mismatch) * float(aux.get("selected_semantic_link_mismatch_ratio", 0.0) or 0.0)
     reward += float(config.utility_prior) * float(aux.get("utility_prior", 0.0) or 0.0)
     reward += float(config.stale_remote) * float(aux.get("selected_stale_remote_ratio", 0.0) or 0.0)
     reward += float(config.topology_risk) * float(aux.get("selected_topology_risk_mean", 0.0) or 0.0)

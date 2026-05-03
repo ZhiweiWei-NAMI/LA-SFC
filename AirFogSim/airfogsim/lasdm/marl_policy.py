@@ -11,6 +11,81 @@ import numpy as np
 from .graph_observation import flatten_observation
 
 
+RESOURCE_LEVEL_VALUES: Tuple[float, ...] = tuple(round(0.1 * index, 1) for index in range(1, 11))
+RESOURCE_ACTION_DIM = len(RESOURCE_LEVEL_VALUES)
+RESOURCE_Q_FEATURE_DIM = 2
+
+
+def _resource_level_index(value: Any, default: float = 1.0) -> int:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        numeric = float(default)
+    numeric = max(RESOURCE_LEVEL_VALUES[0], min(RESOURCE_LEVEL_VALUES[-1], numeric))
+    return min(range(RESOURCE_ACTION_DIM), key=lambda index: abs(RESOURCE_LEVEL_VALUES[index] - numeric))
+
+
+def _resource_level(value: Any, default: float = 1.0) -> float:
+    return float(RESOURCE_LEVEL_VALUES[_resource_level_index(value, default=default)])
+
+
+def _resource_action_payload(instance_id: Any, compute_level: Any = 1.0, bandwidth_level: Any = 1.0) -> Dict[str, Any]:
+    return {
+        "instance_id": str(instance_id),
+        "compute_level": _resource_level(compute_level),
+        "bandwidth_level": _resource_level(bandwidth_level),
+    }
+
+
+def _action_instance_id(value: Any) -> str:
+    if isinstance(value, Mapping):
+        return str(value.get("instance_id", value.get("service_instance_id", "")) or "")
+    return str(value or "")
+
+
+def _action_resource_level(value: Any, key: str, default: float = 1.0) -> float:
+    if isinstance(value, Mapping):
+        return _resource_level(value.get(key), default=default)
+    return _resource_level(default)
+
+
+def _candidate_resource_levels(candidate: Optional[Mapping[str, Any]]) -> Tuple[float, float]:
+    if candidate is None:
+        return 1.0, 1.0
+    metadata = dict(candidate.get("metadata", {}) or {})
+    task_cpu = max(0.0, float(metadata.get("task_cpu", 0.0) or 0.0))
+    capacity_cpu = max(0.1, float(metadata.get("candidate_capacity_cpu", metadata.get("capacity_cpu", 0.0)) or 0.0))
+    function_budget_s = max(0.0, float(metadata.get("function_budget_s", 0.0) or 0.0))
+    capacity_total = max(1, int(float(metadata.get("resource_capacity_total", metadata.get("max_concurrency", 1)) or 1)))
+    fair_compute = max(0.1, min(1.0, 1.0 / float(capacity_total)))
+    compute_level = fair_compute
+    if task_cpu > 0.0 and function_budget_s > 0.0:
+        compute_level = max(compute_level, 1.25 * task_cpu / (capacity_cpu * function_budget_s))
+    remaining_ratio = max(0.0, min(1.0, float(metadata.get("remaining_deadline_ratio", 1.0) or 0.0)))
+    deadline_slack = float(metadata.get("deadline_slack_s", 0.0) or 0.0)
+    estimated_compute_s = max(0.0, float(metadata.get("estimated_compute_s", 0.0) or 0.0))
+    if deadline_slack < 0.0 or (function_budget_s > 0.0 and estimated_compute_s > function_budget_s):
+        compute_level = max(compute_level, 0.9)
+    elif remaining_ratio < 0.35:
+        compute_level = max(compute_level, 0.7)
+    elif remaining_ratio < 0.60:
+        compute_level = max(compute_level, 0.5)
+
+    wireless_hops = max(0.0, float(metadata.get("wireless_hops", 0.0) or 0.0))
+    route_tx_time_s = max(0.0, float(metadata.get("route_tx_time_s", 0.0) or 0.0))
+    wireless_pressure = max(0.0, float(metadata.get("wireless_pressure", 0.0) or 0.0))
+    bandwidth_level = 0.1
+    if wireless_hops > 0.0:
+        bandwidth_level = max(0.2, min(1.0, 0.2 + 0.1 * wireless_hops + 0.05 * wireless_pressure))
+        if function_budget_s > 0.0:
+            bandwidth_level = max(bandwidth_level, min(1.0, 1.25 * route_tx_time_s / function_budget_s))
+        if deadline_slack < 0.0:
+            bandwidth_level = max(bandwidth_level, 0.8)
+        elif remaining_ratio < 0.35:
+            bandwidth_level = max(bandwidth_level, 0.6)
+    return _resource_level(compute_level), _resource_level(bandwidth_level)
+
+
 class BaseMARLPolicy:
     def act(self, observations: Mapping[str, Mapping[str, Any]], deterministic: bool = False) -> Dict[str, Dict[str, Dict[str, str]]]:
         raise NotImplementedError
@@ -42,7 +117,13 @@ class SemanticGreedyPolicy(BaseMARLPolicy):
                     continue
                 sfc_id = str(candidate_set.get("sfc_id"))
                 sfc_node_id = str(candidate_set.get("sfc_node_id"))
-                actions.setdefault(str(agent_id), {}).setdefault(sfc_id, {})[sfc_node_id] = best
+                best_candidate = self._candidate_by_id(candidate_set, best)
+                compute_level, bandwidth_level = _candidate_resource_levels(best_candidate)
+                actions.setdefault(str(agent_id), {}).setdefault(sfc_id, {})[sfc_node_id] = _resource_action_payload(
+                    best,
+                    compute_level,
+                    bandwidth_level,
+                )
         return actions
 
     def _best_candidate(self, candidate_set: Mapping[str, Any]) -> Optional[str]:
@@ -88,6 +169,13 @@ class SemanticGreedyPolicy(BaseMARLPolicy):
                 best_score = score
                 best_id = str(candidate.get("instance_id"))
         return best_id
+
+    @staticmethod
+    def _candidate_by_id(candidate_set: Mapping[str, Any], instance_id: str) -> Optional[Mapping[str, Any]]:
+        for candidate in candidate_set.get("raw_candidates", []) or []:
+            if str(candidate.get("instance_id", "")) == str(instance_id):
+                return candidate
+        return None
 
 
 class TopologyGreedyPolicy(SemanticGreedyPolicy):
@@ -147,13 +235,20 @@ class TopologyGreedyPolicy(SemanticGreedyPolicy):
                     if best is None:
                         break
                     sfc_node_id = str(candidate_set.get("sfc_node_id"))
-                    actions.setdefault(str(agent_id), {}).setdefault(str(sfc_id), {})[sfc_node_id] = best
                     if best_candidate is not None:
+                        compute_level, bandwidth_level = _candidate_resource_levels(best_candidate)
+                        actions.setdefault(str(agent_id), {}).setdefault(str(sfc_id), {})[
+                            sfc_node_id
+                        ] = _resource_action_payload(best, compute_level, bandwidth_level)
                         node_id = str(best_candidate.get("node_id", ""))
                         if node_id:
                             current_source = node_id
                             planned_node_load[node_id] = planned_node_load.get(node_id, 0) + 1
                             remaining_deadline_s = _consume_deadline_budget(remaining_deadline_s, best_candidate)
+                    else:
+                        actions.setdefault(str(agent_id), {}).setdefault(str(sfc_id), {})[
+                            sfc_node_id
+                        ] = _resource_action_payload(best)
                     if not current_source:
                         current_source = str(candidate_set.get("source_node_id", ""))
         return actions
@@ -334,11 +429,16 @@ class UtilityPriorPolicy(BaseMARLPolicy):
                     if best is None:
                         break
                     sfc_node_id = str(candidate_set.get("sfc_node_id"))
-                    actions.setdefault(str(agent_id), {}).setdefault(sfc_id, {})[sfc_node_id] = best
                     if best_candidate is not None:
+                        compute_level, bandwidth_level = _candidate_resource_levels(best_candidate)
+                        actions.setdefault(str(agent_id), {}).setdefault(sfc_id, {})[
+                            sfc_node_id
+                        ] = _resource_action_payload(best, compute_level, bandwidth_level)
                         current_source = str(best_candidate.get("node_id", current_source))
                         planned_node_load[current_source] = planned_node_load.get(current_source, 0) + 1
                         remaining_deadline_s = _consume_deadline_budget(remaining_deadline_s, best_candidate)
+                    else:
+                        actions.setdefault(str(agent_id), {}).setdefault(sfc_id, {})[sfc_node_id] = _resource_action_payload(best)
                     if not current_source:
                         current_source = str(candidate_set.get("source_node_id", ""))
         return actions
@@ -484,8 +584,8 @@ class CentralizedPlannerPolicy(UtilityPriorPolicy):
                 if not chain_choice:
                     continue
                 chain_actions = actions.setdefault(str(agent_id), {}).setdefault(sfc_id, {})
-                for sfc_node_id, instance_id, node_id, wireless_hops in chain_choice:
-                    chain_actions[str(sfc_node_id)] = str(instance_id)
+                for sfc_node_id, instance_id, node_id, wireless_hops, compute_level, bandwidth_level in chain_choice:
+                    chain_actions[str(sfc_node_id)] = _resource_action_payload(instance_id, compute_level, bandwidth_level)
                     if node_id:
                         planned_node_load[str(node_id)] = planned_node_load.get(str(node_id), 0) + 1
                     planned_wireless_load += max(0.0, float(wireless_hops))
@@ -496,11 +596,11 @@ class CentralizedPlannerPolicy(UtilityPriorPolicy):
         ordered_sets: Sequence[Mapping[str, Any]],
         planned_node_load: Mapping[str, int],
         planned_wireless_load: float = 0.0,
-    ) -> List[Tuple[str, str, str, float]]:
+    ) -> List[Tuple[str, str, str, float, float, float]]:
         if not ordered_sets:
             return []
         best_score = -float("inf")
-        best_path: List[Tuple[str, str, str, float]] = []
+        best_path: List[Tuple[str, str, str, float, float, float]] = []
         initial_source = str(ordered_sets[0].get("source_node_id", ""))
         initial_planned = dict(planned_node_load or {})
         initial_remaining_deadline_s, _total_deadline_s = _chain_deadline_budget(ordered_sets)
@@ -512,7 +612,7 @@ class CentralizedPlannerPolicy(UtilityPriorPolicy):
             wireless_load: float,
             remaining_deadline_s: Optional[float],
             score: float,
-            path: List[Tuple[str, str, str, float]],
+            path: List[Tuple[str, str, str, float, float, float]],
         ) -> None:
             nonlocal best_score, best_path
             if index >= len(ordered_sets):
@@ -554,6 +654,7 @@ class CentralizedPlannerPolicy(UtilityPriorPolicy):
                 instance_id = str(candidate.get("instance_id", ""))
                 metadata = dict(candidate.get("metadata", {}) or {})
                 wireless_hops = max(0.0, float(metadata.get("wireless_hops", 0.0) or 0.0))
+                compute_level, bandwidth_level = _candidate_resource_levels(candidate)
                 next_remaining_deadline_s = _consume_deadline_budget(remaining_deadline_s, candidate)
                 next_planned = dict(planned)
                 if node_id:
@@ -565,7 +666,7 @@ class CentralizedPlannerPolicy(UtilityPriorPolicy):
                     wireless_load + wireless_hops,
                     next_remaining_deadline_s,
                     score + utility,
-                    path + [(sfc_node_id, instance_id, node_id, wireless_hops)],
+                    path + [(sfc_node_id, instance_id, node_id, wireless_hops, compute_level, bandwidth_level)],
                 )
 
         search(0, initial_source, initial_planned, float(planned_wireless_load), initial_remaining_deadline_s, 0.0, [])
@@ -652,9 +753,15 @@ class RandomValidPolicy(BaseMARLPolicy):
                 if not ids:
                     continue
                 chosen = ids[0] if deterministic else self.rng.choice(ids)
+                chosen_candidate = None
+                for candidate in candidate_set.get("raw_candidates", []) or []:
+                    if str(candidate.get("instance_id", "")) == str(chosen):
+                        chosen_candidate = candidate
+                        break
+                compute_level, bandwidth_level = _candidate_resource_levels(chosen_candidate)
                 actions.setdefault(str(agent_id), {}).setdefault(str(candidate_set.get("sfc_id")), {})[
                     str(candidate_set.get("sfc_node_id"))
-                ] = chosen
+                ] = _resource_action_payload(chosen, compute_level, bandwidth_level)
         return actions
 
 
@@ -743,6 +850,7 @@ class IPPOPolicy(BaseMARLPolicy):
         self.rng = random.Random(seed)
         torch.manual_seed(seed)
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        self.resource_levels_tensor = torch.tensor(RESOURCE_LEVEL_VALUES, dtype=torch.float32, device=self.device)
         prior_init = (
             1.5,
             self.utility_prior_logit_weight,
@@ -778,6 +886,7 @@ class IPPOPolicy(BaseMARLPolicy):
                 edge_dim: int,
                 temporal_dim: int,
                 max_agents: int,
+                resource_action_dim: int,
                 prior_init_values: Sequence[float],
                 learnable_prior_value: bool,
                 learned_logit_scale_value: float,
@@ -788,6 +897,16 @@ class IPPOPolicy(BaseMARLPolicy):
                 self.body = nn.Sequential(nn.Linear(obs_dim, hid), nn.Tanh(), nn.Linear(hid, hid), nn.Tanh())
                 self.actor = nn.Linear(hid, action_dim)
                 self.candidate_actor = nn.Sequential(nn.Linear(hid + cand_dim, hid), nn.Tanh(), nn.Linear(hid, 1))
+                self.candidate_compute_actor = nn.Sequential(
+                    nn.Linear(hid + cand_dim, hid),
+                    nn.Tanh(),
+                    nn.Linear(hid, resource_action_dim),
+                )
+                self.candidate_bandwidth_actor = nn.Sequential(
+                    nn.Linear(hid + cand_dim, hid),
+                    nn.Tanh(),
+                    nn.Linear(hid, resource_action_dim),
+                )
                 self.critic_body = nn.Sequential(nn.Linear(critic_dim, hid), nn.Tanh(), nn.Linear(hid, hid), nn.Tanh())
                 self.critic = nn.Linear(hid, 1)
                 self.hidden_dim = int(hid)
@@ -832,6 +951,16 @@ class IPPOPolicy(BaseMARLPolicy):
                 self.temporal_encoder = nn.Sequential(nn.Linear(temporal_dim, hid), nn.Tanh())
                 self.region_context = nn.Sequential(nn.Linear(hid * 4, hid), nn.Tanh(), nn.Linear(hid, hid), nn.Tanh())
                 self.region_candidate_actor = nn.Sequential(nn.Linear(hid + cand_dim, hid), nn.Tanh(), nn.Linear(hid, 1))
+                self.region_compute_actor = nn.Sequential(
+                    nn.Linear(hid + cand_dim, hid),
+                    nn.Tanh(),
+                    nn.Linear(hid, resource_action_dim),
+                )
+                self.region_bandwidth_actor = nn.Sequential(
+                    nn.Linear(hid + cand_dim, hid),
+                    nn.Tanh(),
+                    nn.Linear(hid, resource_action_dim),
+                )
                 self.region_critic_body = nn.Sequential(nn.Linear(hid * max_agents, hid), nn.Tanh(), nn.Linear(hid, hid), nn.Tanh())
                 self.region_critic = nn.Linear(hid, 1)
 
@@ -852,6 +981,14 @@ class IPPOPolicy(BaseMARLPolicy):
                     candidate_features = candidate_features.unsqueeze(0)
                 h_expanded = h.expand(candidate_features.shape[0], -1)
                 return self.candidate_actor(self.torch_cat([h_expanded, candidate_features], dim=-1)).squeeze(-1)
+
+            def candidate_resource_logits(self, x, candidate_features):
+                h = self.body(x)
+                if candidate_features.ndim == 1:
+                    candidate_features = candidate_features.unsqueeze(0)
+                h_expanded = h.expand(candidate_features.shape[0], -1)
+                joint = self.torch_cat([h_expanded, candidate_features], dim=-1)
+                return self.candidate_compute_actor(joint), self.candidate_bandwidth_actor(joint)
 
             def region_context_tensor(self, observation, device):
                 import torch
@@ -926,6 +1063,13 @@ class IPPOPolicy(BaseMARLPolicy):
                     candidate_features = candidate_features.unsqueeze(0)
                 context_expanded = context.view(1, -1).expand(candidate_features.shape[0], -1)
                 return self.region_candidate_actor(torch.cat([context_expanded, candidate_features], dim=-1)).squeeze(-1)
+
+            def region_resource_logits(self, context, candidate_features):
+                if candidate_features.ndim == 1:
+                    candidate_features = candidate_features.unsqueeze(0)
+                context_expanded = context.view(1, -1).expand(candidate_features.shape[0], -1)
+                joint = torch.cat([context_expanded, candidate_features], dim=-1)
+                return self.region_compute_actor(joint), self.region_bandwidth_actor(joint)
 
             def candidate_prior_logits(self, prior_features):
                 return torch.matmul(prior_features, self.prior_feature_weights.to(dtype=prior_features.dtype))
@@ -1035,6 +1179,7 @@ class IPPOPolicy(BaseMARLPolicy):
             self.edge_feature_dim,
             self.temporal_feature_dim,
             self.max_critic_agents,
+            RESOURCE_ACTION_DIM,
             prior_init,
             self.learnable_prior,
             self.learned_logit_scale,
@@ -1107,6 +1252,7 @@ class IPPOPolicy(BaseMARLPolicy):
                         base_logits = None if logits is None else logits[0, :mask_len]
                         scores = self._candidate_scores(obs_tensor, base_logits, contextual, mask_len)
                         scores = self._apply_route_penalty(scores, contextual, mask_len)
+                        candidate_features = self._candidate_feature_tensor(contextual, mask_len, scores)
                         if deterministic:
                             action_idx = int(torch.argmax(scores).item())
                             dist = torch.distributions.Categorical(logits=scores)
@@ -1115,13 +1261,37 @@ class IPPOPolicy(BaseMARLPolicy):
                             action_idx = int(dist.sample().item())
                         log_prob_tensor = dist.log_prob(torch.tensor(action_idx, device=scores.device))
                         entropy_tensor = dist.entropy()
+                        compute_logits, bandwidth_logits = self._resource_logits(
+                            obs_tensor,
+                            candidate_features[action_idx].reshape(1, -1),
+                        )
+                        compute_logits = compute_logits.squeeze(0)
+                        bandwidth_logits = bandwidth_logits.squeeze(0)
+                        compute_dist = torch.distributions.Categorical(logits=compute_logits)
+                        bandwidth_dist = torch.distributions.Categorical(logits=bandwidth_logits)
+                        if deterministic:
+                            compute_idx = int(torch.argmax(compute_logits).item())
+                            bandwidth_idx = int(torch.argmax(bandwidth_logits).item())
+                        else:
+                            compute_idx = int(compute_dist.sample().item())
+                            bandwidth_idx = int(bandwidth_dist.sample().item())
+                        compute_log_prob = compute_dist.log_prob(torch.tensor(compute_idx, device=compute_logits.device))
+                        bandwidth_log_prob = bandwidth_dist.log_prob(torch.tensor(bandwidth_idx, device=bandwidth_logits.device))
+                        compute_entropy = compute_dist.entropy()
+                        bandwidth_entropy = bandwidth_dist.entropy()
+                        log_prob_tensor = log_prob_tensor + compute_log_prob + bandwidth_log_prob
+                        entropy_tensor = entropy_tensor + compute_entropy + bandwidth_entropy
                         lp = float(log_prob_tensor.item())
                         log_prob_tensors.append(log_prob_tensor if track_grad else log_prob_tensor.detach())
                         entropy_tensors.append(entropy_tensor if track_grad else entropy_tensor.detach())
                         chosen = ids[action_idx]
                         actions.setdefault(str(agent_id), {}).setdefault(str(contextual.get("sfc_id")), {})[
                             str(contextual.get("sfc_node_id"))
-                        ] = chosen
+                        ] = _resource_action_payload(
+                            chosen,
+                            RESOURCE_LEVEL_VALUES[compute_idx],
+                            RESOURCE_LEVEL_VALUES[bandwidth_idx],
+                        )
                         log_probs[f"{agent_id}:{set_idx}"] = lp
                         agent_action_count += 1
                         chosen_candidate = self._candidate_by_id(contextual, str(chosen))
@@ -1199,7 +1369,8 @@ class IPPOPolicy(BaseMARLPolicy):
                         total_deadline_s=total_deadline_s,
                     )
                     sfc_node_id = str(contextual.get("sfc_node_id", ""))
-                    chosen = self._chosen_action(actions, str(agent_id), str(sfc_id), sfc_node_id)
+                    chosen_payload = self._chosen_action_payload(actions, str(agent_id), str(sfc_id), sfc_node_id)
+                    chosen = _action_instance_id(chosen_payload)
                     if not chosen:
                         continue
                     ids = list(contextual.get("candidate_ids", []) or [])
@@ -1213,8 +1384,27 @@ class IPPOPolicy(BaseMARLPolicy):
                         candidate_logits = self._apply_route_penalty(candidate_logits, contextual, mask_len)
                         dist = torch.distributions.Categorical(logits=candidate_logits)
                         target = torch.tensor(action_idx, device=candidate_logits.device)
-                        log_prob_tensors.append(dist.log_prob(target))
-                        entropy_tensors.append(dist.entropy())
+                        candidate_features = self._candidate_feature_tensor(contextual, mask_len, candidate_logits)
+                        compute_logits, bandwidth_logits = self._resource_logits(
+                            obs_tensor,
+                            candidate_features[action_idx].reshape(1, -1),
+                        )
+                        compute_logits = compute_logits.squeeze(0)
+                        bandwidth_logits = bandwidth_logits.squeeze(0)
+                        compute_dist = torch.distributions.Categorical(logits=compute_logits)
+                        bandwidth_dist = torch.distributions.Categorical(logits=bandwidth_logits)
+                        compute_target = torch.tensor(
+                            _resource_level_index(_action_resource_level(chosen_payload, "compute_level")),
+                            device=compute_logits.device,
+                        )
+                        bandwidth_target = torch.tensor(
+                            _resource_level_index(_action_resource_level(chosen_payload, "bandwidth_level")),
+                            device=bandwidth_logits.device,
+                        )
+                        log_prob_tensors.append(
+                            dist.log_prob(target) + compute_dist.log_prob(compute_target) + bandwidth_dist.log_prob(bandwidth_target)
+                        )
+                        entropy_tensors.append(dist.entropy() + compute_dist.entropy() + bandwidth_dist.entropy())
                         action_count += 1
                         agent_action_count += 1
                     chosen_candidate = self._candidate_by_id(contextual, str(chosen))
@@ -1241,30 +1431,44 @@ class IPPOPolicy(BaseMARLPolicy):
     def _candidate_scores(self, obs_tensor: Any, logits: Any, candidate_set: Mapping[str, Any], mask_len: int) -> Any:
         """Return learned candidate logits blended with runtime-derived priors."""
 
-        features = self.torch.tensor(
-            np.asarray(candidate_set.get("candidate_features", []), dtype=np.float32)[:mask_len],
-            dtype=self.torch.float32 if logits is None else logits.dtype,
-            device=logits.device,
-        ) if logits is not None else self.torch.tensor(
-            np.asarray(candidate_set.get("candidate_features", []), dtype=np.float32)[:mask_len],
-            dtype=obs_tensor.dtype,
-            device=obs_tensor.device,
-        )
+        reference = obs_tensor if logits is None else logits
+        features = self._candidate_feature_tensor(candidate_set, mask_len, reference)
         if features.numel() == 0:
             if logits is not None:
                 return logits[:mask_len].clone()
             return self.torch.zeros((mask_len,), dtype=obs_tensor.dtype, device=obs_tensor.device)
-        if features.shape[-1] < self.candidate_feature_dim:
-            pad = self.torch.zeros((features.shape[0], self.candidate_feature_dim - features.shape[-1]), dtype=features.dtype, device=features.device)
-            features = self.torch.cat([features, pad], dim=-1)
-        elif features.shape[-1] > self.candidate_feature_dim:
-            features = features[:, : self.candidate_feature_dim]
         if self.use_region_encoder:
             learned_scores = self.model.region_candidate_logits(obs_tensor, features)
         else:
             learned_scores = self.model.candidate_logits(obs_tensor, features)
         prior_scores = self._candidate_prior_logits(candidate_set, mask_len, learned_scores)
         return self.model.blend_candidate_logits(learned_scores, prior_scores)
+
+    def _candidate_feature_tensor(self, candidate_set: Mapping[str, Any], mask_len: int, reference: Any) -> Any:
+        features = self.torch.tensor(
+            np.asarray(candidate_set.get("candidate_features", []), dtype=np.float32)[:mask_len],
+            dtype=reference.dtype,
+            device=reference.device,
+        )
+        if features.ndim == 1:
+            features = features.reshape(1, -1)
+        if features.numel() == 0:
+            return self.torch.zeros((0, self.candidate_feature_dim), dtype=reference.dtype, device=reference.device)
+        if features.shape[-1] < self.candidate_feature_dim:
+            pad = self.torch.zeros(
+                (features.shape[0], self.candidate_feature_dim - features.shape[-1]),
+                dtype=features.dtype,
+                device=features.device,
+            )
+            features = self.torch.cat([features, pad], dim=-1)
+        elif features.shape[-1] > self.candidate_feature_dim:
+            features = features[:, : self.candidate_feature_dim]
+        return features
+
+    def _resource_logits(self, obs_tensor: Any, candidate_features: Any) -> Tuple[Any, Any]:
+        if self.use_region_encoder:
+            return self.model.region_resource_logits(obs_tensor, candidate_features)
+        return self.model.candidate_resource_logits(obs_tensor, candidate_features)
 
     def _candidate_prior_logits(self, candidate_set: Mapping[str, Any], mask_len: int, reference: Any) -> Any:
         rows: List[List[float]] = []
@@ -1274,10 +1478,12 @@ class IPPOPolicy(BaseMARLPolicy):
             deadline_slack = float(metadata.get("deadline_slack_s", 0.0) or 0.0)
             deadline_violation = max(0.0, -deadline_slack) / budget
             semantic_score = float(candidate.get("semantic_score", metadata.get("semantic_score", 0.0)) or 0.0)
+            semantic_label_score = float(metadata.get("semantic_link_label_score", semantic_score) or 0.0)
+            semantic_signal = 0.75 * semantic_score + 0.25 * semantic_label_score
             runtime_utility = float(metadata.get("utility_prior", 0.0) or 0.0) - semantic_score
             rows.append(
                 [
-                    semantic_score if self.include_semantic_features else 0.0,
+                    semantic_signal if self.include_semantic_features else 0.0,
                     runtime_utility if self.include_topology_features else 0.0,
                     deadline_violation if self.include_topology_features else 0.0,
                     float(metadata.get("expected_runtime_penalty_s", 0.0) or 0.0) / budget
@@ -1376,9 +1582,10 @@ class IPPOPolicy(BaseMARLPolicy):
                         total_deadline_s=total_deadline_s,
                     )
                     sfc_node_id = str(candidate_set.get("sfc_node_id", ""))
-                    chosen = None
+                    chosen_payload = None
                     if isinstance(agent_payload.get(sfc_id), Mapping):
-                        chosen = agent_payload.get(sfc_id, {}).get(sfc_node_id)
+                        chosen_payload = agent_payload.get(sfc_id, {}).get(sfc_node_id)
+                    chosen = _action_instance_id(chosen_payload)
                     if not chosen:
                         continue
                     ids = list(candidate_set.get("candidate_ids", []) or [])
@@ -1393,6 +1600,23 @@ class IPPOPolicy(BaseMARLPolicy):
                     candidate_logits = self._apply_route_penalty(candidate_logits, candidate_set, mask_len)
                     target = torch.tensor([target_idx], dtype=torch.long, device=candidate_logits.device)
                     losses.append(torch.nn.functional.cross_entropy(candidate_logits.unsqueeze(0), target))
+                    candidate_features = self._candidate_feature_tensor(candidate_set, mask_len, candidate_logits)
+                    compute_logits, bandwidth_logits = self._resource_logits(
+                        obs_tensor,
+                        candidate_features[target_idx].reshape(1, -1),
+                    )
+                    compute_target = torch.tensor(
+                        [_resource_level_index(_action_resource_level(chosen_payload, "compute_level"))],
+                        dtype=torch.long,
+                        device=compute_logits.device,
+                    )
+                    bandwidth_target = torch.tensor(
+                        [_resource_level_index(_action_resource_level(chosen_payload, "bandwidth_level"))],
+                        dtype=torch.long,
+                        device=bandwidth_logits.device,
+                    )
+                    losses.append(0.25 * torch.nn.functional.cross_entropy(compute_logits, compute_target))
+                    losses.append(0.25 * torch.nn.functional.cross_entropy(bandwidth_logits, bandwidth_target))
                     chosen_candidate = self._candidate_by_id(candidate_set, str(chosen))
                     if chosen_candidate is not None:
                         node_id = str(chosen_candidate.get("node_id", ""))
@@ -1422,17 +1646,23 @@ class IPPOPolicy(BaseMARLPolicy):
         label_strategy: str,
         stale_relabel_margin: float,
         deadline_relabel_margin: float,
-    ) -> Tuple[Dict[str, Dict[str, Dict[str, str]]], int]:
+    ) -> Tuple[Dict[str, Dict[str, Dict[str, Any]]], int]:
         strategy = str(label_strategy or "expert")
-        labels: Dict[str, Dict[str, Dict[str, str]]] = {}
+        labels: Dict[str, Dict[str, Dict[str, Any]]] = {}
         for agent_id, payload in dict(expert_actions or {}).items():
             if not isinstance(payload, Mapping):
                 continue
             for sfc_id, assignments in payload.items():
                 if isinstance(assignments, Mapping):
-                    labels.setdefault(str(agent_id), {}).setdefault(str(sfc_id), {}).update(
-                        {str(node_id): str(instance_id) for node_id, instance_id in assignments.items()}
-                    )
+                    for node_id, action_value in assignments.items():
+                        instance_id = _action_instance_id(action_value)
+                        if not instance_id:
+                            continue
+                        labels.setdefault(str(agent_id), {}).setdefault(str(sfc_id), {})[str(node_id)] = _resource_action_payload(
+                            instance_id,
+                            _action_resource_level(action_value, "compute_level"),
+                            _action_resource_level(action_value, "bandwidth_level"),
+                        )
         if strategy in {"expert", "none"}:
             return labels, 0
         relabels = 0
@@ -1457,18 +1687,23 @@ class IPPOPolicy(BaseMARLPolicy):
                     )
                     sfc_node_id = str(contextual.get("sfc_node_id", ""))
                     current_label = agent_payload.get(sfc_id, {}).get(sfc_node_id) if isinstance(agent_payload.get(sfc_id), Mapping) else None
-                    if current_label:
+                    current_instance_id = _action_instance_id(current_label)
+                    if current_instance_id:
                         guarded = self._guarded_supervised_label(
                             contextual,
-                            str(current_label),
+                            current_instance_id,
                             strategy=strategy,
                             stale_relabel_margin=float(stale_relabel_margin),
                             deadline_relabel_margin=float(deadline_relabel_margin),
                         )
-                        if guarded and guarded != str(current_label):
-                            labels.setdefault(str(agent_id), {}).setdefault(str(sfc_id), {})[sfc_node_id] = guarded
+                        if guarded and guarded != current_instance_id:
+                            labels.setdefault(str(agent_id), {}).setdefault(str(sfc_id), {})[sfc_node_id] = _resource_action_payload(
+                                guarded,
+                                _action_resource_level(current_label, "compute_level"),
+                                _action_resource_level(current_label, "bandwidth_level"),
+                            )
                             relabels += 1
-                        chosen_candidate = self._candidate_by_id(contextual, guarded or str(current_label))
+                        chosen_candidate = self._candidate_by_id(contextual, guarded or current_instance_id)
                         if chosen_candidate is not None:
                             node_id = str(chosen_candidate.get("node_id", ""))
                             if node_id:
@@ -1690,14 +1925,19 @@ class IPPOPolicy(BaseMARLPolicy):
 
     @staticmethod
     def _chosen_action(actions: Mapping[str, Any], agent_id: str, sfc_id: str, sfc_node_id: str) -> Optional[str]:
+        chosen = IPPOPolicy._chosen_action_payload(actions, agent_id, sfc_id, sfc_node_id)
+        instance_id = _action_instance_id(chosen)
+        return instance_id if instance_id else None
+
+    @staticmethod
+    def _chosen_action_payload(actions: Mapping[str, Any], agent_id: str, sfc_id: str, sfc_node_id: str) -> Any:
         agent_payload = actions.get(agent_id, {}) if isinstance(actions, Mapping) else {}
         if not isinstance(agent_payload, Mapping):
             return None
         chain_payload = agent_payload.get(sfc_id, {})
         if not isinstance(chain_payload, Mapping):
             return None
-        chosen = chain_payload.get(sfc_node_id)
-        return str(chosen) if chosen else None
+        return chain_payload.get(sfc_node_id)
 
     def _centralized_value_tensor(self, observations: Mapping[str, Mapping[str, Any]]) -> Any:
         if self.use_region_encoder:
@@ -1783,7 +2023,7 @@ class MASACPolicy(IPPOPolicy):
             self.torch.tensor(math.log(self.fixed_alpha), dtype=self.torch.float32, device=self.device)
         )
         hidden_dim = int(getattr(self.model, "hidden_dim", 128))
-        q_input_dim = hidden_dim * self.max_critic_agents + hidden_dim + self.candidate_feature_dim
+        q_input_dim = hidden_dim * self.max_critic_agents + hidden_dim + self.candidate_feature_dim + RESOURCE_Q_FEATURE_DIM
         self.q1 = self._build_q_network(q_input_dim, hidden_dim).to(self.device)
         self.q2 = self._build_q_network(q_input_dim, hidden_dim).to(self.device)
         self.target_q1 = copy.deepcopy(self.q1).to(self.device)
@@ -1838,7 +2078,8 @@ class MASACPolicy(IPPOPolicy):
 
     def sac_state_dict(self) -> Dict[str, Any]:
         return {
-            "algorithm": "masac_discrete_ctde",
+            "algorithm": "masac_joint_resource_ctde",
+            "resource_levels": list(RESOURCE_LEVEL_VALUES),
             "actor": self.model.state_dict(),
             "q1": self.q1.state_dict(),
             "q2": self.q2.state_dict(),
@@ -1924,22 +2165,25 @@ class MASACPolicy(IPPOPolicy):
                         total_deadline_s=total_deadline_s,
                     )
                     sfc_node_id = str(contextual.get("sfc_node_id", ""))
-                    chosen = self._chosen_action(actions, agent_key, str(sfc_id), sfc_node_id)
+                    chosen_payload = self._chosen_action_payload(actions, agent_key, str(sfc_id), sfc_node_id)
+                    chosen = _action_instance_id(chosen_payload)
                     ids = list(contextual.get("candidate_ids", []) or [])
                     mask_len = min(len(ids), self.max_candidates)
                     if not chosen or str(chosen) not in ids[:mask_len] or mask_len <= 0:
                         continue
                     action_idx = ids[:mask_len].index(str(chosen))
-                    q1, q2 = self._masac_q_values(
+                    candidate_features = self._masac_candidate_features(contextual, mask_len, global_context)
+                    q1, q2 = self._masac_joint_q_values(
                         global_context,
                         local_context,
-                        contextual,
-                        mask_len,
+                        candidate_features,
                         target=False,
                         detach_encoder=detach_encoder,
                     )
-                    q1_values.append(q1[action_idx])
-                    q2_values.append(q2[action_idx])
+                    compute_idx = _resource_level_index(_action_resource_level(chosen_payload, "compute_level"))
+                    bandwidth_idx = _resource_level_index(_action_resource_level(chosen_payload, "bandwidth_level"))
+                    q1_values.append(q1[action_idx, compute_idx, bandwidth_idx])
+                    q2_values.append(q2[action_idx, compute_idx, bandwidth_idx])
                     chosen_candidate = self._candidate_by_id(contextual, str(chosen))
                     if chosen_candidate is not None:
                         node_id = str(chosen_candidate.get("node_id", ""))
@@ -1965,12 +2209,17 @@ class MASACPolicy(IPPOPolicy):
         entropies: List[Any] = []
         alpha = self.alpha_tensor
         for item in self._masac_candidate_items(observations, target=target, detach_encoder=detach_encoder):
-            logits = item["logits"]
-            log_probs = self.torch.log_softmax(logits, dim=-1)
-            probs = self.torch.softmax(logits, dim=-1)
-            q_min = self.torch.minimum(item["q1"], item["q2"])
-            values.append((probs * (q_min - alpha * log_probs)).sum())
-            entropies.append(-(probs * log_probs).sum())
+            joint = self._masac_joint_distribution(item)
+            q1, q2 = self._masac_joint_q_values(
+                item["global_context"],
+                item["local_context"],
+                item["candidate_features"],
+                target=target,
+                detach_encoder=detach_encoder,
+            )
+            q_min = self.torch.minimum(q1, q2)
+            values.append((joint["probs"] * (q_min - alpha * joint["log_probs"])).sum())
+            entropies.append(-(joint["probs"] * joint["log_probs"]).sum())
         if not values:
             zero = self.torch.tensor(0.0, dtype=self.torch.float32, device=self.device)
             return zero, zero, 0
@@ -1986,15 +2235,20 @@ class MASACPolicy(IPPOPolicy):
         target_entropies: List[Any] = []
         alpha = self.alpha_tensor.detach()
         for item in self._masac_candidate_items(observations, target=False, detach_encoder=False):
-            logits = item["logits"]
-            log_probs = self.torch.log_softmax(logits, dim=-1)
-            probs = self.torch.softmax(logits, dim=-1)
-            q_min = self.torch.minimum(item["q1"], item["q2"]).detach()
-            losses.append((probs * (alpha * log_probs - q_min)).sum())
-            entropies.append(-(probs * log_probs).sum())
+            joint = self._masac_joint_distribution(item)
+            q1, q2 = self._masac_joint_q_values(
+                item["global_context"],
+                item["local_context"],
+                item["candidate_features"],
+                target=False,
+                detach_encoder=False,
+            )
+            q_min = self.torch.minimum(q1, q2).detach()
+            losses.append((joint["probs"] * (alpha * joint["log_probs"] - q_min)).sum())
+            entropies.append(-(joint["probs"] * joint["log_probs"]).sum())
             target_entropies.append(
                 self.torch.tensor(
-                    self._target_entropy_for_count(int(logits.numel())),
+                    self._target_entropy_for_count(int(joint["log_probs"].numel())),
                     dtype=self.torch.float32,
                     device=self.device,
                 )
@@ -2044,15 +2298,19 @@ class MASACPolicy(IPPOPolicy):
                     logits_slice = None if base_logits is None else base_logits[0, :mask_len]
                     logits = self._candidate_scores(actor_input, logits_slice, contextual, mask_len)
                     logits = self._apply_route_penalty(logits, contextual, mask_len)
-                    q1, q2 = self._masac_q_values(
-                        global_context,
-                        local_context,
-                        contextual,
-                        mask_len,
-                        target=target,
-                        detach_encoder=detach_encoder,
+                    candidate_features = self._masac_candidate_features(contextual, mask_len, global_context)
+                    compute_logits, bandwidth_logits = self._resource_logits(actor_input, candidate_features)
+                    items_out.append(
+                        {
+                            "logits": logits,
+                            "compute_logits": compute_logits,
+                            "bandwidth_logits": bandwidth_logits,
+                            "candidate_features": candidate_features,
+                            "global_context": global_context,
+                            "local_context": local_context,
+                            "contextual": contextual,
+                        }
                     )
-                    items_out.append({"logits": logits, "q1": q1, "q2": q2, "contextual": contextual})
                     chosen_idx = int(self.torch.argmax(logits.detach()).item())
                     chosen_candidate = self._candidate_by_id(contextual, ids[chosen_idx])
                     if chosen_candidate is not None:
@@ -2088,6 +2346,52 @@ class MASACPolicy(IPPOPolicy):
             local_contexts.append(self.torch.zeros((hidden_dim,), dtype=self.torch.float32, device=self.device))
         return bundle, self.torch.cat(local_contexts[: self.max_critic_agents], dim=-1)
 
+    def _masac_joint_distribution(self, item: Mapping[str, Any]) -> Dict[str, Any]:
+        candidate_log_probs = self.torch.log_softmax(item["logits"], dim=-1)
+        candidate_probs = self.torch.softmax(item["logits"], dim=-1)
+        compute_log_probs = self.torch.log_softmax(item["compute_logits"], dim=-1)
+        compute_probs = self.torch.softmax(item["compute_logits"], dim=-1)
+        bandwidth_log_probs = self.torch.log_softmax(item["bandwidth_logits"], dim=-1)
+        bandwidth_probs = self.torch.softmax(item["bandwidth_logits"], dim=-1)
+        return {
+            "log_probs": candidate_log_probs[:, None, None] + compute_log_probs[:, :, None] + bandwidth_log_probs[:, None, :],
+            "probs": candidate_probs[:, None, None] * compute_probs[:, :, None] * bandwidth_probs[:, None, :],
+        }
+
+    def _masac_joint_q_values(
+        self,
+        global_context: Any,
+        local_context: Any,
+        candidate_features: Any,
+        target: bool = False,
+        detach_encoder: bool = False,
+    ) -> Tuple[Any, Any]:
+        features = candidate_features
+        if features.shape[0] <= 0:
+            zero = self.torch.zeros(
+                (0, RESOURCE_ACTION_DIM, RESOURCE_ACTION_DIM),
+                dtype=global_context.dtype,
+                device=global_context.device,
+            )
+            return zero, zero
+        resource_pairs = self.torch.cartesian_prod(
+            self.resource_levels_tensor.to(dtype=global_context.dtype, device=global_context.device),
+            self.resource_levels_tensor.to(dtype=global_context.dtype, device=global_context.device),
+        )
+        pair_count = int(resource_pairs.shape[0])
+        candidate_count = int(features.shape[0])
+        global_expanded = global_context.reshape(1, -1).expand(candidate_count * pair_count, -1)
+        local_expanded = local_context.reshape(1, -1).expand(candidate_count * pair_count, -1)
+        features_expanded = features.repeat_interleave(pair_count, dim=0)
+        resources_expanded = resource_pairs.repeat(candidate_count, 1)
+        q_input = self.torch.cat([global_expanded, local_expanded, features_expanded, resources_expanded], dim=-1)
+        if detach_encoder:
+            q_input = q_input.detach()
+        q1_net, q2_net = (self.target_q1, self.target_q2) if target else (self.q1, self.q2)
+        q1 = q1_net(q_input).squeeze(-1).reshape(candidate_count, RESOURCE_ACTION_DIM, RESOURCE_ACTION_DIM)
+        q2 = q2_net(q_input).squeeze(-1).reshape(candidate_count, RESOURCE_ACTION_DIM, RESOURCE_ACTION_DIM)
+        return q1, q2
+
     def _masac_q_values(
         self,
         global_context: Any,
@@ -2098,16 +2402,14 @@ class MASACPolicy(IPPOPolicy):
         detach_encoder: bool = False,
     ) -> Tuple[Any, Any]:
         features = self._masac_candidate_features(candidate_set, mask_len, global_context)
-        if features.shape[0] <= 0:
-            zero = self.torch.zeros((0,), dtype=global_context.dtype, device=global_context.device)
-            return zero, zero
-        global_expanded = global_context.reshape(1, -1).expand(features.shape[0], -1)
-        local_expanded = local_context.reshape(1, -1).expand(features.shape[0], -1)
-        q_input = self.torch.cat([global_expanded, local_expanded, features], dim=-1)
-        if detach_encoder:
-            q_input = q_input.detach()
-        q1_net, q2_net = (self.target_q1, self.target_q2) if target else (self.q1, self.q2)
-        return q1_net(q_input).squeeze(-1), q2_net(q_input).squeeze(-1)
+        q1, q2 = self._masac_joint_q_values(
+            global_context,
+            local_context,
+            features,
+            target=target,
+            detach_encoder=detach_encoder,
+        )
+        return q1[:, -1, -1], q2[:, -1, -1]
 
     def _masac_candidate_features(self, candidate_set: Mapping[str, Any], mask_len: int, reference: Any) -> Any:
         array = np.asarray(candidate_set.get("candidate_features", []), dtype=np.float32)[:mask_len]

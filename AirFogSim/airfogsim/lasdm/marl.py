@@ -142,15 +142,20 @@ class LASDMMARLInterface:
 
     def decode_action(
         self,
-        action: Dict[str, str],
+        action: Dict[str, Any],
         chain: LASDMServiceChain,
         manager: LASDMManager,
     ) -> LASDMDecision:
         decision = LASDMDecision(sfc_id=chain.sfc_id)
-        for sfc_node_id, instance_id in action.items():
+        for sfc_node_id, action_value in action.items():
+            instance_id = _action_instance_id(action_value)
             if sfc_node_id not in chain.nodes:
                 decision.rejected_reason = SFCFailureReason.INVALID_GRAPH
                 decision.diagnostics["invalid_sfc_node_id"] = sfc_node_id
+                return decision
+            if not instance_id:
+                decision.rejected_reason = SFCFailureReason.NO_CANDIDATE
+                decision.diagnostics["missing_instance_id"] = instance_id
                 return decision
             try:
                 instance = manager.directory.get(instance_id)
@@ -160,6 +165,10 @@ class LASDMMARLInterface:
                 return decision
             decision.assignments[sfc_node_id] = instance_id
             decision.node_mapping[sfc_node_id] = instance.node_id
+            decision.resource_allocations[sfc_node_id] = {
+                "compute_level": _resource_level(_action_resource_value(action_value, "compute_level"), 1.0),
+                "bandwidth_level": _resource_level(_action_resource_value(action_value, "bandwidth_level"), 1.0),
+            }
             decision.routes[sfc_node_id] = [chain.source_node_id, instance.node_id]
         return decision
 
@@ -214,20 +223,20 @@ class LASDMMARLInterface:
         self,
         action: Mapping[str, Any],
         manager: LASDMManager,
-    ) -> List[tuple[LASDMServiceChain, Dict[str, str]]]:
+    ) -> List[tuple[LASDMServiceChain, Dict[str, Any]]]:
         if "assignments" in action:
             chain = self._chain_for_action(manager, action.get("sfc_id"))
-            return [(chain, self._string_mapping(action["assignments"]))]
+            return [(chain, self._action_mapping(action["assignments"]))]
 
         nested_actions = []
         for sfc_id, assignments in action.items():
             if sfc_id in manager.chains and isinstance(assignments, Mapping):
-                nested_actions.append((manager.chains[sfc_id], self._string_mapping(assignments)))
+                nested_actions.append((manager.chains[sfc_id], self._action_mapping(assignments)))
         if nested_actions:
             return nested_actions
 
         chain = self._chain_for_action(manager, None)
-        return [(chain, self._string_mapping(action))]
+        return [(chain, self._action_mapping(action))]
 
     def _chain_for_action(self, manager: LASDMManager, sfc_id: Optional[Any]) -> LASDMServiceChain:
         if sfc_id is not None:
@@ -241,14 +250,36 @@ class LASDMMARLInterface:
             raise ValueError("Action must include sfc_id when there is not exactly one undecided running SFC")
         return candidates[0]
 
-    def _string_mapping(self, raw: Any) -> Dict[str, str]:
+    def _action_mapping(self, raw: Any) -> Dict[str, Any]:
         if not isinstance(raw, Mapping):
             raise ValueError("LASDM MARL action assignments must be a mapping")
-        return {str(key): str(value) for key, value in raw.items()}
+        return {str(key): value for key, value in raw.items()}
 
 
 class LASDMMARLWrapper(LASDMMARLInterface):
     """Named env-style wrapper alias for callers that prefer wrapper terminology."""
+
+
+def _action_instance_id(value: Any) -> str:
+    if isinstance(value, Mapping):
+        return str(value.get("instance_id", value.get("service_instance_id", "")) or "")
+    return str(value or "")
+
+
+def _action_resource_value(value: Any, key: str) -> Any:
+    if isinstance(value, Mapping):
+        return value.get(key)
+    return None
+
+
+def _resource_level(value: Any, default: float = 1.0) -> float:
+    levels = tuple(round(0.1 * index, 1) for index in range(1, 11))
+    try:
+        numeric = float(value if value is not None else default)
+    except (TypeError, ValueError):
+        numeric = float(default)
+    numeric = max(levels[0], min(levels[-1], numeric))
+    return min(levels, key=lambda level: abs(level - numeric))
 
 
 def build_semantic_topology_marl_env(*args, **kwargs):

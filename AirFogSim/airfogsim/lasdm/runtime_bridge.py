@@ -236,12 +236,15 @@ class LASDMRuntimeBridge:
 
     def _semantic_quality_failure(self, task: Task) -> Optional[Dict[str, Any]]:
         min_score = float(getattr(task, "_lasdm_semantic_min_score", 0.0) or 0.0)
-        score = float(getattr(task, "_lasdm_semantic_score", 1.0) or 1.0)
+        score = float(getattr(task, "_lasdm_semantic_cumulative_quality", 1.0) or 1.0)
+        if not bool(getattr(task, "_lasdm_is_sink", False)):
+            return None
         if min_score <= 0.0 or score >= min_score:
             return None
         return {
             "airfogsim_failure_reason": "semantic_accuracy_violation",
-            "semantic_score": score,
+            "semantic_score": float(getattr(task, "_lasdm_semantic_score", score) or score),
+            "semantic_cumulative_quality": score,
             "semantic_min_score": min_score,
             "semantic_shortfall": max(0.0, min_score - score),
         }
@@ -419,6 +422,9 @@ class LASDMRuntimeBridge:
                 getattr(task, "_lasdm_semantic_mismatch_runtime_cost_s", 0.0) or 0.0
             ),
             "semantic_score": float(getattr(task, "_lasdm_semantic_score", 1.0) or 1.0),
+            "semantic_cumulative_quality": float(getattr(task, "_lasdm_semantic_cumulative_quality", 1.0) or 1.0),
+            "semantic_link_relation": str(getattr(task, "_lasdm_semantic_link_relation", "") or ""),
+            "semantic_link_matrix_cell": str(getattr(task, "_lasdm_semantic_link_matrix_cell", "") or ""),
             "semantic_min_score": float(getattr(task, "_lasdm_semantic_min_score", 0.0) or 0.0),
             "semantic_quality_violation": bool(getattr(task, "_lasdm_semantic_quality_violation", False)),
             "finish_time": current_time,
@@ -502,13 +508,38 @@ class LASDMRuntimeBridge:
             and str(metadata.get("semantic_group", "")) != "stale_remote_candidates"
         ):
             stale_penalty_s = 0.0
-        semantic_score = _float(candidate.get("semantic_score"), 1.0)
+        semantic_score = _float(metadata.get("link_similarity"), _float(candidate.get("semantic_score"), 1.0))
+        semantic_quality_before = _float(metadata.get("semantic_quality_before"), 1.0)
+        semantic_cumulative_quality = _float(
+            metadata.get("semantic_cumulative_quality_if_selected"),
+            max(0.0, min(1.0, semantic_quality_before * max(0.0, min(1.0, semantic_score)))),
+        )
         chain = self.manager.chains.get(decision.sfc_id)
         context = dict(getattr(chain, "context", {}) or {}) if chain is not None else {}
         semantic_min_score = max(0.0, _float(context.get("semantic_min_score"), 0.0))
         task.setAttribute("_lasdm_semantic_score", semantic_score)
+        task.setAttribute("_lasdm_link_similarity", semantic_score)
+        task.setAttribute("_lasdm_semantic_quality_before", semantic_quality_before)
+        task.setAttribute("_lasdm_semantic_cumulative_quality", semantic_cumulative_quality)
         task.setAttribute("_lasdm_semantic_min_score", semantic_min_score)
-        task.setAttribute("_lasdm_semantic_quality_violation", bool(semantic_min_score > 0.0 and semantic_score < semantic_min_score))
+        task.setAttribute(
+            "_lasdm_semantic_quality_violation",
+            bool(getattr(task, "_lasdm_is_sink", False) and semantic_min_score > 0.0 and semantic_cumulative_quality < semantic_min_score),
+        )
+        task.setAttribute("_lasdm_semantic_link_relation", str(metadata.get("semantic_link_relation", "")))
+        task.setAttribute("_lasdm_semantic_link_matrix_cell", str(metadata.get("semantic_link_matrix_cell", "")))
+        task.setAttribute("_lasdm_semantic_link_label_score", _float(metadata.get("semantic_link_label_score"), 0.0))
+        if metadata.get("link_source_semantic"):
+            task.setAttribute("_lasdm_input_semantic", str(metadata.get("link_source_semantic")))
+        selected_output = str(candidate.get("output_semantic", metadata.get("candidate_output_semantic", "")) or "")
+        if selected_output:
+            task.setAttribute("_lasdm_output_semantic", selected_output)
+        resource_allocation = dict(getattr(decision, "resource_allocations", {}).get(sfc_node_id, {}) or {})
+        compute_level = _discrete_resource_level(resource_allocation.get("compute_level"), 1.0)
+        bandwidth_level = _discrete_resource_level(resource_allocation.get("bandwidth_level"), 1.0)
+        task.setAttribute("_lasdm_compute_level", compute_level)
+        task.setAttribute("_lasdm_bandwidth_level", bandwidth_level)
+        task.setAttribute("_lasdm_resource_allocation", {"compute_level": compute_level, "bandwidth_level": bandwidth_level})
         mismatch_scale_s = _float(context.get("semantic_mismatch_penalty_s_per_unit"), 0.0)
         semantic_mismatch_s = max(0.0, mismatch_scale_s) * max(0.0, 1.0 - semantic_score) ** 2
         extra_seconds = max(0.0, cold_start_s + stale_penalty_s + semantic_mismatch_s)
@@ -551,6 +582,8 @@ class LASDMRuntimeBridge:
             "node_id": task.getAssignedTo() or task.getCurrentNodeId(),
             "payload_mb": float(getattr(task, "_lasdm_output_payload_mb", task.getTaskSize())),
             "semantic": getattr(task, "_lasdm_output_semantic", "any"),
+            "semantic_cumulative_quality": float(getattr(task, "_lasdm_semantic_cumulative_quality", 1.0) or 1.0),
+            "semantic_link_relation": str(getattr(task, "_lasdm_semantic_link_relation", "") or ""),
             "finish_time": current_time,
         }
 
@@ -706,3 +739,10 @@ def _float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except Exception:
         return float(default)
+
+
+def _discrete_resource_level(value: Any, default: float = 1.0) -> float:
+    levels = tuple(round(0.1 * index, 1) for index in range(1, 11))
+    numeric = _float(value, default)
+    numeric = max(levels[0], min(levels[-1], numeric))
+    return min(levels, key=lambda level: abs(level - numeric))

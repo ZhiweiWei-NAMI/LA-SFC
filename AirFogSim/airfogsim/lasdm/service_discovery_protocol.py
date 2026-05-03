@@ -21,6 +21,7 @@ class DiscoveryRequest:
     top_k: int = 8
     min_similarity: float = -1.0
     allowed_node_types: Sequence[str] = field(default_factory=tuple)
+    link_input_semantic: str = ""
 
 
 @dataclass
@@ -103,6 +104,7 @@ class DistributedServiceDiscoveryProtocol:
             top_k=request.top_k,
             min_similarity=request.min_similarity,
             include_remote=include_remote,
+            link_input_semantic=request.link_input_semantic or None,
         )
         record = DiscoveryTraceRecord(
             time_s=request.created_at_s,
@@ -130,6 +132,7 @@ class DistributedServiceDiscoveryProtocol:
         top_k: int = 8,
         min_similarity: float = -1.0,
         include_remote: bool = True,
+        link_input_semantic: Optional[str] = None,
     ) -> List[CatalogCandidate]:
         sfc_node = chain.nodes[sfc_node_id]
         request = DiscoveryRequest(
@@ -141,6 +144,11 @@ class DistributedServiceDiscoveryProtocol:
             required_capabilities=tuple(sfc_node.required_capabilities),
             allowed_node_types=tuple(str(item) for item in (getattr(chain, "context", {}) or {}).get("allowed_node_types", ()) or ()),
             query_text=sfc_node_text(sfc_node, payload_semantic=getattr(chain, "payload_semantic", "")),
+            link_input_semantic=str(
+                link_input_semantic
+                if link_input_semantic is not None
+                else (getattr(chain, "payload_semantic", "") if not chain.predecessors(sfc_node_id) else getattr(sfc_node, "input_semantic", ""))
+            ),
             created_at_s=float(now_s),
             top_k=int(top_k),
             min_similarity=float(min_similarity),
@@ -199,6 +207,19 @@ class DistributedServiceDiscoveryProtocol:
                     row["task_cpu"] = _float(selected_metadata.get("task_cpu"), _float(row.get("task_cpu"), 0.0))
                     row["deadline_slack_s"] = _float(selected_metadata.get("deadline_slack_s"), _float(row.get("deadline_slack_s"), 0.0))
                     row["utility_prior"] = _float(selected_metadata.get("utility_prior"), _float(row.get("utility_prior"), 0.0))
+                    row["link_similarity"] = _float(selected_metadata.get("link_similarity"), _float(row.get("link_similarity"), row.get("semantic_score", 0.0)))
+                    row["semantic_link_label_score"] = _float(
+                        selected_metadata.get("semantic_link_label_score"),
+                        _float(row.get("semantic_link_label_score"), 0.0),
+                    )
+                    row["semantic_link_relation"] = str(selected_metadata.get("semantic_link_relation", row.get("semantic_link_relation", "")) or "")
+                    row["semantic_link_matrix_cell"] = str(
+                        selected_metadata.get("semantic_link_matrix_cell", row.get("semantic_link_matrix_cell", "")) or ""
+                    )
+                    row["semantic_cumulative_quality"] = _float(
+                        selected_metadata.get("semantic_cumulative_quality_if_selected"),
+                        _float(row.get("semantic_cumulative_quality"), row.get("semantic_score", 1.0)),
+                    )
                 return True
         return False
 
@@ -230,6 +251,11 @@ class DistributedServiceDiscoveryProtocol:
             "function_budget_s",
             "deadline_slack_s",
             "utility_prior",
+            "link_similarity",
+            "node_template_similarity",
+            "semantic_quality_before",
+            "semantic_cumulative_quality_if_selected",
+            "semantic_link_label_score",
         }
         for candidate in candidates:
             metadata = dict(candidate.metadata or {})
@@ -261,6 +287,15 @@ class DistributedServiceDiscoveryProtocol:
                     row["function_budget_s"] = _float(metadata.get("function_budget_s"), 0.0)
                     row["deadline_slack_s"] = _float(metadata.get("deadline_slack_s"), 0.0)
                     row["utility_prior"] = _float(metadata.get("utility_prior"), 0.0)
+                    row["link_similarity"] = _float(metadata.get("link_similarity"), row.get("semantic_score", 0.0))
+                    row["node_template_similarity"] = _float(metadata.get("node_template_similarity"), 0.0)
+                    row["semantic_quality_before"] = _float(metadata.get("semantic_quality_before"), 1.0)
+                    row["semantic_cumulative_quality"] = _float(metadata.get("semantic_cumulative_quality_if_selected"), row["link_similarity"])
+                    row["semantic_link_label_score"] = _float(metadata.get("semantic_link_label_score"), 0.0)
+                    row["semantic_link_relation"] = str(metadata.get("semantic_link_relation", row.get("semantic_link_relation", "")) or "")
+                    row["semantic_link_matrix_cell"] = str(
+                        metadata.get("semantic_link_matrix_cell", row.get("semantic_link_matrix_cell", "")) or ""
+                    )
                     break
 
     def _append_candidate_detail_rows(
@@ -295,6 +330,16 @@ class DistributedServiceDiscoveryProtocol:
                     "instance_id": candidate.instance_id,
                     "rank": int(rank),
                     "semantic_score": float(candidate.semantic_score),
+                    "link_similarity": _float(metadata.get("link_similarity"), candidate.semantic_score),
+                    "node_template_similarity": _float(metadata.get("node_template_similarity"), candidate.semantic_score),
+                    "link_source_semantic": str(metadata.get("link_source_semantic", request.link_input_semantic or "")),
+                    "candidate_input_semantic": str(metadata.get("candidate_input_semantic", getattr(candidate, "input_semantic", ""))),
+                    "candidate_output_semantic": str(metadata.get("candidate_output_semantic", getattr(candidate, "output_semantic", ""))),
+                    "semantic_link_relation": str(metadata.get("semantic_link_relation", "")),
+                    "semantic_link_label_score": _float(metadata.get("semantic_link_label_score"), 0.0),
+                    "semantic_link_matrix_cell": str(metadata.get("semantic_link_matrix_cell", "")),
+                    "semantic_quality_before": _float(metadata.get("semantic_quality_before"), 1.0),
+                    "semantic_cumulative_quality": _float(metadata.get("semantic_cumulative_quality_if_selected"), candidate.semantic_score),
                     "topology_score": max(0.0, min(1.0, 1.0 - topology_risk)),
                     "topology_risk": topology_risk,
                     "mobility_risk": mobility_risk,

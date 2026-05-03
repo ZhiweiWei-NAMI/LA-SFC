@@ -600,18 +600,23 @@ class LASDMEnvAdapter:
                 wireless.append(task_info)
         if not wireless:
             return {}
-        active = wireless[:n_rb]
-        rb_per_task = max(1, n_rb // max(1, len(active)))
-        rb_cursor = 0
+        available_rbs = list(range(n_rb))
         assigned: Dict[str, List[int]] = {}
-        for task_info in active:
+        for task_info in wireless:
+            if not available_rbs:
+                break
             task_id = str(_task_info_value(task_info, "task_id", ""))
-            rb_list = [(rb_cursor + index) % n_rb for index in range(rb_per_task)]
-            rb_cursor = (rb_cursor + rb_per_task) % n_rb
+            bandwidth_level = _task_resource_level(task_info, "bandwidth", default=1.0)
+            requested_count = max(1, min(n_rb, int(float(bandwidth_level) * float(n_rb) + 0.999999)))
+            rb_list = available_rbs[:requested_count]
+            del available_rbs[: len(rb_list)]
             scheduler.setCommunicationWithRB(env, task_id, rb_list)
             assigned[task_id] = rb_list
             self.last_wireless_allocations[task_id] = rb_list
-            self.last_wireless_diagnostics.setdefault(task_id, {})["allocated_rb"] = rb_list
+            diagnostics = self.last_wireless_diagnostics.setdefault(task_id, {})
+            diagnostics["allocated_rb"] = rb_list
+            diagnostics["bandwidth_level"] = bandwidth_level
+            diagnostics["requested_rb_count"] = requested_count
         return assigned
 
     def schedule_computation(self, env: Any) -> bool:
@@ -625,9 +630,14 @@ class LASDMEnvAdapter:
                 if not tasks:
                     continue
                 cpu = self.node_cpu(env, node_id)
-                share = cpu / max(1, len(tasks))
+                available_cpu = max(0.0, float(cpu))
                 for task in tasks:
-                    allocation[task.getTaskId()] = share
+                    task_id = str(task.getTaskId())
+                    compute_level = _task_resource_level(task, "compute", default=1.0)
+                    requested_cpu = max(0.0, float(compute_level) * float(cpu))
+                    allocated_cpu = min(requested_cpu, available_cpu)
+                    allocation[task_id] = allocated_cpu
+                    available_cpu = max(0.0, available_cpu - allocated_cpu)
             return allocation
 
         scheduler.setComputingCallBack(env, alloc_cpu_callback)
@@ -1074,6 +1084,23 @@ def _task_info_value(task_info: Any, key: str, default: Any = None) -> Any:
         except Exception:
             return default
     return default
+
+
+def _task_resource_level(task_info: Any, resource: str, default: float = 1.0) -> float:
+    key = f"lasdm_{resource}_level"
+    raw = _task_info_value(task_info, key, None)
+    if raw is None:
+        raw = getattr(task_info, f"_lasdm_{resource}_level", None)
+    if raw is None and isinstance(task_info, Mapping):
+        allocation = task_info.get("lasdm_resource_allocation") or task_info.get("_lasdm_resource_allocation") or {}
+        if isinstance(allocation, Mapping):
+            raw = allocation.get(f"{resource}_level")
+    try:
+        numeric = float(raw if raw is not None else default)
+    except (TypeError, ValueError):
+        numeric = float(default)
+    numeric = max(0.1, min(1.0, numeric))
+    return round(numeric * 10.0) / 10.0
 
 
 def _node_energy(node: Any) -> float:

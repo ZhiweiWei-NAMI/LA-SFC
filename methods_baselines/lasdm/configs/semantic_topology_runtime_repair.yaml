@@ -158,6 +158,9 @@ marl:
     route_unavailable: -2.0
     deadline_slack: 0.05
     semantic_score: 0.50
+    semantic_link_label: 0.25
+    semantic_cumulative: 0.50
+    semantic_link_mismatch: -1.00
     utility_prior: 1.0
     stale_remote: -0.75
     topology_risk: -0.50

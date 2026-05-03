@@ -71,6 +71,28 @@ class MARLStepResult:
     info: Dict[str, Any]
 
 
+_RESOURCE_LEVELS = tuple(round(0.1 * index, 1) for index in range(1, 11))
+
+
+def _resource_level(value: Any, default: float = 1.0) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        numeric = float(default)
+    numeric = max(_RESOURCE_LEVELS[0], min(_RESOURCE_LEVELS[-1], numeric))
+    return min(_RESOURCE_LEVELS, key=lambda level: abs(level - numeric))
+
+
+def _normalize_resource_action(value: Any) -> Dict[str, Any]:
+    if isinstance(value, Mapping):
+        return {
+            "instance_id": str(value.get("instance_id", value.get("service_instance_id", "")) or ""),
+            "compute_level": _resource_level(value.get("compute_level"), 1.0),
+            "bandwidth_level": _resource_level(value.get("bandwidth_level"), 1.0),
+        }
+    return {"instance_id": str(value or ""), "compute_level": 1.0, "bandwidth_level": 1.0}
+
+
 class SemanticTopologyMARLEnv:
     """Multi-agent environment binding semantic discovery, topology, and LASDM runtime.
 
@@ -440,6 +462,7 @@ class SemanticTopologyMARLEnv:
             discovery_top_k = int(self.config.semantic_top_k)
             discovery_min_similarity = float(self.config.min_semantic_similarity)
             for sfc_node_id in order:
+                link_input_semantic = self._semantic_input_for_sfc_node(chain, sfc_node_id)
                 discovered[sfc_node_id] = self.discovery_protocol.discover_sfc_node(
                     agent_id,
                     chain,
@@ -448,6 +471,7 @@ class SemanticTopologyMARLEnv:
                     top_k=discovery_top_k,
                     min_similarity=discovery_min_similarity,
                     include_remote=self.config.include_remote_candidates,
+                    link_input_semantic=link_input_semantic,
                 )
             enriched_by_node = self._enrich_candidate_sets_with_runtime_routes(chain, order, discovered)
             for index, sfc_node_id in enumerate(order):
@@ -589,6 +613,11 @@ class SemanticTopologyMARLEnv:
                     "hops_from_prev_function",
                     "hops_from_prev_function_norm",
                     "sequential_deadline_feasible",
+                    "link_similarity",
+                    "node_template_similarity",
+                    "semantic_quality_before",
+                    "semantic_cumulative_quality_if_selected",
+                    "semantic_link_label_score",
                 ):
                     metadata[f"{field}_by_source"] = {
                         source: float(fields.get(field, 0.0) or 0.0) for source, fields in source_metrics.items()
@@ -678,10 +707,12 @@ class SemanticTopologyMARLEnv:
         topology_risk = min(1.0, topology_risk + route_risk)
         fields["topology_risk"] = topology_risk
         fields["mobility_risk"] = mobility_risk
-        semantic_score = float(getattr(candidate, "semantic_score", 0.0) or 0.0)
+        semantic_score = max(0.0, min(1.0, float(getattr(candidate, "semantic_score", 0.0) or 0.0)))
+        semantic_quality_before = self._semantic_quality_before(chain, sfc_node_id)
+        semantic_cumulative_quality = max(0.0, min(1.0, semantic_quality_before * semantic_score))
         chain_context = dict(getattr(chain, "context", {}) or {})
         semantic_min_score = max(0.0, float(chain_context.get("semantic_min_score", 0.0) or 0.0))
-        semantic_shortfall = max(0.0, semantic_min_score - semantic_score)
+        semantic_shortfall = max(0.0, semantic_min_score - semantic_cumulative_quality)
         deadline_s = float(getattr(getattr(chain, "qos", None), "deadline_s", 0.0) or 0.0)
         elapsed_s = 0.0
         if getattr(chain, "submit_time", None) is not None:
@@ -724,9 +755,14 @@ class SemanticTopologyMARLEnv:
             + 4.0 * mobility_risk
         )
         fields["semantic_score"] = semantic_score
+        fields["link_similarity"] = semantic_score
+        fields["node_template_similarity"] = max(0.0, min(1.0, float(metadata.get("node_template_similarity", semantic_score) or 0.0)))
+        fields["semantic_quality_before"] = semantic_quality_before
+        fields["semantic_cumulative_quality_if_selected"] = semantic_cumulative_quality
+        fields["semantic_link_label_score"] = max(0.0, min(1.0, float(metadata.get("semantic_link_label_score", semantic_score) or 0.0)))
         fields["semantic_min_score"] = semantic_min_score
         fields["semantic_shortfall"] = semantic_shortfall
-        fields["semantic_quality_violation"] = 1.0 if semantic_shortfall > 0.0 else 0.0
+        fields["semantic_quality_violation"] = 1.0 if semantic_shortfall > 0.0 and not chain.successors(str(sfc_node_id or "")) else 0.0
         fields["task_cpu"] = task_cpu
         fields["candidate_capacity_cpu"] = capacity_cpu
         fields["effective_cpu"] = effective_cpu
@@ -755,8 +791,34 @@ class SemanticTopologyMARLEnv:
             or expected_penalty_s <= remaining_deadline_s + 1e-9
             else 0.0
         )
-        fields["utility_prior"] = semantic_score - (expected_penalty_s / max(1.0, function_budget_s or 1.0))
+        fields["utility_prior"] = semantic_cumulative_quality - (expected_penalty_s / max(1.0, function_budget_s or 1.0))
         return fields
+
+    def _semantic_input_for_sfc_node(self, chain: LASDMServiceChain, sfc_node_id: str) -> str:
+        predecessors = chain.predecessors(sfc_node_id)
+        if not predecessors:
+            return str(getattr(chain, "payload_semantic", "") or "any")
+        for predecessor in predecessors:
+            output = getattr(self.runtime_bridge, "node_outputs", {}).get((chain.sfc_id, predecessor))
+            if isinstance(output, Mapping):
+                semantic = str(output.get("semantic", "") or "")
+                if semantic:
+                    return semantic
+        node = chain.nodes.get(sfc_node_id)
+        return str(getattr(node, "input_semantic", "") or "any")
+
+    def _semantic_quality_before(self, chain: LASDMServiceChain, sfc_node_id: Optional[str]) -> float:
+        if not sfc_node_id:
+            return 1.0
+        predecessors = chain.predecessors(sfc_node_id)
+        if not predecessors:
+            return 1.0
+        quality = 1.0
+        for predecessor in predecessors:
+            output = getattr(self.runtime_bridge, "node_outputs", {}).get((chain.sfc_id, predecessor))
+            if isinstance(output, Mapping):
+                quality *= max(0.0, min(1.0, float(output.get("semantic_cumulative_quality", 1.0) or 1.0)))
+        return max(0.0, min(1.0, quality))
 
     def _remaining_function_count(self, chain: LASDMServiceChain, sfc_node_id: Optional[str]) -> int:
         order = list(chain.topological_order())
@@ -977,10 +1039,10 @@ class SemanticTopologyMARLEnv:
         if not actions:
             return []
         # Accepted formats:
-        # {agent_id: {sfc_id: {sfc_node_id: instance_id}}}
-        # {sfc_id: {sfc_node_id: instance_id}}
+        # {agent_id: {sfc_id: {sfc_node_id: {instance_id, compute_level, bandwidth_level}}}}
+        # {sfc_id: {sfc_node_id: {instance_id, compute_level, bandwidth_level}}}
         nested_by_agent = any(key in self.agent_ids for key in actions.keys())
-        chain_actions: Dict[str, Dict[str, str]] = {}
+        chain_actions: Dict[str, Dict[str, Dict[str, Any]]] = {}
         if nested_by_agent:
             for _agent_id, payload in actions.items():
                 if not isinstance(payload, Mapping):
@@ -992,11 +1054,15 @@ class SemanticTopologyMARLEnv:
                             controller = self._controller_agent_for_chain(chain)
                             if controller and str(_agent_id) != controller:
                                 continue
-                        chain_actions.setdefault(str(sfc_id), {}).update({str(k): str(v) for k, v in assignments.items()})
+                        chain_actions.setdefault(str(sfc_id), {}).update(
+                            {str(k): _normalize_resource_action(v) for k, v in assignments.items()}
+                        )
         else:
             for sfc_id, assignments in actions.items():
                 if isinstance(assignments, Mapping):
-                    chain_actions.setdefault(str(sfc_id), {}).update({str(k): str(v) for k, v in assignments.items()})
+                    chain_actions.setdefault(str(sfc_id), {}).update(
+                        {str(k): _normalize_resource_action(v) for k, v in assignments.items()}
+                    )
 
         decisions: List[LASDMDecision] = []
         selected_lookup = self._selected_candidate_lookup()
@@ -1006,10 +1072,15 @@ class SemanticTopologyMARLEnv:
                 continue
             decision = LASDMDecision(sfc_id=sfc_id)
             selected_candidates: Dict[str, Any] = {}
-            for sfc_node_id, instance_id in assignments.items():
+            for sfc_node_id, action_value in assignments.items():
+                instance_id = str(action_value.get("instance_id", "") or "")
                 if sfc_node_id not in chain.nodes:
                     decision.rejected_reason = SFCFailureReason.INVALID_GRAPH
                     decision.diagnostics["invalid_sfc_node_id"] = sfc_node_id
+                    break
+                if not instance_id:
+                    decision.rejected_reason = SFCFailureReason.NO_CANDIDATE
+                    decision.diagnostics["missing_instance_id"] = instance_id
                     break
                 try:
                     instance = self.manager.directory.get(instance_id)
@@ -1019,6 +1090,10 @@ class SemanticTopologyMARLEnv:
                     break
                 decision.assignments[sfc_node_id] = instance_id
                 decision.node_mapping[sfc_node_id] = instance.node_id
+                decision.resource_allocations[sfc_node_id] = {
+                    "compute_level": _resource_level(action_value.get("compute_level"), 1.0),
+                    "bandwidth_level": _resource_level(action_value.get("bandwidth_level"), 1.0),
+                }
                 source = chain.source_node_id
                 predecessors = chain.predecessors(sfc_node_id)
                 if predecessors:
@@ -1049,6 +1124,10 @@ class SemanticTopologyMARLEnv:
                 decision.diagnostics["missing_sfc_node_ids"] = missing
             if selected_candidates:
                 decision.diagnostics["selected_candidates"] = selected_candidates
+            if decision.resource_allocations:
+                decision.diagnostics["selected_resource_allocations"] = {
+                    key: dict(value) for key, value in decision.resource_allocations.items()
+                }
             decisions.append(decision)
         return decisions
 
@@ -1094,6 +1173,11 @@ class SemanticTopologyMARLEnv:
             "hops_from_prev_function": "hops_from_prev_function_by_source",
             "hops_from_prev_function_norm": "hops_from_prev_function_norm_by_source",
             "sequential_deadline_feasible": "sequential_deadline_feasible_by_source",
+            "link_similarity": "link_similarity_by_source",
+            "node_template_similarity": "node_template_similarity_by_source",
+            "semantic_quality_before": "semantic_quality_before_by_source",
+            "semantic_cumulative_quality_if_selected": "semantic_cumulative_quality_if_selected_by_source",
+            "semantic_link_label_score": "semantic_link_label_score_by_source",
         }
         for field, mapping_name in source_fields.items():
             mapping = metadata.get(mapping_name)
@@ -1180,6 +1264,9 @@ def _reward_aux_from_decisions(decisions: Sequence[LASDMDecision]) -> Dict[str, 
     if not selected:
         return {}
     semantic_scores = [_to_float(item.get("semantic_score"), 0.0) for item in selected]
+    semantic_link_label_scores = []
+    semantic_cumulative_qualities = []
+    semantic_link_mismatches = []
     stale_values = []
     topology_risks = []
     mobility_risks = []
@@ -1200,6 +1287,12 @@ def _reward_aux_from_decisions(decisions: Sequence[LASDMDecision]) -> Dict[str, 
     route_unavailable = 0
     for item in selected:
         metadata = dict(item.get("metadata", {}) or {})
+        relation = str(metadata.get("semantic_link_relation", "") or "")
+        semantic_link_label_scores.append(_to_float(metadata.get("semantic_link_label_score"), _to_float(item.get("semantic_score"), 0.0)))
+        semantic_cumulative_qualities.append(
+            _to_float(metadata.get("semantic_cumulative_quality_if_selected"), _to_float(item.get("semantic_score"), 1.0))
+        )
+        semantic_link_mismatches.append(1.0 if relation == "mismatch" else 0.0)
         stale = (
             _to_float(item.get("staleness_s"), 0.0) > 0.0
             or bool(item.get("stale", False))
@@ -1224,6 +1317,10 @@ def _reward_aux_from_decisions(decisions: Sequence[LASDMDecision]) -> Dict[str, 
         remaining_deadline_ratios.append(_to_float(metadata.get("remaining_deadline_ratio"), 1.0))
         semantic_group = str(metadata.get("semantic_group", item.get("semantic_group", "unknown")) or "unknown")
         semantic_group_counts[semantic_group] = semantic_group_counts.get(semantic_group, 0) + 1
+        semantic_link_relation = relation or "unknown"
+        semantic_group_counts[f"link_relation_{semantic_link_relation}"] = (
+            semantic_group_counts.get(f"link_relation_{semantic_link_relation}", 0) + 1
+        )
         if route_available <= 0.0:
             route_unavailable += 1
     aux = {
@@ -1251,6 +1348,9 @@ def _reward_aux_from_decisions(decisions: Sequence[LASDMDecision]) -> Dict[str, 
         "selected_mobility_risk_mean": _mean(mobility_risks),
         "selected_stale_remote_ratio": _mean(stale_values),
         "selected_semantic_group_count": float(len(selected)),
+        "selected_semantic_link_label_score_mean": _mean(semantic_link_label_scores),
+        "selected_semantic_cumulative_quality_mean": _mean(semantic_cumulative_qualities),
+        "selected_semantic_link_mismatch_ratio": _mean(semantic_link_mismatches),
     }
     for group, count in semantic_group_counts.items():
         key = "".join(char if char.isalnum() else "_" for char in group.lower()).strip("_") or "unknown"
