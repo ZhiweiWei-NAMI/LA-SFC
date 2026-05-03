@@ -22,7 +22,7 @@ from .topology_builder import DynamicTopology, TopologyBuilder, TopologyNode, To
 from .temporal_state_buffer import TemporalStateBuffer, TemporalSummary
 from .graph_observation import GraphObservationBuilder, GraphObservationConfig, flatten_observation
 from .marl_env import MARLEnvConfig, SemanticTopologyMARLEnv
-from .marl_policy import IPPOPolicy, SemanticGreedyPolicy, TopologyGreedyPolicy, RandomValidPolicy
+from .marl_policy import IPPOPolicy, MASACPolicy, SemanticGreedyPolicy, TopologyGreedyPolicy, RandomValidPolicy
 from .marl_reward import SFCReward, SFCRewardConfig, compute_sfc_reward
 
 from .env_adapter import LASDMEnvAdapter

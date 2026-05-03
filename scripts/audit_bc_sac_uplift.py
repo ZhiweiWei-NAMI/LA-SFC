@@ -9,15 +9,15 @@ from typing import Any
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Audit whether PPO fine-tuning improves over the BC topology-greedy student.")
+    parser = argparse.ArgumentParser(description="Audit whether SAC fine-tuning improves over the BC topology-greedy student.")
     parser.add_argument("--train-root", required=True, help="semantic_runtime_train directory")
     parser.add_argument("--output", default=None)
-    parser.add_argument("--required-ppo-selected", type=int, default=3)
+    parser.add_argument("--required-sac-selected", type=int, default=3)
     args = parser.parse_args()
 
     train_root = Path(args.train_root)
     rows = collect_rows(train_root)
-    output = Path(args.output) if args.output else train_root.parent / "bc_ppo_uplift_audit.csv"
+    output = Path(args.output) if args.output else train_root.parent / "bc_sac_uplift_audit.csv"
     output.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
         "variant",
@@ -31,9 +31,9 @@ def main() -> int:
         "best_raw_score",
         "best_success_ratio",
         "best_min_success_ratio",
-        "ppo_delta_score",
-        "ppo_delta_pct",
-        "ppo_selected",
+        "sac_delta_score",
+        "sac_delta_pct",
+        "sac_selected",
         "validation_seed_success_non_decrease_count",
         "training_completed",
     ]
@@ -48,16 +48,16 @@ def main() -> int:
     summary = []
     for variant, items in sorted(by_variant.items()):
         completed = [row for row in items if int(row["training_completed"])]
-        ppo_selected = sum(int(row["ppo_selected"]) for row in completed)
-        deltas = [float(row["ppo_delta_score"]) for row in completed]
+        sac_selected = sum(int(row["sac_selected"]) for row in completed)
+        deltas = [float(row["sac_delta_score"]) for row in completed]
         summary.append(
             {
                 "variant": variant,
                 "seed_count": len(items),
                 "completed_seed_count": len(completed),
-                "ppo_selected_count": ppo_selected,
-                "required_ppo_selected": int(args.required_ppo_selected),
-                "majority_ppo_selected": len(completed) == len(items) and ppo_selected >= int(args.required_ppo_selected),
+                "sac_selected_count": sac_selected,
+                "required_sac_selected": int(args.required_sac_selected),
+                "majority_sac_selected": len(completed) == len(items) and sac_selected >= int(args.required_sac_selected),
                 "mean_delta_score": mean(deltas) if deltas else 0.0,
                 "min_delta_score": min(deltas) if deltas else 0.0,
                 "max_delta_score": max(deltas) if deltas else 0.0,
@@ -82,7 +82,7 @@ def collect_rows(train_root: Path) -> list[dict[str, Any]]:
         bc_row = next((row for row in checkpoint_rows if str(row.get("checkpoint_source", "")) == "bc"), checkpoint_rows[0])
         summary_path = seed_dir / "train_summary.json"
         best = {}
-        training_completed = summary_path.exists() and (seed_dir / "ippo_policy.pt").exists()
+        training_completed = summary_path.exists() and (seed_dir / "masac_policy.pt").exists()
         if summary_path.exists():
             try:
                 best = dict(json.loads(summary_path.read_text(encoding="utf-8")).get("best_selection", {}) or {})
@@ -106,9 +106,9 @@ def collect_rows(train_root: Path) -> list[dict[str, Any]]:
                 "best_raw_score": to_float(best.get("raw_selection_score", best.get("selection_score"))),
                 "best_success_ratio": to_float(best.get("success_ratio")),
                 "best_min_success_ratio": to_float(best.get("min_success_ratio")),
-                "ppo_delta_score": best_score - bc_score,
-                "ppo_delta_pct": (best_score / bc_score - 1.0) if bc_score else 0.0,
-                "ppo_selected": int(str(best.get("checkpoint_source", "")) == "ppo"),
+                "sac_delta_score": best_score - bc_score,
+                "sac_delta_pct": (best_score / bc_score - 1.0) if bc_score else 0.0,
+                "sac_selected": int(str(best.get("checkpoint_source", "")) == "sac"),
                 "validation_seed_success_non_decrease_count": best.get("validation_seed_success_non_decrease_count", ""),
                 "training_completed": int(training_completed),
             }

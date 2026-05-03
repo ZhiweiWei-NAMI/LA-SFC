@@ -56,7 +56,7 @@ def run_diagnostic_episode(
         _config_with_baseline_updates,
         _ippo_policy_kwargs,
     )
-    from airfogsim.lasdm.marl_policy import IPPOPolicy
+    from airfogsim.lasdm.marl_policy import MASACPolicy
     from airfogsim.lasdm.graph_observation import flatten_observation
 
     env, air_env = _build_semantic_runtime_env(config, scenario, role, seed, variant_name, max_steps)
@@ -68,14 +68,18 @@ def run_diagnostic_episode(
         state = torch.load(str(checkpoint_path), map_location="cpu", weights_only=True)
     except TypeError:
         state = torch.load(str(checkpoint_path), map_location="cpu")
-    obs_dim = _checkpoint_observation_dim(state) or (
+    actor_state = state.get("actor", state) if isinstance(state, Mapping) else state
+    obs_dim = _checkpoint_observation_dim(actor_state) or (
         max(len(flatten_observation(obs)) for obs in observations.values()) if observations else 1
     )
-    max_candidates = _checkpoint_action_dim(state) or int(config.get("marl", {}).get("max_candidates", 16))
-    policy = IPPOPolicy(**_ippo_policy_kwargs(
-        policy_config, obs_dim, max_candidates, seed, observations=observations, state=state
-    ))
-    policy.model.load_state_dict(state, strict=_checkpoint_has_critic_body(state))
+    max_candidates = _checkpoint_action_dim(actor_state) or int(config.get("marl", {}).get("max_candidates", 16))
+    policy = MASACPolicy(
+        **_ippo_policy_kwargs(policy_config, obs_dim, max_candidates, seed, observations=observations, state=actor_state),
+        q_lr=float(config.get("marl", {}).get("masac_q_lr", config.get("marl", {}).get("ippo_lr", 3e-4)) or 3e-4),
+        alpha=float(config.get("marl", {}).get("masac_alpha", 0.05) or 0.05),
+        tau=float(config.get("marl", {}).get("masac_tau", 0.005) or 0.005),
+    )
+    policy.load_sac_state_dict(state, strict=_checkpoint_has_critic_body(actor_state))
     policy.model.eval()
 
     rows: List[Dict[str, Any]] = []
@@ -321,7 +325,7 @@ def analyze_results(all_rows: List[Dict[str, Any]], output_dir: Path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Diagnose semantic leakage in IPPO training")
+    parser = argparse.ArgumentParser(description="Diagnose semantic leakage in MASAC training")
     parser.add_argument("--config", default=str(WORKSPACE / "methods_baselines/lasdm/configs/semantic_topology_marl.yaml"),
                         help="Base semantic topology YAML config")
     parser.add_argument("--repair-config", default=str(WORKSPACE / "methods_baselines/lasdm/configs/semantic_topology_runtime_repair.yaml"),
@@ -385,9 +389,9 @@ def main():
             best_ep = int(best["episode"])
 
             # Find checkpoint file
-            pt_candidates = list(seed_dir.glob(f"ippo_policy_best_ep{best_ep}*.pt"))
+            pt_candidates = list(seed_dir.glob(f"masac_policy_best_ep{best_ep}*.pt"))
             if not pt_candidates:
-                pt_candidates = list(seed_dir.glob("ippo_policy*.pt"))
+                pt_candidates = list(seed_dir.glob("masac_policy*.pt"))
             if not pt_candidates:
                 print(f"WARNING: No checkpoint .pt file in {seed_dir}, skipping")
                 continue

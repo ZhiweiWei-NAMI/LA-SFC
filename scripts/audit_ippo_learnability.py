@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Run a small learnability audit for the IPPO candidate-choice actor.
+"""Run a small learnability audit for the learned candidate-choice actor.
 
 The audit separates three questions that final runtime success cannot answer:
 
 * Is the expert policy strong on the same runtime scenario?
-* Can the IPPO actor behavior-clone the expert's per-function candidate choice?
-* Does BC improve candidate quality metrics before PPO is attempted?
+* Can the actor behavior-clone the expert's per-function candidate choice?
+* Does BC improve candidate quality metrics before SAC fine tuning?
 
 Outputs are diagnostic CSVs only. They are not paper figure data.
 """
@@ -30,7 +30,7 @@ for path in (WORKSPACE / "AirFogSim", WORKSPACE / "methods_baselines" / "lasdm",
 
 
 from airfogsim.lasdm.graph_observation import flatten_observation
-from airfogsim.lasdm.marl_policy import IPPOPolicy, policy_from_name
+from airfogsim.lasdm.marl_policy import MASACPolicy, policy_from_name
 from run_complete_runtime_experiment import (
     _build_semantic_runtime_env,
     _close_env,
@@ -43,7 +43,7 @@ from run_complete_runtime_experiment import (
 
 DEFAULT_CONFIG = "methods_baselines/lasdm/configs/semantic_topology_marl.yaml"
 DEFAULT_REPAIR_CONFIG = "methods_baselines/lasdm/configs/semantic_topology_runtime_repair.yaml"
-DEFAULT_OUTPUT = "experiment_artifacts/diagnostics/ippo_learnability_audit_20260501"
+DEFAULT_OUTPUT = "experiment_artifacts/diagnostics/masac_learnability_audit_20260501"
 DEFAULT_SCENARIOS = [
     "semantic_runtime_calibration_easy",
     "semantic_runtime_contention_stress",
@@ -51,7 +51,7 @@ DEFAULT_SCENARIOS = [
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Audit IPPO BC learnability on real semantic-runtime env rollouts.")
+    parser = argparse.ArgumentParser(description="Audit learned-actor BC learnability on real semantic-runtime env rollouts.")
     parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument("--repair-config", default=DEFAULT_REPAIR_CONFIG)
     parser.add_argument("--output-root", default=DEFAULT_OUTPUT)
@@ -86,7 +86,7 @@ def main() -> int:
         for scenario in scenarios:
             scenario_name = str(scenario.get("name", "scenario"))
             print(f"[audit] seed={seed} scenario={scenario_name}", flush=True)
-            policy = _new_ippo_policy(config, scenario, args.role, seed, args.max_steps)
+            policy = _new_masac_policy(config, scenario, args.role, seed, args.max_steps)
             expert = _new_expert_policy(config, seed)
 
             runtime_rows.append(
@@ -109,7 +109,7 @@ def main() -> int:
                     seed + args.eval_seed_offset,
                     policy,
                     args.max_steps,
-                    method="ippo_before_bc",
+                    method="masac_before_bc",
                     train_seed=seed,
                 )
             )
@@ -152,7 +152,7 @@ def main() -> int:
                     seed + args.eval_seed_offset,
                     policy,
                     args.max_steps,
-                    method="ippo_after_bc",
+                    method="masac_after_bc",
                     train_seed=seed,
                 )
             )
@@ -218,13 +218,13 @@ def _new_expert_policy(config: Mapping[str, Any], seed: int) -> Any:
     return policy_from_name(name, **kwargs)
 
 
-def _new_ippo_policy(
+def _new_masac_policy(
     config: Mapping[str, Any],
     scenario: Mapping[str, Any],
     role: str,
     seed: int,
     max_steps: int,
-) -> IPPOPolicy:
+) -> MASACPolicy:
     env = None
     air_env = None
     try:
@@ -239,7 +239,13 @@ def _new_ippo_policy(
         observations = env.reset()
         obs_dim = max((len(flatten_observation(obs)) for obs in observations.values()), default=1)
         max_candidates = int(dict(config.get("marl", {}) or {}).get("max_candidates", 16) or 16)
-        return IPPOPolicy(**_ippo_policy_kwargs(config, obs_dim, max_candidates, int(seed), observations=observations))
+        marl_cfg = dict(config.get("marl", {}) or {})
+        return MASACPolicy(
+            **_ippo_policy_kwargs(config, obs_dim, max_candidates, int(seed), observations=observations),
+            q_lr=float(marl_cfg.get("masac_q_lr", marl_cfg.get("ippo_lr", 3e-4)) or 3e-4),
+            alpha=float(marl_cfg.get("masac_alpha", 0.05) or 0.05),
+            tau=float(marl_cfg.get("masac_tau", 0.005) or 0.005),
+        )
     finally:
         _close_env(air_env)
 
@@ -249,7 +255,7 @@ def _behavior_clone(
     scenario: Mapping[str, Any],
     role: str,
     seed: int,
-    policy: IPPOPolicy,
+    policy: MASACPolicy,
     expert: Any,
     bc_episodes: int,
     steps_per_observation: int,
@@ -315,7 +321,7 @@ def _evaluate_imitation(
     scenario: Mapping[str, Any],
     role: str,
     seed: int,
-    policy: IPPOPolicy,
+    policy: MASACPolicy,
     expert: Any,
     max_steps: int,
     stage: str,
@@ -395,7 +401,7 @@ def _evaluate_imitation(
 
 
 def _compare_policy_to_expert(
-    policy: IPPOPolicy,
+    policy: MASACPolicy,
     observations: Mapping[str, Mapping[str, Any]],
     expert_actions: Mapping[str, Any],
 ) -> List[Dict[str, Any]]:
@@ -516,7 +522,7 @@ def _compare_policy_to_expert(
     return rows
 
 
-def _policy_observation_tensors(policy: IPPOPolicy, observation: Mapping[str, Any]) -> Tuple[Any, Optional[Any]]:
+def _policy_observation_tensors(policy: MASACPolicy, observation: Mapping[str, Any]) -> Tuple[Any, Optional[Any]]:
     torch = policy.torch
     if policy.use_region_encoder:
         return policy.model.region_context_tensor(observation, policy.device), None

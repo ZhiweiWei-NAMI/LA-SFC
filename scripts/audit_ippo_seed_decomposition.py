@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Decompose IPPO BC failures by environment, initialization, and BC data seed.
+"""Decompose learned-actor BC failures by environment, initialization, and BC data seed.
 
 This is a diagnostic script. It runs real offline AirFogSim rollouts but does
 not produce paper figure data.
@@ -25,7 +25,7 @@ for path in (WORKSPACE / "AirFogSim", WORKSPACE / "methods_baselines" / "lasdm",
 
 
 from airfogsim.lasdm.graph_observation import flatten_observation
-from airfogsim.lasdm.marl_policy import IPPOPolicy
+from airfogsim.lasdm.marl_policy import MASACPolicy
 from audit_ippo_learnability import (
     _behavior_clone,
     _evaluate_imitation,
@@ -43,7 +43,7 @@ from run_complete_runtime_experiment import (
 
 DEFAULT_CONFIG = "methods_baselines/lasdm/configs/semantic_topology_marl.yaml"
 DEFAULT_REPAIR_CONFIG = "methods_baselines/lasdm/configs/semantic_topology_runtime_repair.yaml"
-DEFAULT_OUTPUT = "experiment_artifacts/diagnostics/ippo_seed_decomposition_20260502"
+DEFAULT_OUTPUT = "experiment_artifacts/diagnostics/masac_seed_decomposition_20260502"
 DEFAULT_SCENARIOS = [
     "semantic_runtime_calibration_easy",
     "semantic_ambiguity_calibrated",
@@ -98,7 +98,7 @@ def main() -> int:
             flush=True,
         )
         for scenario in scenarios:
-            policy = _new_decoupled_ippo_policy(config, scenario, args.role, env_seed, init_seed, args.max_steps, args.baseline)
+            policy = _new_decoupled_masac_policy(config, scenario, args.role, env_seed, init_seed, args.max_steps, args.baseline)
             expert = _new_expert_policy(config, env_seed)
             _behavior_clone(
                 config,
@@ -133,7 +133,7 @@ def main() -> int:
                 eval_seed,
                 policy,
                 args.max_steps,
-                method="ippo_after_bc",
+                method="masac_after_bc",
                 train_seed=env_seed,
             )
             expert_runtime = _run_runtime_episode(
@@ -225,7 +225,7 @@ def _scenario_by_name(config: Mapping[str, Any], name: str) -> Dict[str, Any]:
     raise ValueError(f"Unknown scenario: {name}")
 
 
-def _new_decoupled_ippo_policy(
+def _new_decoupled_masac_policy(
     config: Mapping[str, Any],
     scenario: Mapping[str, Any],
     role: str,
@@ -233,7 +233,7 @@ def _new_decoupled_ippo_policy(
     init_seed: int,
     max_steps: int,
     baseline: str,
-) -> IPPOPolicy:
+) -> MASACPolicy:
     env = None
     air_env = None
     try:
@@ -249,8 +249,12 @@ def _new_decoupled_ippo_policy(
         obs_dim = max((len(flatten_observation(obs)) for obs in observations.values()), default=1)
         max_candidates = int(dict(config.get("marl", {}) or {}).get("max_candidates", 16) or 16)
         policy_config = _config_with_baseline_updates(config, baseline)
-        return IPPOPolicy(
-            **_ippo_policy_kwargs(policy_config, obs_dim, max_candidates, int(init_seed), observations=observations)
+        marl_cfg = dict(policy_config.get("marl", {}) or {})
+        return MASACPolicy(
+            **_ippo_policy_kwargs(policy_config, obs_dim, max_candidates, int(init_seed), observations=observations),
+            q_lr=float(marl_cfg.get("masac_q_lr", marl_cfg.get("ippo_lr", 3e-4)) or 3e-4),
+            alpha=float(marl_cfg.get("masac_alpha", 0.05) or 0.05),
+            tau=float(marl_cfg.get("masac_tau", 0.005) or 0.005),
         )
     finally:
         _close_env(air_env)

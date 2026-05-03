@@ -1059,7 +1059,7 @@ def plot_f1_architecture() -> plt.Figure:
         ("Semantic\ncatalog", 0.23, 0.72, "#e8f4ea"),
         ("Distributed\nexchange", 0.23, 0.38, "#e8f4ea"),
         ("Topology +\ntemporal state", 0.45, 0.56, "#fff4df"),
-        ("IPPO\npolicy", 0.66, 0.56, "#f6e8ef"),
+        ("MASAC\npolicy", 0.66, 0.56, "#f6e8ef"),
         ("AirFogSim\nscheduler", 0.83, 0.56, "#e8eef7"),
         ("Wireless / compute /\nenergy queues", 0.83, 0.23, "#e8eef7"),
     ]
@@ -1297,7 +1297,7 @@ def plot_f6_topology_churn(df: pd.DataFrame) -> plt.Figure:
 
 def plot_f7_reward_curve(df: pd.DataFrame) -> plt.Figure:
     if df.empty or "mean_reward" not in df.columns:
-        return notice_figure("F7 IPPO reward unavailable", ["reward_curve.csv from stress training/evaluation is required."])
+        return notice_figure("F7 MASAC reward unavailable", ["reward_curve.csv from stress training/evaluation is required."])
     df = df.copy()
     df["mean_reward"] = pd.to_numeric(df["mean_reward"], errors="coerce")
     df["episode"] = pd.to_numeric(df["episode"], errors="coerce").fillna(0)
@@ -1316,7 +1316,7 @@ def plot_f7_reward_curve(df: pd.DataFrame) -> plt.Figure:
         ax.fill_between(grouped["episode"], y - ci, y + ci, color=method_color(method), alpha=0.15, linewidth=0)
     ax.set_xlabel("Training episode")
     ax.set_ylabel("Mean reward")
-    ax.set_title("IPPO training on stress scenarios")
+    ax.set_title("MASAC training on stress scenarios")
     return fig
 
 
@@ -1553,7 +1553,7 @@ def expected_figure_specs() -> Dict[str, Dict[str, str]]:
         "F4": {"x": "candidate rank / method", "y": "mean or selected semantic score", "legend": "method", "expected": "semantic-aware methods show higher top-k quality"},
         "F5": {"x": "TTL seconds or exchange radius hops", "y": "remote discovery rate / stale ratio", "legend": "method", "expected": "larger TTL/radius increases discovery and stale risk"},
         "F6": {"x": "topology churn score", "y": "reward / QoS hit ratio", "legend": "method", "expected": "topology-aware methods degrade less under churn"},
-        "F7": {"x": "training episode", "y": "mean reward", "legend": "method/policy", "expected": "IPPO stress reward is non-constant and improves or stabilizes"},
+        "F7": {"x": "training episode", "y": "mean reward", "legend": "method/policy", "expected": "MASAC stress reward is non-constant and improves or stabilizes"},
         "F8": {"x": "semantic exchange overhead KB/run", "y": "QoS hit or success ratio", "legend": "method; scenario annotations for planner/proposed", "expected": "proposed near Pareto frontier"},
     }
 

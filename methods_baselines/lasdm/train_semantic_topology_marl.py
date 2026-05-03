@@ -24,9 +24,9 @@ from airfogsim.lasdm.env_adapter import LASDMEnvAdapter
 from airfogsim.lasdm.instance_directory import ServiceInstance, ServiceInstanceDirectory
 from airfogsim.lasdm.manager import LASDMManager
 from airfogsim.lasdm.marl_env import MARLEnvConfig, SemanticTopologyMARLEnv
-from airfogsim.lasdm.marl_policy import IPPOPolicy, policy_from_name
+from airfogsim.lasdm.marl_policy import MASACPolicy, policy_from_name
 from airfogsim.lasdm.marl_reward import SFCReward, SFCRewardConfig
-from airfogsim.lasdm.marl_trainer import HeuristicEvaluator, IPPOTrainer, write_reward_curve
+from airfogsim.lasdm.marl_trainer import HeuristicEvaluator, MASACTrainer, write_reward_curve
 from airfogsim.lasdm.model import LASDMServiceChain
 from airfogsim.lasdm.orchestrator import LASDMOrchestrator
 from airfogsim.lasdm.runtime_bridge import LASDMRuntimeBridge
@@ -41,7 +41,7 @@ PHYSICAL_RSU_COUNT = 4
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train/evaluate semantic-topology LASDM MARL.")
     parser.add_argument("--config", default=DEFAULT_CONFIG)
-    parser.add_argument("--policy", default="semantic_greedy", choices=["semantic_greedy", "topology_greedy", "random_valid", "ippo"])
+    parser.add_argument("--policy", default="semantic_greedy", choices=["semantic_greedy", "topology_greedy", "random_valid", "masac"])
     parser.add_argument("--episodes", type=int, default=None)
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--seed", type=int, default=0)
@@ -60,7 +60,7 @@ def main() -> None:
         scenario=args.scenario,
         service_role_sweep=args.service_role_sweep,
         attach_runtime=True,
-        baseline="proposed_semantic_topology_marl" if args.policy == "ippo" else args.policy,
+        baseline="proposed_semantic_topology_marl" if args.policy == "masac" else args.policy,
     )
     try:
         observations = env.reset()
@@ -68,18 +68,21 @@ def main() -> None:
         output_dir = Path(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        if args.policy == "ippo":
+        if args.policy == "masac":
             obs_dim = max(len(flatten_observation(obs)) for obs in observations.values()) if observations else 1
             marl_cfg = dict(config.get("marl", {}) or {})
             max_candidates = int(marl_cfg.get("max_candidates", 16))
             critic_agents = int(marl_cfg.get("ippo_critic_agent_count", len(observations) or 4) or 4)
             candidate_feature_dim = _observation_candidate_feature_dim(observations) or 31
-            policy = IPPOPolicy(
+            policy = MASACPolicy(
                 observation_dim=obs_dim,
                 max_candidates=max_candidates,
                 candidate_feature_dim=candidate_feature_dim,
                 seed=args.seed,
                 lr=float(marl_cfg.get("ippo_lr", 3e-4) or 3e-4),
+                q_lr=float(marl_cfg.get("masac_q_lr", marl_cfg.get("ippo_lr", 3e-4)) or 3e-4),
+                alpha=float(marl_cfg.get("masac_alpha", 0.05) or 0.05),
+                tau=float(marl_cfg.get("masac_tau", 0.005) or 0.005),
                 centralized_critic=bool(marl_cfg.get("ippo_centralized_critic", True)),
                 critic_observation_dim=obs_dim * max(1, critic_agents),
                 max_critic_agents=max(1, critic_agents),
@@ -103,35 +106,18 @@ def main() -> None:
                 learnable_logit_blend=bool(marl_cfg.get("ippo_learnable_logit_blend", False)),
                 device=str(marl_cfg.get("ippo_device", "") or "") or None,
             )
-            trainer = IPPOTrainer(
+            trainer = MASACTrainer(
                 env,
                 policy,
-                gamma=float(marl_cfg.get("ippo_gamma", 0.99) or 0.99),
-                clip_eps=float(marl_cfg.get("ippo_clip_eps", 0.2) or 0.2),
-                gae_lambda=float(marl_cfg.get("ippo_gae_lambda", 0.95) or 0.95),
-                entropy_coef=float(marl_cfg.get("ippo_entropy_coef", 0.01) or 0.01),
-                actor_loss_coef=float(marl_cfg.get("ippo_actor_loss_coef", 1.0) or 1.0),
-                value_coef=float(marl_cfg.get("ippo_value_coef", 1.0) or 1.0),
-                update_epochs=int(marl_cfg.get("ippo_update_epochs", 4) or 4),
-                minibatch_size=int(marl_cfg.get("ippo_minibatch_size", 64) or 64),
-                prior_l2_coef=float(marl_cfg.get("ippo_prior_l2_coef", 1e-3) or 0.0),
-                target_kl=float(marl_cfg.get("ippo_target_kl", 0.02) or 0.02),
-                rollout_episodes_per_update=int(marl_cfg.get("ippo_rollout_episodes_per_update", 1) or 1),
-                max_grad_norm=float(marl_cfg.get("ippo_max_grad_norm", 0.5) or 0.5),
-                normalize_returns=bool(marl_cfg.get("ippo_return_norm_enabled", marl_cfg.get("ippo_normalize_returns", True))),
-                return_norm_momentum=float(marl_cfg.get("ippo_return_norm_momentum", 0.95) or 0.95),
-                return_norm_eps=float(marl_cfg.get("ippo_return_norm_eps", 1e-6) or 1e-6),
-                entropy_coef_start=(
-                    float(marl_cfg["ippo_entropy_coef_start"])
-                    if "ippo_entropy_coef_start" in marl_cfg
-                    else None
-                ),
-                entropy_coef_end=(
-                    float(marl_cfg["ippo_entropy_coef_end"])
-                    if "ippo_entropy_coef_end" in marl_cfg
-                    else None
-                ),
-                entropy_decay_episodes=int(marl_cfg.get("ippo_entropy_decay_episodes", 0) or 0),
+                gamma=float(marl_cfg.get("masac_gamma", 0.99) or 0.99),
+                tau=float(marl_cfg.get("masac_tau", 0.005) or 0.005),
+                batch_size=int(marl_cfg.get("masac_batch_size", 128) or 128),
+                replay_capacity=int(marl_cfg.get("masac_replay_capacity", 20000) or 20000),
+                replay_warmup_steps=int(marl_cfg.get("masac_replay_warmup_steps", 128) or 128),
+                updates_per_env_step=int(marl_cfg.get("masac_updates_per_env_step", 1) or 1),
+                max_grad_norm=float(marl_cfg.get("masac_max_grad_norm", 1.0) or 1.0),
+                reward_scale=float(marl_cfg.get("masac_reward_scale", 1.0) or 1.0),
+                seed=args.seed,
             )
             rows = trainer.train(episodes=episodes, max_steps=max_steps, output_dir=str(output_dir))
         else:
@@ -144,6 +130,7 @@ def main() -> None:
         payload = {
             "completed": True,
             "policy": args.policy,
+            "algorithm": "masac_discrete_ctde" if args.policy == "masac" else args.policy,
             "episodes": episodes,
             "max_steps": max_steps,
             "output_dir": str(output_dir),

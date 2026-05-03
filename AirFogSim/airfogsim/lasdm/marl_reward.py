@@ -6,12 +6,29 @@ from typing import Any, Dict, Mapping, Optional
 
 @dataclass(frozen=True)
 class SFCRewardConfig:
-    success: float = 1.0
-    timeout: float = 0.0
+    success: float = 10.0
+    timeout: float = -5.0
+    route_unavailable: float = -2.0
+    deadline_slack: float = 0.05
+    semantic_score: float = 0.50
+    utility_prior: float = 1.0
+    stale_remote: float = -0.75
+    topology_risk: float = -0.50
+    mobility_risk: float = -0.50
+    cold_start: float = -0.05
+    runtime_penalty: float = -0.10
+    load_imbalance: float = -0.25
+    route_hops: float = -0.10
+    route_tx_time: float = -0.05
+    rb_wait: float = -0.05
+    wireless_pressure: float = -0.05
+    resource_available: float = 0.25
+    remaining_deadline: float = 0.25
+    dense_clip: float = 3.0
 
 
 class SFCReward:
-    """Basic completion success-rate reward for SFC-oriented MARL."""
+    """SFC completion reward plus selected-candidate dense shaping."""
 
     def __init__(self, config: Optional[SFCRewardConfig] = None):
         self.config = config or SFCRewardConfig()
@@ -31,6 +48,16 @@ def compute_sfc_reward(
     aux: Mapping[str, Any],
     config: SFCRewardConfig,
 ) -> float:
+    reward = _terminal_reward(previous_summary, current_summary, config)
+    reward += _selected_candidate_dense_reward(aux, config)
+    return float(reward)
+
+
+def _terminal_reward(
+    previous_summary: Mapping[str, Any],
+    current_summary: Mapping[str, Any],
+    config: SFCRewardConfig,
+) -> float:
     success_delta = _delta(previous_summary, current_summary, "succeeded")
     failed_delta = _delta(previous_summary, current_summary, "failed")
     timeout_delta = _delta(previous_summary, current_summary, "timed_out")
@@ -40,6 +67,35 @@ def compute_sfc_reward(
     success_rate = success_delta / completed_delta
     failure_rate = (failed_delta + timeout_delta) / completed_delta
     return float(config.success * success_rate + config.timeout * failure_rate)
+
+
+def _selected_candidate_dense_reward(aux: Mapping[str, Any], config: SFCRewardConfig) -> float:
+    if float(aux.get("selected_semantic_group_count", 0.0) or 0.0) <= 0.0:
+        return 0.0
+    reward = 0.0
+    reward += float(config.route_unavailable) * float(aux.get("route_unavailable_ratio", 0.0) or 0.0)
+    reward += float(config.deadline_slack) * _positive_clip(float(aux.get("selected_deadline_slack_mean", 0.0) or 0.0), 20.0)
+    reward += float(config.semantic_score) * float(aux.get("mean_semantic_top_score", 0.0) or 0.0)
+    reward += float(config.utility_prior) * float(aux.get("utility_prior", 0.0) or 0.0)
+    reward += float(config.stale_remote) * float(aux.get("selected_stale_remote_ratio", 0.0) or 0.0)
+    reward += float(config.topology_risk) * float(aux.get("selected_topology_risk_mean", 0.0) or 0.0)
+    reward += float(config.mobility_risk) * float(aux.get("selected_mobility_risk_mean", 0.0) or 0.0)
+    reward += float(config.cold_start) * _positive_clip(float(aux.get("cold_start_s", 0.0) or 0.0), 20.0)
+    reward += float(config.runtime_penalty) * _positive_clip(
+        float(aux.get("selected_expected_runtime_penalty_mean", 0.0) or 0.0),
+        20.0,
+    )
+    reward += float(config.load_imbalance) * float(aux.get("load_imbalance", 0.0) or 0.0)
+    reward += float(config.route_hops) * _positive_clip(float(aux.get("route_hops", 0.0) or 0.0), 4.0)
+    reward += float(config.route_tx_time) * _positive_clip(float(aux.get("route_tx_time_s", 0.0) or 0.0), 20.0)
+    reward += float(config.rb_wait) * _positive_clip(float(aux.get("expected_rb_wait_s", 0.0) or 0.0), 20.0)
+    reward += float(config.wireless_pressure) * _positive_clip(float(aux.get("wireless_pressure", 0.0) or 0.0), 8.0)
+    reward += float(config.resource_available) * float(aux.get("selected_resource_available_ratio_mean", 0.0) or 0.0)
+    reward += float(config.remaining_deadline) * float(aux.get("selected_remaining_deadline_ratio_mean", 0.0) or 0.0)
+    clip = max(0.0, float(config.dense_clip))
+    if clip > 0.0:
+        reward = max(-clip, min(clip, reward))
+    return float(reward)
 
 
 def reward_aux_from_observations(observations: Mapping[str, Mapping[str, Any]], overhead_bytes: float = 0.0) -> Dict[str, float]:
@@ -68,6 +124,10 @@ def reward_aux_from_observations(observations: Mapping[str, Mapping[str, Any]], 
 
 def _delta(previous: Mapping[str, Any], current: Mapping[str, Any], key: str) -> float:
     return float(current.get(key, 0.0) or 0.0) - float(previous.get(key, 0.0) or 0.0)
+
+
+def _positive_clip(value: float, scale: float) -> float:
+    return max(0.0, min(1.0, float(value) / max(1e-9, float(scale))))
 
 
 

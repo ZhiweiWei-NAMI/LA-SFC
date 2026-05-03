@@ -14,14 +14,14 @@ import pandas as pd
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run Semantic-Topology stage1 IPPO training by seed shards.")
+    parser = argparse.ArgumentParser(description="Run Semantic-Topology stage1 MASAC training by seed shards.")
     parser.add_argument("--root", required=True)
     parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2, 3, 4])
     parser.add_argument(
         "--variants",
         nargs="+",
         default=["proposed_semantic_topology_marl"],
-        help="IPPO variants to train; ablations write under semantic_runtime_train/<variant>.",
+        help="MASAC variants to train; ablations write under semantic_runtime_train/<variant>.",
     )
     parser.add_argument(
         "--variant-concurrency",
@@ -173,7 +173,7 @@ def start_shard(
 
 def shard_completed(seed: int, variant: str, root: Path) -> bool:
     variant_root = root / "semantic_runtime_train" if variant == "proposed_semantic_topology_marl" else root / "semantic_runtime_train" / variant
-    checkpoint = variant_root / f"ippo_seed_{seed}" / "ippo_policy.pt"
+    checkpoint = variant_root / f"ippo_seed_{seed}" / "masac_policy.pt"
     result = root / "logs" / f"stage1_{variant}_seed_{seed}_result.json"
     return checkpoint.exists() and result.exists()
 

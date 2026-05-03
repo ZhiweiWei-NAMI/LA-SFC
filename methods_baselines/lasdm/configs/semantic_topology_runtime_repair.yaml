@@ -57,7 +57,7 @@ marl:
   # real infrastructure instances plus semantic-high/topology-bad,
   # semantic-medium/topology-good, semantic-low/topology-good, and stale
   # remote decoys.  A horizon below that silently removes topology-good
-  # candidates from the IPPO action space, so 32 is the smallest power-of-two
+  # candidates from the learned action space, so 32 is the smallest power-of-two
   # bound that covers the intended candidate conflict set.
   semantic_top_k: 32
   max_candidates: 32
@@ -67,10 +67,10 @@ marl:
   # Training-only imitation warm start.  The first episodes follow the
   # runtime-derived utility_prior target, which combines semantic fit,
   # topology/mobility risk, route hops, cold-start, and deadline slack.
-  # Later episodes use the learned policy with policy-gradient fine tuning.
+  # Later episodes use the learned policy with off-policy SAC fine tuning.
   # Evaluation loads only the saved checkpoint and does not call the expert;
   # the actor logits are blended with runtime-derived candidate priors.
-  # The IPPO actor makes per-function choices, so the imitation target must use
+  # The MASAC actor makes per-function choices, so the imitation target must use
   # the same sequential decision shape instead of chain-level planner search.
   ippo_centralized_critic: true
   ippo_use_region_encoder: true
@@ -85,7 +85,7 @@ marl:
   ippo_expert_branch_width: 8
   ippo_utility_prior_logit_weight: 2.5
   ippo_route_unavailable_penalty: 20.0
-  ippo_behavior_clone_pretrain_episodes: 20
+  ippo_behavior_clone_pretrain_episodes: 40
   ippo_behavior_clone_steps_per_observation: 4
   ippo_bc_scenarios:
     - semantic_runtime_calibration_easy
@@ -98,14 +98,15 @@ marl:
   # full-information planner heuristic labels, but reward_curve.csv starts once policy actions
   # are actually executed in the runtime.
   ippo_reward_curve_policy_only: true
-  # Keep a light imitation term during PPO updates.  The runtime action has
-  # sequential SFC dependencies, while this compact IPPO implementation uses a
+  # Keep a light imitation term during SAC updates.  The runtime action has
+  # sequential SFC dependencies, while this compact MASAC implementation uses a
   # small independent actor; the continued expert term prevents drifting away
   # from the corrected source/load-aware utility target.
   ippo_behavior_clone_finetune_steps_per_observation: 1
   ippo_bc_label_strategy: expert
   ippo_bc_stale_relabel_margin: 0.05
   ippo_bc_deadline_relabel_margin: 0.05
+  masac_training_scenario_sampling: balanced
   ippo_curriculum_enabled: true
   ippo_curriculum:
     - fraction: 0.20
@@ -116,27 +117,20 @@ marl:
       scenarios: [semantic_runtime_contention_stress, distributed_service_discovery_calibrated]
     - fraction: 0.30
       scenarios: [semantic_runtime_mobility_staleness_stress]
-  ippo_gamma: 0.99
-  ippo_clip_eps: 0.12
-  ippo_gae_lambda: 0.95
-  ippo_value_coef: 1.0
-  ippo_update_epochs: 4
-  ippo_minibatch_size: 256
-  ippo_entropy_coef: 0.01
-  ippo_actor_loss_coef: 4.0
-  ippo_target_kl: 0.02
-  ippo_rollout_episodes_per_update: 4
-  ippo_per_function_rollout_samples: true
-  ippo_share_reward_across_function_samples: true
-  ippo_per_function_reward_mode: shared
-  ippo_max_grad_norm: 0.5
-  ippo_return_norm_enabled: false
-  ippo_return_norm_momentum: 0.95
-  ippo_return_norm_eps: 0.000001
+  masac_gamma: 0.99
+  masac_alpha: 0.05
+  masac_tau: 0.005
+  masac_q_lr: 0.0003
+  masac_batch_size: 128
+  masac_replay_capacity: 20000
+  masac_replay_warmup_steps: 128
+  masac_updates_per_env_step: 1
+  masac_max_grad_norm: 1.0
+  masac_reward_scale: 1.0
+  masac_replay_include_bc_expert: true
+  masac_actor_update_during_bc: false
+  masac_replay_sample_strategy: scenario_balanced
   ippo_lr: 0.0002
-  ippo_entropy_coef_start: 0.02
-  ippo_entropy_coef_end: 0.003
-  ippo_entropy_decay_episodes: 120
   # Expert penalties use the same observable runtime factors as the reward:
   # high topology/mobility risk frequently causes graph timeouts under the two
   # stress scenarios, while route hops and cold-start add direct delay.
@@ -154,8 +148,25 @@ marl:
   topology_greedy_utility_prior_weight: 2.00
   ippo_expert_stale_penalty: 0.35
   reward:
-    success: 1.0
-    timeout: 0.0
+    success: 10.0
+    timeout: -5.0
+    route_unavailable: -2.0
+    deadline_slack: 0.05
+    semantic_score: 0.50
+    utility_prior: 1.0
+    stale_remote: -0.75
+    topology_risk: -0.50
+    mobility_risk: -0.50
+    cold_start: -0.05
+    runtime_penalty: -0.10
+    load_imbalance: -0.25
+    route_hops: -0.10
+    route_tx_time: -0.05
+    rb_wait: -0.05
+    wireless_pressure: -0.05
+    resource_available: 0.25
+    remaining_deadline: 0.25
+    dense_clip: 3.0
   # Save the checkpoint that performs best on a small live-runtime validation
   # copy instead of blindly saving the final stochastic RL episode.  This is
   # standard model selection: success/task-success dominate, latency is a
@@ -165,22 +176,21 @@ marl:
   ippo_checkpoint_selection_early_until_episode: 40
   ippo_checkpoint_selection_max_steps: 80
   ippo_checkpoint_selection_seed_offsets: [1000, 1001, 1002, 1003, 1004]
-  ippo_checkpoint_selection_metric: success_ratio
+  ippo_checkpoint_selection_metric: success_min_blend
   ippo_checkpoint_selection_mode: raw
   ippo_checkpoint_selection_robust_window: 1
   ippo_checkpoint_selection_std_penalty: 0.0
-  ippo_checkpoint_selection_require_ppo_improves_bc: true
-  ippo_checkpoint_selection_ppo_min_score_ratio: 1.0
+  masac_checkpoint_selection_require_sac_improves_bc: true
+  masac_checkpoint_selection_sac_min_score_ratio: 1.0
+  masac_checkpoint_selection_require_min_success_non_decrease: true
+  masac_checkpoint_selection_min_success_tolerance: 0.02
   ippo_checkpoint_selection_min_seed_non_decrease_count: 3
   ippo_checkpoint_selection_seed_non_decrease_tolerance: 0.0
   # Use the checkpoint with the best live-runtime validation score across
   # random restarts; evaluation still runs on held-out eval seeds.
   ippo_eval_checkpoint_strategy: global_best_validation
-  # BC is a topology-greedy student initialization. For the final proposed
-  # method, only a PPO-finetuned checkpoint can be selected when the majority
-  # of training seeds passed the BC-uplift gate.
-  ippo_eval_prefer_ppo_for_proposed: true
-  ippo_eval_min_proposed_ppo_selected_count: 3
+  masac_eval_prefer_sac_for_proposed: false
+  masac_eval_min_proposed_sac_selected_count: 3
   ippo_training_progress_guard_enabled: true
   ippo_training_guard_min_episodes: 5
   ippo_training_guard_recent_window: 3

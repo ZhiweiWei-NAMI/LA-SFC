@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import math
 import random
 from dataclasses import dataclass, field
@@ -676,11 +677,11 @@ class PolicyEvaluation:
 
 
 class IPPOPolicy(BaseMARLPolicy):
-    """Independent actor with optional centralized critic for CTDE PPO.
+    """Candidate-choice actor with optional centralized context support.
 
     Execution remains decentralized: candidate actions are sampled from each
-    agent's local observation.  When ``centralized_critic`` is enabled, training
-    evaluates V(s) from a deterministic concatenation of all agent observations.
+    agent's local observation.  MASAC reuses this actor surface and trains
+    centralized Q critics around it.
     """
 
     def __init__(
@@ -715,7 +716,7 @@ class IPPOPolicy(BaseMARLPolicy):
             import torch.nn as nn
             import torch.optim as optim
         except Exception as exc:  # pragma: no cover - exercised only when torch is absent
-            raise RuntimeError("IPPOPolicy requires PyTorch. Use SemanticGreedyPolicy for no-torch smoke tests.") from exc
+            raise RuntimeError("Learned candidate policies require PyTorch. Use SemanticGreedyPolicy for no-torch smoke tests.") from exc
 
         self.torch = torch
         self.nn = nn
@@ -1715,8 +1716,8 @@ class IPPOPolicy(BaseMARLPolicy):
 
     def _flatten_global_state(self, observations: Mapping[str, Mapping[str, Any]]) -> np.ndarray:
         chunks: List[np.ndarray] = []
-        for agent_id in sorted(str(item) for item in observations):
-            observation = observations.get(agent_id, {})
+        for raw_agent_id, observation in sorted(dict(observations or {}).items(), key=lambda item: str(item[0])):
+            agent_id = str(raw_agent_id)
             chunks.append(self._fit_dim(flatten_observation(observation)))
             if len(chunks) >= self.max_critic_agents:
                 break
@@ -1743,6 +1744,310 @@ class IPPOPolicy(BaseMARLPolicy):
         padded = np.zeros(self.observation_dim, dtype=np.float32)
         padded[: vector.size] = vector
         return padded
+
+
+class MASACPolicy(IPPOPolicy):
+    """Discrete-action MASAC policy for CTDE service-function placement.
+
+    The actor is inherited from ``IPPOPolicy`` because the decentralized
+    execution surface is already correct: each region chooses among its local
+    candidate IDs.  Training is changed to off-policy discrete SAC with twin
+    centralized Q critics over global region context, local region context, and
+    candidate features.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        q_lr: Optional[float] = None,
+        alpha: float = 0.05,
+        tau: float = 0.005,
+        **kwargs: Any,
+    ):
+        super().__init__(*args, **kwargs)
+        self.tau = float(tau)
+        self.fixed_alpha = float(alpha)
+        hidden_dim = int(getattr(self.model, "hidden_dim", 128))
+        q_input_dim = hidden_dim * self.max_critic_agents + hidden_dim + self.candidate_feature_dim
+        self.q1 = self._build_q_network(q_input_dim, hidden_dim).to(self.device)
+        self.q2 = self._build_q_network(q_input_dim, hidden_dim).to(self.device)
+        self.target_q1 = copy.deepcopy(self.q1).to(self.device)
+        self.target_q2 = copy.deepcopy(self.q2).to(self.device)
+        for module in (self.target_q1, self.target_q2):
+            module.eval()
+            for parameter in module.parameters():
+                parameter.requires_grad_(False)
+        self.q_optimizer = self.torch.optim.Adam(
+            list(self.q1.parameters()) + list(self.q2.parameters()),
+            lr=float(q_lr if q_lr is not None else kwargs.get("lr", 3e-4)),
+        )
+
+    def _build_q_network(self, input_dim: int, hidden_dim: int) -> Any:
+        return self.nn.Sequential(
+            self.nn.Linear(int(input_dim), int(hidden_dim)),
+            self.nn.ReLU(),
+            self.nn.Linear(int(hidden_dim), int(hidden_dim)),
+            self.nn.ReLU(),
+            self.nn.Linear(int(hidden_dim), 1),
+        )
+
+    @property
+    def alpha_tensor(self) -> Any:
+        return self.torch.tensor(float(self.fixed_alpha), dtype=self.torch.float32, device=self.device)
+
+    def sac_state_dict(self) -> Dict[str, Any]:
+        return {
+            "algorithm": "masac_discrete_ctde",
+            "actor": self.model.state_dict(),
+            "q1": self.q1.state_dict(),
+            "q2": self.q2.state_dict(),
+            "target_q1": self.target_q1.state_dict(),
+            "target_q2": self.target_q2.state_dict(),
+            "alpha": float(self.fixed_alpha),
+            "tau": float(self.tau),
+        }
+
+    def load_sac_state_dict(self, state: Mapping[str, Any], strict: bool = True) -> None:
+        actor_state = state.get("actor", state) if isinstance(state, Mapping) else state
+        self.model.load_state_dict(actor_state, strict=strict)
+        if isinstance(state, Mapping) and "q1" in state:
+            self.q1.load_state_dict(state["q1"], strict=True)
+            self.q2.load_state_dict(state["q2"], strict=True)
+            self.target_q1.load_state_dict(state.get("target_q1", state["q1"]), strict=True)
+            self.target_q2.load_state_dict(state.get("target_q2", state["q2"]), strict=True)
+            self.fixed_alpha = float(state.get("alpha", self.fixed_alpha) or self.fixed_alpha)
+            self.tau = float(state.get("tau", self.tau) or self.tau)
+
+    def soft_update_targets(self, tau: Optional[float] = None) -> None:
+        value = self.tau if tau is None else float(tau)
+        with self.torch.no_grad():
+            for target, source in ((self.target_q1, self.q1), (self.target_q2, self.q2)):
+                for target_param, source_param in zip(target.parameters(), source.parameters()):
+                    target_param.data.mul_(1.0 - value).add_(source_param.data, alpha=value)
+
+    def masac_selected_q_values(
+        self,
+        observations: Mapping[str, Mapping[str, Any]],
+        actions: Mapping[str, Any],
+        detach_encoder: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        q1_values: List[Any] = []
+        q2_values: List[Any] = []
+        bundle, global_context = self._masac_context_bundle(observations)
+        for agent_id, observation in observations.items():
+            agent_key = str(agent_id)
+            if agent_key not in bundle:
+                continue
+            actor_input, base_logits, local_context = bundle[agent_key]
+            grouped: Dict[str, List[Mapping[str, Any]]] = {}
+            for candidate_set in observation.get("candidate_sets", []) or []:
+                grouped.setdefault(str(candidate_set.get("sfc_id", "")), []).append(candidate_set)
+            for sfc_id, candidate_sets in grouped.items():
+                current_source = str(candidate_sets[0].get("source_node_id", "")) if candidate_sets else ""
+                planned_node_load: Dict[str, int] = {}
+                remaining_deadline_s, total_deadline_s = _chain_deadline_budget(candidate_sets)
+                for candidate_set in sorted(candidate_sets, key=lambda item: int(item.get("sfc_node_index", 0) or 0)):
+                    contextual = self._contextual_candidate_set(
+                        candidate_set,
+                        current_source,
+                        planned_node_load,
+                        remaining_deadline_s=remaining_deadline_s,
+                        total_deadline_s=total_deadline_s,
+                    )
+                    sfc_node_id = str(contextual.get("sfc_node_id", ""))
+                    chosen = self._chosen_action(actions, agent_key, str(sfc_id), sfc_node_id)
+                    ids = list(contextual.get("candidate_ids", []) or [])
+                    mask_len = min(len(ids), self.max_candidates)
+                    if not chosen or str(chosen) not in ids[:mask_len] or mask_len <= 0:
+                        continue
+                    action_idx = ids[:mask_len].index(str(chosen))
+                    q1, q2 = self._masac_q_values(
+                        global_context,
+                        local_context,
+                        contextual,
+                        mask_len,
+                        target=False,
+                        detach_encoder=detach_encoder,
+                    )
+                    q1_values.append(q1[action_idx])
+                    q2_values.append(q2[action_idx])
+                    chosen_candidate = self._candidate_by_id(contextual, str(chosen))
+                    if chosen_candidate is not None:
+                        node_id = str(chosen_candidate.get("node_id", ""))
+                        if node_id:
+                            current_source = node_id
+                            planned_node_load[node_id] = planned_node_load.get(node_id, 0) + 1
+                            remaining_deadline_s = _consume_deadline_budget(remaining_deadline_s, chosen_candidate)
+        if not q1_values:
+            return None
+        return {
+            "q1": self.torch.stack([item.reshape(()) for item in q1_values]).mean(),
+            "q2": self.torch.stack([item.reshape(()) for item in q2_values]).mean(),
+            "action_count": len(q1_values),
+        }
+
+    def masac_soft_state_value(
+        self,
+        observations: Mapping[str, Mapping[str, Any]],
+        target: bool = False,
+        detach_encoder: bool = True,
+    ) -> Tuple[Any, Any, int]:
+        values: List[Any] = []
+        entropies: List[Any] = []
+        alpha = self.alpha_tensor
+        for item in self._masac_candidate_items(observations, target=target, detach_encoder=detach_encoder):
+            logits = item["logits"]
+            log_probs = self.torch.log_softmax(logits, dim=-1)
+            probs = self.torch.softmax(logits, dim=-1)
+            q_min = self.torch.minimum(item["q1"], item["q2"])
+            values.append((probs * (q_min - alpha * log_probs)).sum())
+            entropies.append(-(probs * log_probs).sum())
+        if not values:
+            zero = self.torch.tensor(0.0, dtype=self.torch.float32, device=self.device)
+            return zero, zero, 0
+        return (
+            self.torch.stack([item.reshape(()) for item in values]).mean(),
+            self.torch.stack([item.reshape(()) for item in entropies]).mean(),
+            len(values),
+        )
+
+    def masac_actor_loss(self, observations: Mapping[str, Mapping[str, Any]]) -> Tuple[Any, Any, int]:
+        losses: List[Any] = []
+        entropies: List[Any] = []
+        alpha = self.alpha_tensor
+        for item in self._masac_candidate_items(observations, target=False, detach_encoder=False):
+            logits = item["logits"]
+            log_probs = self.torch.log_softmax(logits, dim=-1)
+            probs = self.torch.softmax(logits, dim=-1)
+            q_min = self.torch.minimum(item["q1"], item["q2"]).detach()
+            losses.append((probs * (alpha * log_probs - q_min)).sum())
+            entropies.append(-(probs * log_probs).sum())
+        if not losses:
+            zero = self.torch.tensor(0.0, dtype=self.torch.float32, device=self.device)
+            return zero, zero, 0
+        return (
+            self.torch.stack([item.reshape(()) for item in losses]).mean(),
+            self.torch.stack([item.reshape(()) for item in entropies]).mean(),
+            len(losses),
+        )
+
+    def _masac_candidate_items(
+        self,
+        observations: Mapping[str, Mapping[str, Any]],
+        target: bool = False,
+        detach_encoder: bool = False,
+    ) -> List[Dict[str, Any]]:
+        items_out: List[Dict[str, Any]] = []
+        bundle, global_context = self._masac_context_bundle(observations)
+        for agent_id, observation in observations.items():
+            agent_key = str(agent_id)
+            if agent_key not in bundle:
+                continue
+            actor_input, base_logits, local_context = bundle[agent_key]
+            grouped: Dict[str, List[Mapping[str, Any]]] = {}
+            for candidate_set in observation.get("candidate_sets", []) or []:
+                grouped.setdefault(str(candidate_set.get("sfc_id", "")), []).append(candidate_set)
+            for _sfc_id, candidate_sets in grouped.items():
+                current_source = str(candidate_sets[0].get("source_node_id", "")) if candidate_sets else ""
+                planned_node_load: Dict[str, int] = {}
+                remaining_deadline_s, total_deadline_s = _chain_deadline_budget(candidate_sets)
+                for candidate_set in sorted(candidate_sets, key=lambda item: int(item.get("sfc_node_index", 0) or 0)):
+                    contextual = self._contextual_candidate_set(
+                        candidate_set,
+                        current_source,
+                        planned_node_load,
+                        remaining_deadline_s=remaining_deadline_s,
+                        total_deadline_s=total_deadline_s,
+                    )
+                    ids = list(contextual.get("candidate_ids", []) or [])
+                    mask_len = min(len(ids), self.max_candidates)
+                    if mask_len <= 0:
+                        continue
+                    logits_slice = None if base_logits is None else base_logits[0, :mask_len]
+                    logits = self._candidate_scores(actor_input, logits_slice, contextual, mask_len)
+                    logits = self._apply_route_penalty(logits, contextual, mask_len)
+                    q1, q2 = self._masac_q_values(
+                        global_context,
+                        local_context,
+                        contextual,
+                        mask_len,
+                        target=target,
+                        detach_encoder=detach_encoder,
+                    )
+                    items_out.append({"logits": logits, "q1": q1, "q2": q2, "contextual": contextual})
+                    chosen_idx = int(self.torch.argmax(logits.detach()).item())
+                    chosen_candidate = self._candidate_by_id(contextual, ids[chosen_idx])
+                    if chosen_candidate is not None:
+                        node_id = str(chosen_candidate.get("node_id", ""))
+                        if node_id:
+                            current_source = node_id
+                            planned_node_load[node_id] = planned_node_load.get(node_id, 0) + 1
+                            remaining_deadline_s = _consume_deadline_budget(remaining_deadline_s, chosen_candidate)
+        return items_out
+
+    def _masac_context_bundle(self, observations: Mapping[str, Mapping[str, Any]]) -> Tuple[Dict[str, Tuple[Any, Any, Any]], Any]:
+        bundle: Dict[str, Tuple[Any, Any, Any]] = {}
+        local_contexts: List[Any] = []
+        for agent_id in sorted(str(item) for item in observations):
+            observation = observations.get(agent_id, {})
+            if self.use_region_encoder:
+                actor_input = self.model.region_context_tensor(observation, self.device)
+                base_logits = None
+                local_context = actor_input
+            else:
+                actor_input = self.torch.tensor(
+                    self._fit_dim(flatten_observation(observation)),
+                    dtype=self.torch.float32,
+                    device=self.device,
+                ).unsqueeze(0)
+                base_logits = self.model.actor_logits(actor_input)
+                local_context = self.model.body(actor_input).squeeze(0)
+            bundle[agent_id] = (actor_input, base_logits, local_context)
+            if len(local_contexts) < self.max_critic_agents:
+                local_contexts.append(local_context.reshape(-1))
+        hidden_dim = int(getattr(self.model, "hidden_dim", 128))
+        while len(local_contexts) < self.max_critic_agents:
+            local_contexts.append(self.torch.zeros((hidden_dim,), dtype=self.torch.float32, device=self.device))
+        return bundle, self.torch.cat(local_contexts[: self.max_critic_agents], dim=-1)
+
+    def _masac_q_values(
+        self,
+        global_context: Any,
+        local_context: Any,
+        candidate_set: Mapping[str, Any],
+        mask_len: int,
+        target: bool = False,
+        detach_encoder: bool = False,
+    ) -> Tuple[Any, Any]:
+        features = self._masac_candidate_features(candidate_set, mask_len, global_context)
+        if features.shape[0] <= 0:
+            zero = self.torch.zeros((0,), dtype=global_context.dtype, device=global_context.device)
+            return zero, zero
+        global_expanded = global_context.reshape(1, -1).expand(features.shape[0], -1)
+        local_expanded = local_context.reshape(1, -1).expand(features.shape[0], -1)
+        q_input = self.torch.cat([global_expanded, local_expanded, features], dim=-1)
+        if detach_encoder:
+            q_input = q_input.detach()
+        q1_net, q2_net = (self.target_q1, self.target_q2) if target else (self.q1, self.q2)
+        return q1_net(q_input).squeeze(-1), q2_net(q_input).squeeze(-1)
+
+    def _masac_candidate_features(self, candidate_set: Mapping[str, Any], mask_len: int, reference: Any) -> Any:
+        array = np.asarray(candidate_set.get("candidate_features", []), dtype=np.float32)[:mask_len]
+        features = self.torch.tensor(array, dtype=reference.dtype, device=reference.device)
+        if features.ndim == 1:
+            features = features.reshape(1, -1)
+        if features.numel() == 0:
+            return self.torch.zeros((0, self.candidate_feature_dim), dtype=reference.dtype, device=reference.device)
+        if features.shape[-1] < self.candidate_feature_dim:
+            pad = self.torch.zeros(
+                (features.shape[0], self.candidate_feature_dim - features.shape[-1]),
+                dtype=features.dtype,
+                device=features.device,
+            )
+            features = self.torch.cat([features, pad], dim=-1)
+        elif features.shape[-1] > self.candidate_feature_dim:
+            features = features[:, : self.candidate_feature_dim]
+        return features
 
 
 def policy_from_name(name: str, **kwargs: Any) -> BaseMARLPolicy:
@@ -1786,7 +2091,7 @@ def policy_from_name(name: str, **kwargs: Any) -> BaseMARLPolicy:
             **_policy_kwargs(kwargs, "prefer_local", "remote_penalty", "stale_penalty"),
         )
     if name == "proposed_semantic_topology_marl":
-        raise ValueError("proposed_semantic_topology_marl requires an explicit IPPO checkpoint loader; heuristic policy is not allowed")
+        raise ValueError("proposed_semantic_topology_marl requires an explicit MASAC checkpoint loader; heuristic policy is not allowed")
     if name == "utility_prior":
         return UtilityPriorPolicy()
     if name in {"centralized_planner", "centralized_oracle"}:

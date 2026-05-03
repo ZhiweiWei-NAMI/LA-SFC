@@ -67,7 +67,7 @@ marl:
   # real infrastructure instances plus semantic-high/topology-bad,
   # semantic-medium/topology-good, semantic-low/topology-good, and stale
   # remote decoys.  A horizon below that silently removes topology-good
-  # candidates from the IPPO action space, so 32 is the smallest power-of-two
+  # candidates from the learned actor action space, so 32 is the smallest power-of-two
   # bound that covers the intended candidate conflict set.
   semantic_top_k: 32
   max_candidates: 32
@@ -77,10 +77,10 @@ marl:
   # Training-only imitation warm start.  The first episodes follow the
   # runtime-derived utility_prior target, which combines semantic fit,
   # topology/mobility risk, route hops, cold-start, and deadline slack.
-  # Later episodes use the learned policy with policy-gradient fine tuning.
+  # Later episodes use the learned policy with off-policy SAC fine tuning.
   # Evaluation loads only the saved checkpoint and does not call the expert;
   # the actor logits are blended with runtime-derived candidate priors.
-  # The IPPO actor makes per-function choices, so the imitation target must use
+  # The learned actor makes per-function choices, so the imitation target must use
   # the same sequential decision shape instead of chain-level planner search.
   ippo_centralized_critic: true
   ippo_use_region_encoder: true
@@ -92,10 +92,14 @@ marl:
   ippo_expert_branch_width: 8
   ippo_utility_prior_logit_weight: 2.5
   ippo_route_unavailable_penalty: 20.0
-  ippo_behavior_clone_pretrain_episodes: 20
+  ippo_behavior_clone_pretrain_episodes: 40
   ippo_behavior_clone_steps_per_observation: 4
-  # Keep a light imitation term during PPO updates.  The runtime action has
-  # sequential SFC dependencies, while this compact IPPO implementation uses a
+  masac_training_scenario_sampling: balanced
+  masac_replay_include_bc_expert: true
+  masac_actor_update_during_bc: false
+  masac_replay_sample_strategy: scenario_balanced
+  # Keep a light imitation term during SAC updates.  The runtime action has
+  # sequential SFC dependencies, while this compact learned actor uses a
   # small independent actor; the continued expert term prevents drifting away
   # from the corrected source/load-aware utility target.
   ippo_behavior_clone_finetune_steps_per_observation: 0
@@ -125,6 +129,11 @@ marl:
   ippo_checkpoint_selection_interval: 20
   ippo_checkpoint_selection_max_steps: 80
   ippo_checkpoint_selection_seed_offsets: [1000]
+  ippo_checkpoint_selection_metric: success_min_blend
+  masac_checkpoint_selection_require_sac_improves_bc: true
+  masac_checkpoint_selection_sac_min_score_ratio: 1.0
+  masac_checkpoint_selection_require_min_success_non_decrease: true
+  masac_checkpoint_selection_min_success_tolerance: 0.02
   # Use the checkpoint with the strongest live-runtime validation score across
   # training seeds.  This is the standard paper-evaluation model-selection
   # setting and keeps evaluation on real checkpoints only.

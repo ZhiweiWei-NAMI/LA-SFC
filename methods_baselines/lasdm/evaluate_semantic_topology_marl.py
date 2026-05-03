@@ -175,7 +175,7 @@ def main() -> None:
 def _baseline_settings(name: str) -> Tuple[str, Dict[str, Any]]:
     """Map experimental labels to executable policy/config ablations.
 
-    The IPPO trainer is invoked through train_semantic_topology_marl.py --policy ippo.
+    The learned proposed method is invoked through train_semantic_topology_marl.py --policy masac.
     This evaluator gives deterministic smoke-test counterparts for every method label.
     """
     if name == "semantic_greedy_no_exchange":

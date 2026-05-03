@@ -26,12 +26,12 @@ from airfogsim.lasdm.baselines import baseline_names
 from airfogsim.lasdm.benchmark_adapter import run_lasdm_benchmark_suite
 from airfogsim.lasdm.env_adapter import LASDMEnvAdapter
 from airfogsim.lasdm.graph_observation import flatten_observation
-from airfogsim.lasdm.marl_policy import IPPOPolicy, policy_from_name
+from airfogsim.lasdm.marl_policy import IPPOPolicy, MASACPolicy, policy_from_name
 from airfogsim.lasdm.marl_trainer import (
-    PPORolloutStep,
+    ReplayBuffer,
+    SACTransition,
     TrainingMetrics,
-    ppo_update_policy,
-    rollout_steps_from_policy_step,
+    masac_update_policy,
     write_reward_curve,
 )
 from airfogsim.lasdm.runtime_bridge import LASDMRuntimeBridge
@@ -333,7 +333,7 @@ def train_semantic_ippo_runtime(
         if seed_dir.exists():
             shutil.rmtree(seed_dir)
         seed_dir.mkdir(parents=True, exist_ok=True)
-        policy: Optional[IPPOPolicy] = None
+        policy: Optional[MASACPolicy] = None
         marl_cfg = dict(config.get("marl", {}) or {})
         policy_config = _config_with_baseline_updates(config, baseline)
         if baseline == "proposed_semantic_topology_marl":
@@ -377,7 +377,7 @@ def train_semantic_ippo_runtime(
         best_state: Optional[Dict[str, Any]] = None
         best_score = -float("inf")
         best_metadata: Dict[str, Any] = {}
-        bc_checkpoint_path = seed_dir / "ippo_bc_policy.pt"
+        bc_checkpoint_path = seed_dir / "masac_bc_policy.pt"
         bc_checkpoint_saved = False
         bc_checkpoint_error = ""
         bc_metadata: Dict[str, Any] = {}
@@ -385,22 +385,24 @@ def train_semantic_ippo_runtime(
         selection_rows: List[Dict[str, Any]] = []
         reward_rows: List[TrainingMetrics] = []
         progress_rows: List[Dict[str, Any]] = []
-        ppo_diagnostic_rows: List[Dict[str, Any]] = []
-        rollout_buffer: List[PPORolloutStep] = []
-        rollout_episode_count = 0
-        ppo_update_index = 0
-        rollout_episodes_per_update = max(1, int(marl_cfg.get("ippo_rollout_episodes_per_update", 1) or 1))
-        target_kl = float(marl_cfg.get("ippo_target_kl", 0.02) or 0.02)
-        max_grad_norm = float(marl_cfg.get("ippo_max_grad_norm", 0.5) or 0.5)
-        normalize_returns = bool(marl_cfg.get("ippo_return_norm_enabled", marl_cfg.get("ippo_normalize_returns", True)))
-        return_norm_momentum = float(marl_cfg.get("ippo_return_norm_momentum", 0.95) or 0.95)
-        return_norm_eps = float(marl_cfg.get("ippo_return_norm_eps", 1e-6) or 1e-6)
+        sac_diagnostic_rows: List[Dict[str, Any]] = []
+        replay_buffer = ReplayBuffer(
+            capacity=int(marl_cfg.get("masac_replay_capacity", 20000) or 20000),
+            seed=int(seed),
+        )
+        sac_update_index = 0
+        sac_batch_size = int(marl_cfg.get("masac_batch_size", 128) or 128)
+        sac_replay_warmup_steps = int(marl_cfg.get("masac_replay_warmup_steps", 128) or 128)
+        sac_updates_per_env_step = int(marl_cfg.get("masac_updates_per_env_step", 1) or 1)
+        sac_tau = float(marl_cfg.get("masac_tau", 0.005) or 0.005)
+        sac_reward_scale = float(marl_cfg.get("masac_reward_scale", 1.0) or 1.0)
+        max_grad_norm = float(marl_cfg.get("masac_max_grad_norm", 1.0) or 1.0)
+        sac_replay_sample_strategy = str(marl_cfg.get("masac_replay_sample_strategy", "uniform") or "uniform")
+        sac_replay_include_bc_expert = bool(marl_cfg.get("masac_replay_include_bc_expert", False))
+        sac_actor_update_during_bc = bool(marl_cfg.get("masac_actor_update_during_bc", False))
         bc_label_strategy = str(marl_cfg.get("ippo_bc_label_strategy", "expert") or "expert")
         bc_stale_relabel_margin = float(marl_cfg.get("ippo_bc_stale_relabel_margin", 0.05) or 0.0)
         bc_deadline_relabel_margin = float(marl_cfg.get("ippo_bc_deadline_relabel_margin", 0.05) or 0.0)
-        per_function_rollout_samples = bool(marl_cfg.get("ippo_per_function_rollout_samples", False))
-        share_reward_across_functions = bool(marl_cfg.get("ippo_share_reward_across_function_samples", True))
-        per_function_reward_mode = str(marl_cfg.get("ippo_per_function_reward_mode", "shared") or "shared")
         for episode in range(int(episodes)):
             pretrain_episode = episode < bc_pretrain_episodes
             if pretrain_episode:
@@ -414,7 +416,6 @@ def train_semantic_ippo_runtime(
                 )
             role = roles[episode % len(roles)]
             env, air_env = _build_semantic_runtime_env(config, scenario, role, seed, baseline, max_steps)
-            episode_steps: List[PPORolloutStep] = []
             try:
                 observations = env.reset()
                 wrote_episode_traces = False
@@ -423,8 +424,11 @@ def train_semantic_ippo_runtime(
                 if policy is None:
                     obs_dim = max(len(flatten_observation(obs)) for obs in observations.values()) if observations else 1
                     max_candidates = int(config.get("marl", {}).get("max_candidates", 16))
-                    policy = IPPOPolicy(
-                        **_ippo_policy_kwargs(policy_config, obs_dim, max_candidates, seed, observations=observations)
+                    policy = MASACPolicy(
+                        **_ippo_policy_kwargs(policy_config, obs_dim, max_candidates, seed, observations=observations),
+                        q_lr=float(marl_cfg.get("masac_q_lr", marl_cfg.get("ippo_lr", 3e-4)) or 3e-4),
+                        alpha=float(marl_cfg.get("masac_alpha", 0.05) or 0.05),
+                        tau=sac_tau,
                     )
                 total = 0.0
                 bc_steps = bc_pretrain_steps if pretrain_episode else bc_finetune_steps
@@ -453,27 +457,56 @@ def train_semantic_ippo_runtime(
                     if pretrain_episode:
                         policy_step = None
                         actions = expert_actions
+                        transition_source = "bc_expert"
                     else:
                         policy_step = policy.act_with_logprobs(current_observations, deterministic=False, track_grad=False)
                         actions = policy_step.actions
+                        transition_source = "policy"
                     observations, rewards, done, info = env.step(actions)
                     mean_reward = sum(rewards.values()) / max(1, len(rewards))
                     total += mean_reward
-                    if policy_step is not None:
-                        episode_steps.extend(
-                            rollout_steps_from_policy_step(
-                                policy,
-                                current_observations,
-                                policy_step.actions,
-                                mean_reward=float(mean_reward),
+                    add_to_replay = policy_step is not None or (pretrain_episode and sac_replay_include_bc_expert)
+                    if add_to_replay:
+                        replay_buffer.add(
+                            SACTransition(
+                                observations=current_observations,
+                                actions=actions,
+                                reward=float(mean_reward),
+                                next_observations=observations,
                                 done=bool(done or step + 1 >= int(max_steps)),
                                 episode=int(episode),
-                                per_function_samples=per_function_rollout_samples,
-                                share_reward_across_functions=share_reward_across_functions,
-                                per_function_reward_mode=per_function_reward_mode,
-                                reward_aux=info.get("reward_aux", {}),
+                                scenario=str(scenario.get("name", "default")),
+                                source=transition_source,
                             )
                         )
+                        if len(replay_buffer) >= max(1, sac_replay_warmup_steps):
+                            metrics = masac_update_policy(
+                                policy,
+                                replay_buffer,
+                                batch_size=sac_batch_size,
+                                updates=sac_updates_per_env_step,
+                                gamma=float(marl_cfg.get("masac_gamma", 0.99) or 0.99),
+                                tau=sac_tau,
+                                max_grad_norm=max_grad_norm,
+                                reward_scale=sac_reward_scale,
+                                sample_strategy=sac_replay_sample_strategy,
+                                update_actor=bool((not pretrain_episode) or sac_actor_update_during_bc),
+                            )
+                            if metrics:
+                                sac_update_index += 1
+                                sac_diagnostic_rows.append(
+                                    {
+                                        "episode": int(episode),
+                                        "step": int(step),
+                                        "seed": int(seed),
+                                        "baseline": baseline,
+                                        "update_index": sac_update_index,
+                                        "replay_size": len(replay_buffer),
+                                        "batch_size": sac_batch_size,
+                                        **metrics,
+                                    }
+                                )
+                                _write_csv_dynamic(seed_dir / "sac_diagnostics.csv", sac_diagnostic_rows)
                     summary_dict = info.get("summary", {})
                     episode_summary = dict(summary_dict)
                     episode_step_count = step + 1
@@ -492,50 +525,6 @@ def train_semantic_ippo_runtime(
                         )
                     if done:
                         break
-                if not pretrain_episode:
-                    if episode_steps:
-                        rollout_buffer.extend(episode_steps)
-                        rollout_episode_count += 1
-                    should_update = (
-                        rollout_episode_count >= rollout_episodes_per_update
-                        or episode == int(episodes) - 1
-                    )
-                    if should_update and rollout_buffer:
-                        entropy_coef = _scheduled_ippo_entropy_coef(marl_cfg, episode)
-                        metrics = _runtime_ippo_episode_update(
-                            policy,
-                            rollout_buffer,
-                            gamma=float(marl_cfg.get("ippo_gamma", 0.99) or 0.99),
-                            gae_lambda=float(marl_cfg.get("ippo_gae_lambda", 0.95) or 0.95),
-                            clip_eps=float(marl_cfg.get("ippo_clip_eps", 0.2) or 0.2),
-                            entropy_coef=entropy_coef,
-                            actor_loss_coef=float(marl_cfg.get("ippo_actor_loss_coef", 1.0) or 1.0),
-                            value_coef=float(marl_cfg.get("ippo_value_coef", 1.0) or 1.0),
-                            update_epochs=int(marl_cfg.get("ippo_update_epochs", 4) or 4),
-                            minibatch_size=int(marl_cfg.get("ippo_minibatch_size", 64) or 64),
-                            prior_l2_coef=float(marl_cfg.get("ippo_prior_l2_coef", 1e-3) or 0.0),
-                            target_kl=target_kl,
-                            max_grad_norm=max_grad_norm,
-                            normalize_returns=normalize_returns,
-                            return_norm_momentum=return_norm_momentum,
-                            return_norm_eps=return_norm_eps,
-                        )
-                        ppo_update_index += 1
-                        ppo_diagnostic_rows.append(
-                            {
-                                "episode": int(episode),
-                                "seed": int(seed),
-                                "baseline": baseline,
-                                "update_index": ppo_update_index,
-                                "rollout_episodes": rollout_episode_count,
-                                "rollout_steps": len(rollout_buffer),
-                                "entropy_coef": entropy_coef,
-                                **metrics,
-                            }
-                        )
-                        _write_csv_dynamic(seed_dir / "ppo_diagnostics.csv", ppo_diagnostic_rows)
-                        rollout_buffer = []
-                        rollout_episode_count = 0
                 if episode == episodes - 1:
                     env.write_traces(str(seed_dir))
                     _write_runtime_trace_files(seed_dir, "semantic_runtime_train", baseline, scenario, role, seed, env)
@@ -570,7 +559,7 @@ def train_semantic_ippo_runtime(
                         baseline,
                     )
                     raw_validation_score = _ippo_checkpoint_selection_score(validation_metrics, metric=selection_metric)
-                    checkpoint_source = "bc" if bc_boundary else "ppo"
+                    checkpoint_source = "bc" if bc_boundary else "sac"
                     selection_row = {
                         "episode": episode,
                         "seed": seed,
@@ -590,7 +579,7 @@ def train_semantic_ippo_runtime(
                     )
                     selection_score = (
                         robust_selection_score
-                        if selection_mode in {"robust", "bc_or_ppo_robust", "robust_bc_or_ppo"}
+                        if selection_mode in {"robust", "bc_or_sac_robust", "robust_bc_or_sac"}
                         else raw_validation_score
                     )
                     selection_row.update(
@@ -629,14 +618,26 @@ def train_semantic_ippo_runtime(
                     selection_row["eligible_for_best_checkpoint"] = int(eligible_for_best)
                     if bc_boundary:
                         bc_metadata = dict(selection_row)
-                    _write_csv_dynamic(seed_dir / "checkpoint_selection.csv", selection_rows)
                     if eligible_for_best and selection_score > best_score:
                         best_score = selection_score
-                        best_state = copy.deepcopy(policy.model.state_dict())
+                        best_state = copy.deepcopy(policy.sac_state_dict())
                         best_metadata = dict(selection_row)
+                        best_candidate_path = seed_dir / f"masac_policy_best_ep{int(episode):04d}.pt"
+                        try:
+                            policy.torch.save(best_state, best_candidate_path)
+                            selection_row["checkpoint_path"] = str(best_candidate_path)
+                            selection_row["checkpoint_saved"] = 1
+                            selection_row["checkpoint_sha256"] = _sha256_file(best_candidate_path)
+                            selection_row["checkpoint_error"] = ""
+                        except Exception as exc:
+                            selection_row["checkpoint_path"] = str(best_candidate_path)
+                            selection_row["checkpoint_saved"] = 0
+                            selection_row["checkpoint_sha256"] = ""
+                            selection_row["checkpoint_error"] = str(exc)
+                    _write_csv_dynamic(seed_dir / "checkpoint_selection.csv", selection_rows)
                     if bc_boundary:
                         try:
-                            policy.torch.save(policy.model.state_dict(), bc_checkpoint_path)
+                            policy.torch.save(policy.sac_state_dict(), bc_checkpoint_path)
                             bc_checkpoint_saved = bc_checkpoint_path.exists()
                             bc_checkpoint_error = ""
                         except Exception as exc:
@@ -677,12 +678,12 @@ def train_semantic_ippo_runtime(
                 progress_rows.append(progress_row)
                 write_reward_curve(seed_dir / "reward_curve.csv", reward_rows)
                 _write_csv_dynamic(seed_dir / "train_progress.csv", progress_rows)
-                _write_csv_dynamic(seed_dir / "ppo_diagnostics.csv", ppo_diagnostic_rows)
+                _write_csv_dynamic(seed_dir / "sac_diagnostics.csv", sac_diagnostic_rows)
                 progress_guard = _evaluate_training_progress_guard(progress_rows, marl_cfg)
                 if not progress_guard.get("passed", True):
                     _write_json(seed_dir / "training_progress_guard_failure.json", progress_guard)
                     raise RuntimeError(
-                        "IPPO training progress guard failed: "
+                        "MASAC training progress guard failed: "
                         f"{progress_guard.get('reason')} | details={progress_guard.get('details')}"
                     )
             finally:
@@ -691,14 +692,14 @@ def train_semantic_ippo_runtime(
         _write_csv_dynamic(seed_dir / "checkpoint_selection.csv", selection_rows)
         if bc_selection_rows:
             _write_csv_dynamic(seed_dir / "bc_checkpoint_selection.csv", bc_selection_rows)
-        checkpoint_path = seed_dir / "ippo_policy.pt"
+        checkpoint_path = seed_dir / "masac_policy.pt"
         checkpoint_saved = False
         checkpoint_error = ""
         if policy is not None:
             try:
                 if best_state is not None:
-                    policy.model.load_state_dict(best_state)
-                policy.torch.save(policy.model.state_dict(), checkpoint_path)
+                    policy.load_sac_state_dict(best_state, strict=True)
+                policy.torch.save(policy.sac_state_dict(), checkpoint_path)
                 checkpoint_saved = checkpoint_path.exists()
             except Exception as exc:
                 checkpoint_error = str(exc)
@@ -723,8 +724,16 @@ def train_semantic_ippo_runtime(
             "behavior_clone_finetune_steps_per_observation": bc_finetune_steps,
             "reward_curve_policy_only": reward_curve_policy_only,
             "expert_policy": expert_policy_name,
-            "ippo_centralized_critic": bool(marl_cfg.get("ippo_centralized_critic", True)),
-            "ippo_critic_agent_count": int(marl_cfg.get("ippo_critic_agent_count", 4) or 4),
+            "algorithm": "masac_discrete_ctde",
+            "masac_centralized_critic": True,
+            "masac_critic_agent_count": int(marl_cfg.get("ippo_critic_agent_count", 4) or 4),
+            "masac_replay_size": len(replay_buffer),
+            "masac_batch_size": sac_batch_size,
+            "masac_alpha": float(marl_cfg.get("masac_alpha", 0.05) or 0.05),
+            "masac_tau": sac_tau,
+            "masac_replay_sample_strategy": sac_replay_sample_strategy,
+            "masac_replay_include_bc_expert": sac_replay_include_bc_expert,
+            "masac_actor_update_during_bc": sac_actor_update_during_bc,
             "checkpoint_selection_interval": selection_interval,
             "checkpoint_selection_early_interval": early_selection_interval,
             "checkpoint_selection_early_until_episode": early_selection_until,
@@ -1017,23 +1026,23 @@ def _semantic_policy_for_eval(
         if strategy == "global_best_validation":
             if (
                 baseline == "proposed_semantic_topology_marl"
-                and bool(marl_cfg.get("ippo_eval_prefer_ppo_for_proposed", False))
+                and bool(marl_cfg.get("masac_eval_prefer_sac_for_proposed", False))
             ):
-                min_count = int(marl_cfg.get("ippo_eval_min_proposed_ppo_selected_count", 0) or 0)
-                ppo_count = _selected_checkpoint_source_count(baseline_checkpoint_root, "ppo")
-                if min_count > 0 and ppo_count < min_count:
+                min_count = int(marl_cfg.get("masac_eval_min_proposed_sac_selected_count", 0) or 0)
+                sac_count = _selected_checkpoint_source_count(baseline_checkpoint_root, "sac")
+                if min_count > 0 and sac_count < min_count:
                     raise RuntimeError(
-                        "proposed_semantic_topology_marl failed PPO-uplift selection: "
-                        f"selected PPO checkpoints={ppo_count}, required={min_count}"
+                        "proposed_semantic_topology_marl failed SAC-uplift selection: "
+                        f"selected SAC checkpoints={sac_count}, required={min_count}"
                     )
                 checkpoint, summary_path = _best_validation_checkpoint(
                     baseline_checkpoint_root,
-                    checkpoint_source="ppo",
+                    checkpoint_source="sac",
                 )
             else:
                 checkpoint, summary_path = _best_validation_checkpoint(baseline_checkpoint_root)
         elif strategy == "exact_seed":
-            checkpoint = baseline_checkpoint_root / f"ippo_seed_{seed}" / "ippo_policy.pt"
+            checkpoint = baseline_checkpoint_root / f"ippo_seed_{seed}" / "masac_policy.pt"
             summary_path = baseline_checkpoint_root / f"ippo_seed_{seed}" / "train_summary.json"
         else:
             raise ValueError(f"Unknown ippo_eval_checkpoint_strategy: {strategy}")
@@ -1050,7 +1059,7 @@ def _semantic_policy_for_eval(
             )
         if not checkpoint.exists():
             raise RuntimeError(
-                f"{baseline} requires the exact seed IPPO checkpoint; "
+                f"{baseline} requires the exact seed MASAC checkpoint; "
                 f"missing {checkpoint}"
             )
         import torch
@@ -1059,19 +1068,23 @@ def _semantic_policy_for_eval(
             state = torch.load(checkpoint, map_location="cpu", weights_only=True)
         except TypeError:
             state = torch.load(checkpoint, map_location="cpu")
-        obs_dim = _checkpoint_observation_dim(state) or (
+        actor_state = state.get("actor", state) if isinstance(state, Mapping) else state
+        obs_dim = _checkpoint_observation_dim(actor_state) or (
             max(len(flatten_observation(obs)) for obs in observations.values()) if observations else 1
         )
-        action_dim = _checkpoint_action_dim(state) or int(policy_config.get("marl", {}).get("max_candidates", 16))
-        policy = IPPOPolicy(
-            **_ippo_policy_kwargs(policy_config, obs_dim, action_dim, seed, observations=observations, state=state)
+        action_dim = _checkpoint_action_dim(actor_state) or int(policy_config.get("marl", {}).get("max_candidates", 16))
+        policy = MASACPolicy(
+            **_ippo_policy_kwargs(policy_config, obs_dim, action_dim, seed, observations=observations, state=actor_state),
+            q_lr=float(marl_cfg.get("masac_q_lr", marl_cfg.get("ippo_lr", 3e-4)) or 3e-4),
+            alpha=float(marl_cfg.get("masac_alpha", 0.05) or 0.05),
+            tau=float(marl_cfg.get("masac_tau", 0.005) or 0.005),
         )
-        strict = _checkpoint_has_critic_body(state)
-        policy.model.load_state_dict(state, strict=strict)
+        strict = _checkpoint_has_critic_body(actor_state)
+        policy.load_sac_state_dict(state, strict=strict)
         policy.checkpoint_loaded = True
         policy.checkpoint_path = str(checkpoint)
         policy.checkpoint_sha256 = _sha256_file(checkpoint)
-        policy.policy_source = "ippo_checkpoint"
+        policy.policy_source = "masac_checkpoint"
         policy.checkpoint_train_seed = summary_seed
         policy.checkpoint_strategy = strategy
         return policy
@@ -1195,44 +1208,6 @@ def _evaluate_training_progress_guard(
     if max_success < min_recent_max_success:
         return {"passed": False, "reason": "training success ratio stayed near zero", "details": details}
     return {"passed": True, "reason": "training progress guard passed", "details": details}
-
-
-def _runtime_ippo_episode_update(
-    policy: IPPOPolicy,
-    episode_steps: Sequence[PPORolloutStep],
-    gamma: float = 0.99,
-    gae_lambda: float = 0.95,
-    clip_eps: float = 0.2,
-    entropy_coef: float = 0.01,
-    actor_loss_coef: float = 1.0,
-    value_coef: float = 1.0,
-    update_epochs: int = 4,
-    minibatch_size: int = 64,
-    prior_l2_coef: float = 0.0,
-    target_kl: float = 0.02,
-    max_grad_norm: float = 0.5,
-    normalize_returns: bool = True,
-    return_norm_momentum: float = 0.95,
-    return_norm_eps: float = 1e-6,
-) -> Dict[str, float]:
-    return ppo_update_policy(
-        policy,
-        episode_steps,
-        gamma=gamma,
-        gae_lambda=gae_lambda,
-        clip_eps=clip_eps,
-        entropy_coef=entropy_coef,
-        actor_loss_coef=actor_loss_coef,
-        value_coef=value_coef,
-        update_epochs=update_epochs,
-        minibatch_size=minibatch_size,
-        max_grad_norm=max_grad_norm,
-        prior_l2_coef=prior_l2_coef,
-        target_kl=target_kl,
-        normalize_returns=normalize_returns,
-        return_norm_momentum=return_norm_momentum,
-        return_norm_eps=return_norm_eps,
-    )
 
 
 def _ippo_bc_quality_metrics(
@@ -1381,6 +1356,12 @@ def _ippo_training_scenario_for_episode(
 ) -> Mapping[str, Any]:
     if not scenarios:
         return {"name": "default"}
+    sampling_mode = str(
+        marl_cfg.get("masac_training_scenario_sampling", marl_cfg.get("ippo_training_scenario_sampling", "curriculum"))
+        or "curriculum"
+    )
+    if sampling_mode in {"balanced", "round_robin", "cycle"}:
+        return scenarios[int(episode) % len(scenarios)]
     if not bool(marl_cfg.get("ippo_curriculum_enabled", False)):
         return scenarios[int(episode) % len(scenarios)]
     phases = list(marl_cfg.get("ippo_curriculum", []) or [])
@@ -1439,17 +1420,6 @@ def _ippo_bc_scenario_for_episode(
     if not bc_scenarios:
         return scenarios[int(episode) % len(scenarios)]
     return bc_scenarios[int(episode) % len(bc_scenarios)]
-
-
-def _scheduled_ippo_entropy_coef(marl_cfg: Mapping[str, Any], episode: int) -> float:
-    fallback = float(marl_cfg.get("ippo_entropy_coef", 0.01) or 0.01)
-    if "ippo_entropy_coef_start" not in marl_cfg or "ippo_entropy_coef_end" not in marl_cfg:
-        return fallback
-    decay_episodes = max(1, int(marl_cfg.get("ippo_entropy_decay_episodes", 1) or 1))
-    start = float(marl_cfg.get("ippo_entropy_coef_start", fallback) or fallback)
-    end = float(marl_cfg.get("ippo_entropy_coef_end", fallback) or fallback)
-    progress = max(0.0, min(1.0, float(episode) / float(decay_episodes)))
-    return start + (end - start) * progress
 
 
 def _evaluate_ippo_policy_for_selection(
@@ -1556,8 +1526,10 @@ def _ippo_checkpoint_selection_score(metrics: Mapping[str, Any], metric: str = "
     min_success = float(metrics.get("min_success_ratio", success) or 0.0)
     if metric_name == "min_success_ratio":
         return min_success
+    if metric_name in {"success_min_blend", "success_min_robust"}:
+        return 0.65 * success + 0.35 * min_success
     if metric_name != "composite":
-        raise ValueError(f"Unknown IPPO checkpoint selection metric: {metric_name}")
+        raise ValueError(f"Unknown MASAC checkpoint selection metric: {metric_name}")
     qos = float(metrics.get("qos_hit_ratio", 0.0) or 0.0)
     task_success = float(metrics.get("task_success_ratio", 0.0) or 0.0)
     finish = float(metrics.get("avg_graph_finish_time", 0.0) or 0.0)
@@ -1587,20 +1559,26 @@ def _ippo_checkpoint_eligible_for_best(
     bc_row: Mapping[str, Any],
     marl_cfg: Mapping[str, Any],
 ) -> bool:
-    """Gate PPO checkpoints against the BC checkpoint unless explicitly disabled.
+    """Gate SAC checkpoints against the BC checkpoint unless explicitly disabled.
 
     Per-validation-seed non-decrease is logged as a robustness diagnostic, not
     as a hard gate. A policy can improve the robust aggregate by fixing the
     worst cases while slightly moving individual validation seeds.
     """
 
-    source = str(row.get("checkpoint_source", "ppo") or "ppo")
+    source = str(row.get("checkpoint_source", "sac") or "sac")
     if source == "bc":
         return True
-    require_bc_improvement = bool(marl_cfg.get("ippo_checkpoint_selection_require_ppo_improves_bc", False))
+    require_bc_improvement = bool(marl_cfg.get("masac_checkpoint_selection_require_sac_improves_bc", False))
     if not require_bc_improvement or not bc_row:
         return True
-    improvement_ratio = float(marl_cfg.get("ippo_checkpoint_selection_ppo_min_score_ratio", 1.0) or 1.0)
+    if bool(marl_cfg.get("masac_checkpoint_selection_require_min_success_non_decrease", False)):
+        tolerance = float(marl_cfg.get("masac_checkpoint_selection_min_success_tolerance", 0.0) or 0.0)
+        current_min = float(row.get("min_success_ratio", row.get("success_ratio", 0.0)) or 0.0)
+        bc_min = float(bc_row.get("min_success_ratio", bc_row.get("success_ratio", 0.0)) or 0.0)
+        if current_min + tolerance < bc_min:
+            return False
+    improvement_ratio = float(marl_cfg.get("masac_checkpoint_selection_sac_min_score_ratio", 1.0) or 1.0)
     current_score = float(row.get("selection_score", row.get("robust_selection_score", -float("inf"))) or -float("inf"))
     bc_score = float(bc_row.get("selection_score", bc_row.get("raw_selection_score", -float("inf"))) or -float("inf"))
     return current_score >= bc_score * improvement_ratio
@@ -1769,11 +1747,11 @@ def _best_validation_checkpoint(checkpoint_root: Path, checkpoint_source: Option
         best = dict(payload.get("best_selection", {}) or {})
         if checkpoint_source and str(best.get("checkpoint_source", "") or "") != str(checkpoint_source):
             continue
-        checkpoint_path = Path(str(payload.get("checkpoint_path") or summary_path.with_name("ippo_policy.pt")))
+        checkpoint_path = Path(str(payload.get("checkpoint_path") or summary_path.with_name("masac_policy.pt")))
         if not checkpoint_path.is_absolute():
             checkpoint_path = Path.cwd() / checkpoint_path
         if not checkpoint_path.exists():
-            checkpoint_path = summary_path.with_name("ippo_policy.pt")
+            checkpoint_path = summary_path.with_name("masac_policy.pt")
         if not checkpoint_path.exists():
             continue
         score = payload.get("best_selection_score", None)
@@ -1784,7 +1762,7 @@ def _best_validation_checkpoint(checkpoint_root: Path, checkpoint_source: Option
         candidates.append((score_value, checkpoint_path, summary_path))
     if not candidates:
         suffix = f" with checkpoint_source={checkpoint_source}" if checkpoint_source else ""
-        raise RuntimeError(f"No valid IPPO checkpoints found under {checkpoint_root}{suffix}")
+        raise RuntimeError(f"No valid MASAC checkpoints found under {checkpoint_root}{suffix}")
     candidates.sort(key=lambda item: item[0], reverse=True)
     return candidates[0][1], candidates[0][2]
 

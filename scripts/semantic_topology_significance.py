@@ -183,9 +183,9 @@ def gate_report(
     checks["stale_ratio_explained_by_ttl"] = stale_ttl_relationship(discovery_rows)
     checks["topology_aware_better_under_mobility"] = topology_better_under_mobility(summary_by, scenarios)
     proposed_rows = [row for row in summary if canonical_baseline(row.get("baseline", "")) == PROPOSED]
-    checks["ippo_checkpoint_strictly_loaded"] = bool(proposed_rows) and all(
+    checks["masac_checkpoint_strictly_loaded"] = bool(proposed_rows) and all(
         truthy(row.get("checkpoint_loaded"))
-        and str(row.get("policy_source", "")) == "ippo_checkpoint"
+        and str(row.get("policy_source", "")) == "masac_checkpoint"
         and bool(str(row.get("checkpoint_sha256", "")).strip())
         for row in proposed_rows
     )

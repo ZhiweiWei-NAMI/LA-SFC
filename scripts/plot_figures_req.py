@@ -532,7 +532,7 @@ def plot_fig10_training_curve(data: FigureData) -> tuple[plt.Figure, dict[str, A
     fig, ax1 = plt.subplots(figsize=(5.4, 3.2))
     ax1.plot(reward["episode"], reward["smooth"], color="#0072B2", label="Smoothed reward")
     ax1.axvline(20, linestyle="--", color="#666666", linewidth=1.0)
-    ax1.text(20, ax1.get_ylim()[1], "BC -> PPO", ha="left", va="top", fontsize=7)
+    ax1.text(20, ax1.get_ylim()[1], "BC -> SAC", ha="left", va="top", fontsize=7)
     ax1.set_xlabel("Training episode")
     ax1.set_ylabel("Smoothed reward")
     ax1.set_title("Fig-10 Training curve")
