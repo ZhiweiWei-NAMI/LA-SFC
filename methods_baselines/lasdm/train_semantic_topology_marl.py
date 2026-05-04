@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import logging
 import math
 import os
 import random
@@ -11,6 +12,9 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 import yaml
+
+LOGGER = logging.getLogger(__name__)
+_LOGGED_V21_CHAIN_OVERWRITES: set[tuple[str, int, str, str]] = set()
 
 METHOD_ROOT = os.path.abspath(os.path.dirname(__file__))
 WORKSPACE_ROOT = os.path.abspath(os.path.join(METHOD_ROOT, "../.."))
@@ -30,9 +34,13 @@ from airfogsim.lasdm.marl_trainer import HeuristicEvaluator, MASACTrainer, write
 from airfogsim.lasdm.model import LASDMServiceChain
 from airfogsim.lasdm.orchestrator import LASDMOrchestrator
 from airfogsim.lasdm.runtime_bridge import LASDMRuntimeBridge
+from airfogsim.lasdm.semantic_encoder import SemanticEncoder
+from airfogsim.lasdm.semantic_link_matrix import SERVICE_IO_DEFAULTS, SemanticLinkMatrix, V21_OUTPUT_ROOT
+from airfogsim.lasdm.semantic_link_predictor import build_semantic_scorer
 from airfogsim.lasdm.topology_builder import TopologyBuilder
 
 DEFAULT_CONFIG = os.path.join(METHOD_ROOT, "configs", "semantic_topology_marl.yaml")
+DEFAULT_V21_OUTPUT_ROOT = os.path.join(WORKSPACE_ROOT, str(V21_OUTPUT_ROOT))
 PHYSICAL_VEHICLE_COUNT = 100
 PHYSICAL_UAV_COUNT = 20
 PHYSICAL_RSU_COUNT = 4
@@ -41,13 +49,31 @@ PHYSICAL_RSU_COUNT = 4
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train/evaluate semantic-topology LASDM MARL.")
     parser.add_argument("--config", default=DEFAULT_CONFIG)
-    parser.add_argument("--policy", default="semantic_greedy", choices=["semantic_greedy", "topology_greedy", "random_valid", "masac"])
+    parser.add_argument(
+        "--policy",
+        default="semantic_greedy",
+        choices=[
+            "semantic_greedy",
+            "pure_semantic_greedy_no_exchange",
+            "local_semantic_runtime_greedy",
+            "topology_greedy",
+            "utility_prior_with_exchange",
+            "intra_region_only",
+            "cross_region_auction",
+            "centralized_planner",
+            "nsga2_semantic_qos",
+            "random_valid",
+            "masac",
+            "mappo",
+            "iql",
+        ],
+    )
     parser.add_argument("--episodes", type=int, default=None)
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--scenario", default=None)
     parser.add_argument("--service-role-sweep", default="full_hybrid")
-    parser.add_argument("--output-dir", default="experiment_artifacts/raw_data/lasdm_semantic_topology_marl/train")
+    parser.add_argument("--output-dir", default=os.path.join(DEFAULT_V21_OUTPUT_ROOT, "semantic_runtime_train", "default"))
     args = parser.parse_args()
 
     config = _load_yaml(args.config)
@@ -68,19 +94,12 @@ def main() -> None:
         output_dir = Path(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
+        marl_cfg = dict(config.get("marl", {}) or {})
+        policy_kwargs = _actor_policy_kwargs(config, observations, env.config.semantic_scorer, args.seed)
         if args.policy == "masac":
-            obs_dim = max(len(flatten_observation(obs)) for obs in observations.values()) if observations else 1
-            marl_cfg = dict(config.get("marl", {}) or {})
-            max_candidates = int(marl_cfg.get("max_candidates", 16))
-            critic_agents = int(marl_cfg.get("ippo_critic_agent_count", len(observations) or 4) or 4)
-            candidate_feature_dim = _observation_candidate_feature_dim(observations) or 31
             target_entropy_raw = marl_cfg.get("masac_target_entropy", None)
             policy = MASACPolicy(
-                observation_dim=obs_dim,
-                max_candidates=max_candidates,
-                candidate_feature_dim=candidate_feature_dim,
-                seed=args.seed,
-                lr=float(marl_cfg.get("ippo_lr", 3e-4) or 3e-4),
+                **policy_kwargs,
                 q_lr=float(marl_cfg.get("masac_q_lr", marl_cfg.get("ippo_lr", 3e-4)) or 3e-4),
                 alpha=float(marl_cfg.get("masac_alpha", 0.05) or 0.05),
                 auto_alpha=bool(marl_cfg.get("masac_auto_alpha", False)),
@@ -90,28 +109,6 @@ def main() -> None:
                 alpha_min=float(marl_cfg.get("masac_alpha_min", 0.005) or 0.005),
                 alpha_max=float(marl_cfg.get("masac_alpha_max", 0.25) or 0.25),
                 tau=float(marl_cfg.get("masac_tau", 0.005) or 0.005),
-                centralized_critic=bool(marl_cfg.get("ippo_centralized_critic", True)),
-                critic_observation_dim=obs_dim * max(1, critic_agents),
-                max_critic_agents=max(1, critic_agents),
-                utility_prior_logit_weight=float(marl_cfg.get("ippo_utility_prior_logit_weight", 2.5) or 2.5),
-                route_unavailable_penalty=float(
-                    marl_cfg.get("ippo_route_unavailable_penalty", marl_cfg.get("ippo_expert_route_unavailable_penalty", 20.0))
-                    or 20.0
-                ),
-                include_semantic_features=bool(marl_cfg.get("include_semantic_features", True)),
-                include_topology_features=bool(marl_cfg.get("include_topology_features", True)),
-                include_temporal_features=bool(marl_cfg.get("include_temporal_features", True)),
-                use_region_encoder=bool(marl_cfg.get("ippo_use_region_encoder", True)),
-                learnable_prior=bool(marl_cfg.get("ippo_learnable_prior", True)),
-                prior_l2_coef=float(marl_cfg.get("ippo_prior_l2_coef", 1e-3) or 0.0),
-                learned_logit_scale=float(
-                    marl_cfg.get("ippo_learned_logit_scale_init", marl_cfg.get("ippo_learned_logit_scale", 1.0)) or 1.0
-                ),
-                prior_logit_scale=float(
-                    marl_cfg.get("ippo_prior_logit_scale_init", marl_cfg.get("ippo_prior_logit_scale", 1.0)) or 1.0
-                ),
-                learnable_logit_blend=bool(marl_cfg.get("ippo_learnable_logit_blend", False)),
-                device=str(marl_cfg.get("ippo_device", "") or "") or None,
             )
             trainer = MASACTrainer(
                 env,
@@ -127,6 +124,52 @@ def main() -> None:
                 seed=args.seed,
             )
             rows = trainer.train(episodes=episodes, max_steps=max_steps, output_dir=str(output_dir))
+        elif args.policy == "mappo":
+            from airfogsim.lasdm.mappo_policy import MAPPOPolicy
+            from airfogsim.lasdm.mappo_trainer import MAPPOTrainer
+
+            policy = MAPPOPolicy(**policy_kwargs)
+            trainer = MAPPOTrainer(
+                env,
+                policy,
+                gamma=float(marl_cfg.get("mappo_gamma", marl_cfg.get("masac_gamma", 0.99)) or 0.99),
+                lam=float(marl_cfg.get("mappo_gae_lambda", 0.95) or 0.95),
+                clip_eps=float(marl_cfg.get("mappo_clip_eps", 0.2) or 0.2),
+                ppo_epochs=int(marl_cfg.get("mappo_ppo_epochs", 4) or 4),
+                rollout_steps=int(marl_cfg.get("mappo_rollout_steps", 128) or 128),
+                vf_coef=float(marl_cfg.get("mappo_vf_coef", 0.5) or 0.5),
+                ent_coef=float(marl_cfg.get("mappo_ent_coef", 0.01) or 0.01),
+                max_grad_norm=float(marl_cfg.get("mappo_max_grad_norm", 0.5) or 0.5),
+            )
+            rows = trainer.train(episodes=episodes, max_steps=max_steps, output_dir=str(output_dir))
+        elif args.policy == "iql":
+            from airfogsim.lasdm.iql_policy import IQLPolicy
+            from airfogsim.lasdm.iql_trainer import IQLTrainer
+
+            policy = IQLPolicy(
+                **policy_kwargs,
+                q_lr=float(marl_cfg.get("iql_q_lr", marl_cfg.get("masac_q_lr", marl_cfg.get("ippo_lr", 3e-4))) or 3e-4),
+                expectile=float(marl_cfg.get("iql_expectile", 0.7) or 0.7),
+                beta=float(marl_cfg.get("iql_beta", 3.0) or 3.0),
+                v_lr=float(marl_cfg.get("iql_v_lr", marl_cfg.get("masac_q_lr", marl_cfg.get("ippo_lr", 3e-4))) or 3e-4),
+                tau=float(marl_cfg.get("masac_tau", 0.005) or 0.005),
+            )
+            behavior_policy = policy_from_name(str(marl_cfg.get("iql_behavior_policy", "utility_prior_with_exchange")), seed=args.seed)
+            trainer = IQLTrainer(
+                env,
+                policy,
+                behavior_policy=behavior_policy,
+                gamma=float(marl_cfg.get("iql_gamma", marl_cfg.get("masac_gamma", 0.99)) or 0.99),
+                tau=float(marl_cfg.get("iql_tau", marl_cfg.get("masac_tau", 0.005)) or 0.005),
+                batch_size=int(marl_cfg.get("iql_batch_size", marl_cfg.get("masac_batch_size", 128)) or 128),
+                replay_capacity=int(marl_cfg.get("iql_replay_capacity", marl_cfg.get("masac_replay_capacity", 20000)) or 20000),
+                offline_updates=int(marl_cfg.get("iql_offline_updates", 0) or 0),
+                updates_per_transition=float(marl_cfg.get("iql_updates_per_transition", 1.0) or 1.0),
+                max_grad_norm=float(marl_cfg.get("iql_max_grad_norm", marl_cfg.get("masac_max_grad_norm", 1.0)) or 1.0),
+                reward_scale=float(marl_cfg.get("iql_reward_scale", marl_cfg.get("masac_reward_scale", 1.0)) or 1.0),
+                seed=args.seed,
+            )
+            rows = trainer.train(episodes=episodes, max_steps=max_steps, output_dir=str(output_dir))
         else:
             policy = policy_from_name(args.policy, seed=args.seed)
             evaluator = HeuristicEvaluator(env, policy)
@@ -137,7 +180,7 @@ def main() -> None:
         payload = {
             "completed": True,
             "policy": args.policy,
-            "algorithm": "masac_discrete_ctde" if args.policy == "masac" else args.policy,
+            "algorithm": _algorithm_name(args.policy),
             "episodes": episodes,
             "max_steps": max_steps,
             "output_dir": str(output_dir),
@@ -171,6 +214,8 @@ def build_offline_env(
     marl_cfg = run_config.get("marl", {})
     exchange_cfg = run_config.get("semantic_exchange", {})
     topology_cfg = run_config.get("topology", {})
+    semantic_matrix = run_config.get("_semantic_matrix")
+    semantic_scorer = _build_semantic_scorer(run_config, semantic_matrix)
     env_cfg = MARLEnvConfig(
         semantic_top_k=int(marl_cfg.get("semantic_top_k", 8)),
         min_semantic_similarity=float(marl_cfg.get("min_semantic_similarity", -1.0)),
@@ -204,6 +249,9 @@ def build_offline_env(
         region_agents=tuple(str(item) for item in topology_cfg.get("region_agents", []) or []),
         sequential_capacity_enabled=bool(marl_cfg.get("sequential_capacity_enabled", True)),
         sequential_deadline_pruning_enabled=bool(marl_cfg.get("sequential_deadline_pruning_enabled", True)),
+        semantic_matrix=semantic_matrix,
+        semantic_scorer=semantic_scorer,
+        enable_semantic_profiles=True,
     )
     semantic_env = SemanticTopologyMARLEnv(
         manager=manager,
@@ -214,6 +262,24 @@ def build_offline_env(
     if attach_runtime:
         _attach_runtime_env(semantic_env, config, scenario_cfg, seed, baseline)
     return semantic_env
+
+
+def _build_semantic_scorer(run_config: Mapping[str, Any], semantic_matrix: Optional[SemanticLinkMatrix]) -> Any:
+    if semantic_matrix is None:
+        return None
+    exchange_cfg = dict(run_config.get("semantic_exchange", {}) or {})
+    encoder = SemanticEncoder(
+        backend=str(exchange_cfg.get("encoder_backend", "hash")),
+        model_name=str(exchange_cfg.get("sbert_model_name", "sentence-transformers/all-MiniLM-L6-v2")),
+        hash_dim=int(exchange_cfg.get("hash_dim", 384)),
+        batch_size=int(exchange_cfg.get("encoder_batch_size", 64)),
+        device=str(exchange_cfg.get("encoder_device", "")) or None,
+    )
+    return build_semantic_scorer(
+        service_type_to_idx=semantic_matrix.service_type_to_idx,
+        encoder=encoder,
+        embedding_dim=int(exchange_cfg.get("hash_dim", 384)),
+    )
 
 
 def _attach_runtime_env(
@@ -275,6 +341,58 @@ def _observation_candidate_feature_dim(observations: Mapping[str, Mapping[str, A
     return None
 
 
+def _actor_policy_kwargs(
+    config: Mapping[str, Any],
+    observations: Mapping[str, Mapping[str, Any]],
+    semantic_scorer: Any,
+    seed: int,
+) -> Dict[str, Any]:
+    marl_cfg = dict(config.get("marl", {}) or {})
+    obs_dim = max(len(flatten_observation(obs)) for obs in observations.values()) if observations else 1
+    critic_agents = int(marl_cfg.get("ippo_critic_agent_count", len(observations) or 4) or 4)
+    return {
+        "observation_dim": obs_dim,
+        "max_candidates": int(marl_cfg.get("max_candidates", 16) or 16),
+        "candidate_feature_dim": _observation_candidate_feature_dim(observations) or 31,
+        "hidden_dim": int(marl_cfg.get("ippo_hidden_dim", marl_cfg.get("hidden_dim", 128)) or 128),
+        "lr": float(marl_cfg.get("ippo_lr", 3e-4) or 3e-4),
+        "seed": int(seed),
+        "centralized_critic": bool(marl_cfg.get("ippo_centralized_critic", True)),
+        "critic_observation_dim": obs_dim * max(1, critic_agents),
+        "max_critic_agents": max(1, critic_agents),
+        "utility_prior_logit_weight": float(marl_cfg.get("ippo_utility_prior_logit_weight", 2.5) or 2.5),
+        "route_unavailable_penalty": float(
+            marl_cfg.get("ippo_route_unavailable_penalty", marl_cfg.get("ippo_expert_route_unavailable_penalty", 20.0))
+            or 20.0
+        ),
+        "include_semantic_features": bool(marl_cfg.get("include_semantic_features", True)),
+        "include_topology_features": bool(marl_cfg.get("include_topology_features", True)),
+        "include_temporal_features": bool(marl_cfg.get("include_temporal_features", True)),
+        "use_region_encoder": bool(marl_cfg.get("ippo_use_region_encoder", True)),
+        "learnable_prior": bool(marl_cfg.get("ippo_learnable_prior", True)),
+        "prior_l2_coef": float(marl_cfg.get("ippo_prior_l2_coef", 1e-3) or 0.0),
+        "learned_logit_scale": float(
+            marl_cfg.get("ippo_learned_logit_scale_init", marl_cfg.get("ippo_learned_logit_scale", 1.0)) or 1.0
+        ),
+        "prior_logit_scale": float(
+            marl_cfg.get("ippo_prior_logit_scale_init", marl_cfg.get("ippo_prior_logit_scale", 1.0)) or 1.0
+        ),
+        "learnable_logit_blend": bool(marl_cfg.get("ippo_learnable_logit_blend", False)),
+        "semantic_scorer": semantic_scorer,
+        "device": str(marl_cfg.get("ippo_device", "") or "") or None,
+    }
+
+
+def _algorithm_name(policy_name: str) -> str:
+    mapping = {
+        "masac": "masac_discrete_ctde",
+        "mappo": "mappo_ctde",
+        "iql": "iql_offline",
+        "nsga2_semantic_qos": "nsga2_semantic_qos",
+    }
+    return mapping.get(str(policy_name), str(policy_name))
+
+
 def _load_yaml(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as file:
         return yaml.safe_load(file) or {}
@@ -303,10 +421,9 @@ def _materialize_offline_config(
     run_config = copy.deepcopy(dict(config))
     role_name = str(service_role_sweep or "full_hybrid")
     allowed_node_types = _allowed_service_node_types(run_config, role_name)
-    base_instances = [dict(item) for item in run_config.get("service_instances", [])]
-    instances = [_scenario_instance(item, scenario) for item in base_instances if str(item.get("node_type")) in allowed_node_types]
-    instances.extend(_materialized_service_instances(run_config, scenario, allowed_node_types, seed))
-    instances = inject_semantic_topology_decoys(instances, scenario, seed, allowed_node_types)
+    semantic_matrix = SemanticLinkMatrix.from_config(run_config, METHOD_ROOT, WORKSPACE_ROOT)
+    instances = _materialized_service_instances(run_config, scenario, allowed_node_types, seed, semantic_matrix)
+    instances = inject_semantic_topology_decoys(instances, scenario, seed, allowed_node_types, semantic_matrix)
     forced_service_node_id = scenario.get("forced_service_node_id") or scenario.get("force_service_node_id")
     if forced_service_node_id:
         forced_service_node_id = str(forced_service_node_id)
@@ -326,6 +443,12 @@ def _materialize_offline_config(
         exchange_cfg["top_k_per_agent"] = int(scenario["exchange_top_k"])
     run_config["semantic_exchange"] = exchange_cfg
     run_config["service_chains"] = _scenario_chains(run_config, scenario, role_name, seed)
+    _assign_v21_request_types(run_config["service_chains"], semantic_matrix)
+    semantic_output_root = Path(
+        str(dict(run_config.get("semantic_profiles", {}) or {}).get("output_root", DEFAULT_V21_OUTPUT_ROOT))
+    )
+    semantic_matrix.export_artifacts(semantic_output_root, materialized_instances=instances, encoder_config=exchange_cfg)
+    run_config["_semantic_matrix"] = semantic_matrix
     return run_config
 
 
@@ -363,57 +486,99 @@ def _materialized_service_instances(
     scenario: Mapping[str, Any],
     allowed_node_types: set[str],
     seed: int,
+    semantic_matrix: SemanticLinkMatrix,
 ) -> List[Dict[str, Any]]:
-    service_specs = _service_specs(config)
     service_nodes = dict(scenario.get("service_nodes", {}) or {})
     load_multiplier = _load_multiplier(scenario)
     supply_ratio = float(scenario.get("service_supply_ratio", 1.0) or 1.0)
     rng = random.Random(int(seed))
     generated: List[Dict[str, Any]] = []
-    for node_type, max_nodes in (("vehicle", PHYSICAL_VEHICLE_COUNT), ("uav", PHYSICAL_UAV_COUNT), ("rsu", PHYSICAL_RSU_COUNT)):
+    service_types = semantic_matrix.list_service_types()
+    for node_type, max_nodes in (
+        ("vehicle", PHYSICAL_VEHICLE_COUNT),
+        ("uav", PHYSICAL_UAV_COUNT),
+        ("rsu", PHYSICAL_RSU_COUNT),
+        ("cloud_server", 1),
+    ):
         if node_type not in allowed_node_types:
             continue
-        requested = int(service_nodes.get(node_type, 0) or 0)
+        requested = int(service_nodes.get(node_type, 1 if node_type == "cloud_server" else 0) or 0)
         node_count = min(max_nodes, max(0, int(round(requested * supply_ratio))))
         for node_index in range(node_count):
             node_id = _materialized_node_id(node_type, node_index)
             region_id = f"RSU_{node_index % PHYSICAL_RSU_COUNT}" if node_type != "rsu" else node_id
-            for spec_index, spec in enumerate(service_specs):
-                capacity = _materialized_capacity(node_type)
-                used_cpu = min(capacity["cpu"] * 0.9, (0.25 + 0.08 * ((node_index + spec_index) % 3)) * capacity["cpu"] * load_multiplier)
-                generated.append(
-                    {
-                        "instance_id": f"{node_id.lower()}_{spec['service_id']}_{seed}_{spec_index}",
-                        "service_id": spec["service_id"],
-                        "node_id": node_id,
-                        "node_type": node_type,
-                        "region_id": region_id,
-                        "capabilities": list(spec["required_capabilities"]),
-                        "input_semantic": spec["input_semantic"],
-                        "output_semantic": spec["output_semantic"],
-                        "capacity": capacity,
-                        "used": {
-                            "cpu": used_cpu,
-                            "memory": min(capacity["memory"] * 0.75, float(spec["memory_mb"]) * load_multiplier),
-                            "storage": min(capacity["storage"] * 0.5, float(spec["storage_mb"]) * load_multiplier),
-                        },
-                        "max_concurrency": _materialized_concurrency(node_type),
-                        "current_load": int(rng.random() < min(0.75, max(0.0, load_multiplier - 1.0) * 0.35)),
-                        "reliability_score": _materialized_quality(node_type, 0.90, 0.985),
-                        "accuracy_score": _materialized_quality(node_type, 0.88, 0.98),
-                        "trust_score": _materialized_quality(node_type, 0.88, 0.99),
-                        "cold_start_s": _materialized_cold_start(node_type, spec_index),
-                        "metadata": {
-                            "scenario_materialized": True,
-                            "scenario": scenario.get("name", "default"),
-                            "role_control": "service_supply",
-                            "load_ratio_override": 0.20 if node_type in {"vehicle", "uav"} else 0.05,
-                            "topology_risk": 0.30 if node_type in {"vehicle", "uav"} else 0.08,
-                            "mobility_risk": 0.35 if node_type in {"vehicle", "uav"} else 0.05,
-                        },
-                    }
-                )
+            if node_type == "cloud_server":
+                region_id = "cloud"
+            for spec_index, service_type in enumerate(service_types):
+                implementations = semantic_matrix.list_implementations_for(service_type, compatible_node_type=node_type)
+                if not implementations:
+                    continue
+                rng.shuffle(implementations)
+                instance_count = _instance_count_per_node(node_type, len(implementations))
+                for replica_index, implementation in enumerate(implementations[:instance_count]):
+                    metadata = semantic_matrix.candidate_metadata_from_implementation(implementation)
+                    profile = dict(implementation.raw)
+                    resource_profile = dict(profile.get("resource_profile", {}) or {})
+                    performance = dict(profile.get("performance_profile", {}) or {})
+                    capacity = _materialized_capacity(node_type)
+                    min_cpu = max(0.1, float(resource_profile.get("min_compute_cpu", 1.0) or 1.0))
+                    min_memory = max(128.0, float(resource_profile.get("min_memory_mb", 512.0) or 512.0))
+                    min_storage = max(128.0, float(resource_profile.get("min_storage_mb", 256.0) or 256.0))
+                    used_cpu = min(capacity["cpu"] * 0.9, (0.10 + 0.04 * ((node_index + spec_index + replica_index) % 5)) * capacity["cpu"] * load_multiplier)
+                    input_semantic = implementation.input_semantic_label
+                    output_semantic = implementation.output_semantic_label
+                    generated.append(
+                        {
+                            "instance_id": (
+                                f"{node_id.lower()}_{implementation.implementation_id}_{seed}_{spec_index}_{replica_index}"
+                            ),
+                            "service_id": implementation.service_type,
+                            "node_id": node_id,
+                            "node_type": node_type,
+                            "region_id": region_id,
+                            "capabilities": list(dict.fromkeys([implementation.service_type, *profile.get("capabilities", [])])),
+                            "input_semantic": input_semantic,
+                            "output_semantic": output_semantic,
+                            "capacity": capacity,
+                            "used": {
+                                "cpu": max(min_cpu * 0.20, used_cpu),
+                                "memory": min(capacity["memory"] * 0.80, min_memory * load_multiplier),
+                                "storage": min(capacity["storage"] * 0.60, min_storage * load_multiplier),
+                            },
+                            "max_concurrency": _materialized_concurrency(node_type),
+                            "current_load": int(rng.random() < min(0.75, max(0.0, load_multiplier - 1.0) * 0.35)),
+                            "reliability_score": _profile_quality(performance, "typical_reliability", node_type, 0.92, 0.99),
+                            "accuracy_score": _profile_quality(performance, "typical_accuracy_f1", node_type, 0.86, 0.98),
+                            "trust_score": _materialized_quality(node_type, 0.88, 0.99),
+                            "cold_start_s": _materialized_cold_start(node_type, spec_index + replica_index),
+                            "metadata": {
+                                **metadata,
+                                "scenario_materialized": True,
+                                "scenario": scenario.get("name", "default"),
+                                "role_control": "v21_semantic_profile",
+                                "load_ratio_override": 0.20 if node_type in {"vehicle", "uav"} else 0.05,
+                                "topology_risk": 0.30 if node_type in {"vehicle", "uav"} else 0.08,
+                                "mobility_risk": 0.35 if node_type in {"vehicle", "uav"} else 0.05,
+                            },
+                        }
+                    )
     return generated
+
+
+def _instance_count_per_node(node_type: str, available: int) -> int:
+    target = 1
+    if node_type == "rsu":
+        target = 2
+    elif node_type == "cloud_server":
+        target = 3
+    return max(1, min(int(available), target))
+
+
+def _profile_quality(performance: Mapping[str, Any], key: str, node_type: str, low: float, high: float) -> float:
+    value = performance.get(key)
+    if value is not None:
+        return max(0.0, min(1.0, float(value)))
+    return _materialized_quality(node_type, low, high)
 
 
 def _scenario_chains(
@@ -485,6 +650,72 @@ def _scenario_with_default_task_classes(config: Mapping[str, Any], scenario: Map
     if "task_classes" not in scenario_cfg and "task_classes" in experiment_cfg:
         scenario_cfg["task_classes"] = copy.deepcopy(experiment_cfg["task_classes"])
     return scenario_cfg
+
+
+def _assign_v21_request_types(chains: Sequence[Dict[str, Any]], semantic_matrix: SemanticLinkMatrix) -> None:
+    request_cycle = [name for name in ("forest_fire_monitoring", "traffic_surveillance", "urban_security", "industrial_inspection") if name in semantic_matrix.request_types]
+    if not request_cycle:
+        request_cycle = sorted(semantic_matrix.request_types)
+    if not request_cycle:
+        raise ValueError("V21 semantic assignment requires at least one request_type in request_types.yaml")
+    for index, chain in enumerate(chains):
+        context = dict(chain.get("context", {}) or {})
+        chain_id = str(chain.get("sfc_id", f"chain_{index}"))
+        if not context.get("request_type"):
+            context["request_type"] = request_cycle[index % len(request_cycle)]
+            LOGGER.warning(
+                "V21 chain %s missing request_type; assigned %s from deterministic request cycle.",
+                chain_id,
+                context["request_type"],
+            )
+        chain["context"] = context
+        request_type = str(context["request_type"])
+        sequence = _representative_service_sequence(request_type, semantic_matrix)
+        nodes = list(chain.get("nodes", []) or [])
+        if len(nodes) > len(sequence):
+            LOGGER.warning(
+                "V21 request_type %s has %d representative services but chain %s has %d nodes; "
+                "terminal service %s is repeated for excess structural slots.",
+                request_type,
+                len(sequence),
+                chain_id,
+                len(nodes),
+                sequence[-1],
+            )
+        for node_index, node in enumerate(nodes):
+            service_type = sequence[node_index] if node_index < len(sequence) else sequence[-1]
+            previous_service_type = str(node.get("service_type", "") or "")
+            if previous_service_type and previous_service_type != service_type:
+                warning_key = (request_type, node_index, previous_service_type, service_type)
+                if warning_key not in _LOGGED_V21_CHAIN_OVERWRITES:
+                    _LOGGED_V21_CHAIN_OVERWRITES.add(warning_key)
+                    LOGGER.warning(
+                        "V21 request_type %s overwrites structural chain node %d service_type %s -> %s. "
+                        "This is intentional: request_types.yaml is the semantic source of truth.",
+                        request_type,
+                        node_index,
+                        previous_service_type,
+                        service_type,
+                    )
+            node["service_type"] = service_type
+            node["required_capabilities"] = [service_type]
+            input_semantic, output_semantic = SERVICE_IO_DEFAULTS.get(service_type, ("any", "any"))
+            node["input_semantic"] = input_semantic
+            node["output_semantic"] = output_semantic
+
+
+def _representative_service_sequence(request_type: str, semantic_matrix: SemanticLinkMatrix) -> list[str]:
+    request = dict(semantic_matrix.request_types.get(str(request_type), {}) or {})
+    raw_sequence = request.get("representative_service_chain", request.get("service_sequence", [])) or []
+    sequence = [str(item) for item in raw_sequence if str(item) in semantic_matrix.service_type_to_idx]
+    if not sequence:
+        raise ValueError(f"V21 request_type {request_type!r} has no valid representative_service_chain entries")
+    return sequence
+
+
+def _service_type_for_request_position(request_type: str, position: int, semantic_matrix: SemanticLinkMatrix) -> str:
+    sequence = _representative_service_sequence(request_type, semantic_matrix)
+    return sequence[min(max(0, int(position)), len(sequence) - 1)]
 
 
 def _select_task_class(
@@ -615,8 +846,8 @@ def _apply_sfc_length_override(chain: Dict[str, Any], target_length: int) -> Non
         nodes.append(
             {
                 "node_id": node_id,
-                "service_type": "event_archive",
-                "required_capabilities": ["event_archive"],
+                "service_type": "surveillance_event_archive",
+                "required_capabilities": ["surveillance_event_archive"],
                 "input_semantic": input_semantic,
                 "output_semantic": output_semantic,
                 "cpu_mb": 4.0,
@@ -657,8 +888,9 @@ def inject_semantic_topology_decoys(
     scenario: Mapping[str, Any],
     seed: int,
     allowed_node_types: set[str],
+    semantic_matrix: SemanticLinkMatrix,
 ) -> List[Dict[str, Any]]:
-    """Inject controlled semantic/topology conflicts for stress calibration."""
+    """Inject V21 truth-driven semantic/topology conflicts without score bias."""
 
     decoy_cfg = dict(scenario.get("candidate_decoys", {}) or {})
     if not decoy_cfg.get("enabled"):
@@ -671,18 +903,25 @@ def inject_semantic_topology_decoys(
         service_templates.setdefault(str(item.get("service_id")), item)
 
     decoy_specs = [
-        ("semantic_high_topology_bad", int(decoy_cfg.get("semantic_high_topology_bad", 0) or 0)),
-        ("semantic_medium_topology_good", int(decoy_cfg.get("semantic_medium_topology_good", 0) or 0)),
-        ("semantic_low_topology_good", int(decoy_cfg.get("semantic_low_topology_good", 0) or 0)),
-        ("stale_remote_candidates", int(decoy_cfg.get("stale_remote_candidates", 0) or 0)),
+        ("hard_negative_mismatch", "mismatch", int(decoy_cfg.get("hard_negative_mismatch", decoy_cfg.get("semantic_low_topology_good", 0)) or 0)),
+        ("borderline_weak", "weak", int(decoy_cfg.get("borderline_weak", decoy_cfg.get("semantic_medium_topology_good", 0)) or 0)),
+        ("remote_exact", "exact", int(decoy_cfg.get("remote_exact", decoy_cfg.get("semantic_high_topology_bad", 0)) or 0)),
+        ("remote_compatible", "compatible", int(decoy_cfg.get("remote_compatible", 0) or 0)),
+        ("stale_clone_exact", "exact", int(decoy_cfg.get("stale_clone_exact", decoy_cfg.get("stale_remote_candidates", 0)) or 0)),
     ]
     for service_id, template in sorted(service_templates.items()):
-        for decoy_kind, count in decoy_specs:
+        for decoy_kind, variant_type, count in decoy_specs:
+            implementations = [
+                item for item in semantic_matrix.list_implementations_for(service_id) if item.variant_type == variant_type
+            ]
+            if not implementations:
+                continue
             for index in range(max(0, count)):
+                implementation = implementations[index % len(implementations)]
                 node_type = _decoy_node_type(decoy_kind, allowed_node_types, index)
                 node_id = _materialized_node_id(node_type, index + seed)
                 region_id = _decoy_region_id(node_type, index, decoy_kind)
-                profile = _decoy_profile(decoy_kind, node_type, rng)
+                profile = _truth_driven_decoy_profile(decoy_kind, node_type, rng)
                 item = copy.deepcopy(template)
                 item.update(
                     {
@@ -698,20 +937,21 @@ def inject_semantic_topology_decoys(
                         "accuracy_score": profile["accuracy_score"],
                         "trust_score": profile["trust_score"],
                         "cold_start_s": profile["cold_start_s"],
+                        "input_semantic": implementation.input_semantic_label,
+                        "output_semantic": implementation.output_semantic_label,
                     }
                 )
-                metadata = dict(item.get("metadata", {}) or {})
+                metadata = semantic_matrix.candidate_metadata_from_implementation(implementation)
                 metadata.update(
                     {
                         "is_decoy": True,
                         "semantic_group": decoy_kind,
-                        "semantic_score_bias": profile["semantic_score_bias"],
                         "load_ratio_override": profile["load_ratio_override"],
                         "topology_risk": profile["topology_risk"],
                         "mobility_risk": profile["mobility_risk"],
                         "stale_latency_penalty_s": float(
                             dict(scenario.get("stale_candidate_injection", {}) or {}).get("stale_latency_penalty_s", 0.0)
-                            if decoy_kind == "stale_remote_candidates"
+                            if decoy_kind == "stale_clone_exact"
                             else 0.0
                         ),
                         "description": _decoy_description(service_id, decoy_kind),
@@ -762,6 +1002,8 @@ def _apply_local_catalog_visibility(
 
 
 def _service_specs(config: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """Return only SFC service templates; V21 semantics come from YAML profiles."""
+
     specs: Dict[str, Dict[str, Any]] = {}
     for chain in config.get("service_chains", []) or []:
         for node in chain.get("nodes", []) or []:
@@ -771,8 +1013,6 @@ def _service_specs(config: Mapping[str, Any]) -> List[Dict[str, Any]]:
                 {
                     "service_id": service_id,
                     "required_capabilities": list(node.get("required_capabilities", []) or []),
-                    "input_semantic": str(node.get("input_semantic", "any")),
-                    "output_semantic": str(node.get("output_semantic", "any")),
                     "memory_mb": float(node.get("memory_mb", 512.0) or 512.0),
                     "storage_mb": float(node.get("storage_mb", 256.0) or 256.0),
                 },
@@ -782,16 +1022,16 @@ def _service_specs(config: Mapping[str, Any]) -> List[Dict[str, Any]]:
 
 def _decoy_node_type(decoy_kind: str, allowed_node_types: set[str], index: int) -> str:
     mobile_order = ["uav", "vehicle"]
-    if decoy_kind in {"semantic_high_topology_bad", "stale_remote_candidates"}:
+    if decoy_kind in {"remote_exact", "remote_compatible", "stale_clone_exact"}:
         for node_type in mobile_order:
             if node_type in allowed_node_types:
                 return node_type
-    if decoy_kind == "semantic_medium_topology_good":
+    if decoy_kind == "borderline_weak":
         if "rsu" in allowed_node_types:
             return "rsu"
         if "cloud_server" in allowed_node_types:
             return "cloud_server"
-    if decoy_kind == "semantic_low_topology_good":
+    if decoy_kind == "hard_negative_mismatch":
         if index % 2 == 0 and "vehicle" in allowed_node_types:
             return "vehicle"
         if "rsu" in allowed_node_types:
@@ -807,14 +1047,14 @@ def _decoy_region_id(node_type: str, index: int, decoy_kind: str) -> str:
         return "cloud"
     if node_type == "rsu":
         return f"RSU_{index % PHYSICAL_RSU_COUNT}"
-    if decoy_kind in {"semantic_high_topology_bad", "stale_remote_candidates"}:
+    if decoy_kind in {"remote_exact", "remote_compatible", "stale_clone_exact", "hard_negative_mismatch"}:
         return f"RSU_{1 + (index % (PHYSICAL_RSU_COUNT - 1))}"
     return f"RSU_{index % PHYSICAL_RSU_COUNT}"
 
 
-def _decoy_profile(decoy_kind: str, node_type: str, rng: random.Random) -> Dict[str, Any]:
+def _truth_driven_decoy_profile(decoy_kind: str, node_type: str, rng: random.Random) -> Dict[str, Any]:
     capacity = _materialized_capacity(node_type)
-    if decoy_kind == "semantic_high_topology_bad":
+    if decoy_kind in {"remote_exact", "remote_compatible"}:
         return {
             "capacity": capacity,
             "used": {"cpu": capacity["cpu"] * 0.35, "memory": capacity["memory"] * 0.20, "storage": capacity["storage"] * 0.10},
@@ -824,12 +1064,11 @@ def _decoy_profile(decoy_kind: str, node_type: str, rng: random.Random) -> Dict[
             "accuracy_score": 0.97,
             "trust_score": 0.96,
             "cold_start_s": 0.55 + 0.10 * rng.random(),
-            "semantic_score_bias": 0.90,
             "load_ratio_override": 0.92,
             "topology_risk": 0.88,
             "mobility_risk": 0.75 if node_type in {"uav", "vehicle"} else 0.25,
         }
-    if decoy_kind == "semantic_medium_topology_good":
+    if decoy_kind == "borderline_weak":
         return {
             "capacity": capacity,
             "used": {"cpu": capacity["cpu"] * 0.05, "memory": capacity["memory"] * 0.05, "storage": capacity["storage"] * 0.05},
@@ -839,12 +1078,11 @@ def _decoy_profile(decoy_kind: str, node_type: str, rng: random.Random) -> Dict[
             "accuracy_score": 0.94,
             "trust_score": 0.98,
             "cold_start_s": 0.08 + 0.03 * rng.random(),
-            "semantic_score_bias": 0.40,
             "load_ratio_override": 0.05,
             "topology_risk": 0.08,
             "mobility_risk": 0.05,
         }
-    if decoy_kind == "semantic_low_topology_good":
+    if decoy_kind == "hard_negative_mismatch":
         return {
             "capacity": capacity,
             "used": {"cpu": capacity["cpu"] * 0.04, "memory": capacity["memory"] * 0.05, "storage": capacity["storage"] * 0.05},
@@ -854,7 +1092,6 @@ def _decoy_profile(decoy_kind: str, node_type: str, rng: random.Random) -> Dict[
             "accuracy_score": 0.90,
             "trust_score": 0.97,
             "cold_start_s": 0.05 + 0.02 * rng.random(),
-            "semantic_score_bias": -0.20,
             "load_ratio_override": 0.02,
             "topology_risk": 0.05,
             "mobility_risk": 0.05 if node_type == "rsu" else 0.20,
@@ -866,24 +1103,25 @@ def _decoy_profile(decoy_kind: str, node_type: str, rng: random.Random) -> Dict[
         "current_load": 1,
         "reliability_score": 0.92,
         "accuracy_score": 0.95,
-            "trust_score": 0.94,
-            "cold_start_s": 0.45 + 0.10 * rng.random(),
-            "semantic_score_bias": 0.70,
-            "load_ratio_override": 0.65,
-            "topology_risk": 0.70,
+        "trust_score": 0.94,
+        "cold_start_s": 0.45 + 0.10 * rng.random(),
+        "load_ratio_override": 0.65,
+        "topology_risk": 0.70,
         "mobility_risk": 0.70 if node_type in {"uav", "vehicle"} else 0.20,
     }
 
 
 def _decoy_description(service_id: str, decoy_kind: str) -> str:
     service_text = str(service_id).replace("_", " ")
-    if decoy_kind == "semantic_high_topology_bad":
-        return f"high semantic match for {service_text} with specialized model but congested mobile topology"
-    if decoy_kind == "semantic_medium_topology_good":
-        return f"balanced {service_text} service with stable nearby topology and moderate semantic specificity"
-    if decoy_kind == "semantic_low_topology_good":
-        return f"generic nearby compute service for {service_text} with weak semantic specialization"
-    return f"stale remote advertisement for {service_text} with formerly high semantic relevance"
+    if decoy_kind == "remote_exact":
+        return f"remote exact implementation for {service_text} with strong semantic fit but expensive route conditions"
+    if decoy_kind == "remote_compatible":
+        return f"remote compatible implementation for {service_text} that can complete the chain when local profiles are weak"
+    if decoy_kind == "borderline_weak":
+        return f"nearby weak implementation for {service_text} with stable topology and partial semantic coverage"
+    if decoy_kind == "hard_negative_mismatch":
+        return f"nearby mismatched implementation for {service_text} with attractive resources but wrong business semantics"
+    return f"stale remote exact clone for {service_text} whose advertisement can survive long TTL settings"
 
 
 def _load_multiplier(scenario: Mapping[str, Any]) -> float:

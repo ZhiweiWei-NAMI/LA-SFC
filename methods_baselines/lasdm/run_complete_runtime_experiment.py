@@ -26,7 +26,7 @@ from airfogsim.lasdm.baselines import baseline_names
 from airfogsim.lasdm.benchmark_adapter import run_lasdm_benchmark_suite
 from airfogsim.lasdm.env_adapter import LASDMEnvAdapter
 from airfogsim.lasdm.graph_observation import flatten_observation
-from airfogsim.lasdm.marl_policy import IPPOPolicy, MASACPolicy, policy_from_name
+from airfogsim.lasdm.marl_policy import IPPOPolicy, MASACPolicy, _action_instance_id, policy_from_name
 from airfogsim.lasdm.marl_trainer import (
     ReplayBuffer,
     SACTransition,
@@ -53,6 +53,9 @@ from train_semantic_topology_marl import build_offline_env, _load_yaml
 
 DEFAULT_LASDM_CONFIG = os.path.join(METHOD_ROOT, "configs", "lasdm_airfogsim.yaml")
 DEFAULT_OUTPUT_ROOT = os.path.join(WORKSPACE_ROOT, "experiment_artifacts", "raw_data", "complete_runtime_scheduler")
+DEFAULT_RUNTIME_SEMANTIC_BASELINES = [
+    item for item in DEFAULT_BASELINES if item not in {"mappo_ctde", "iql_offline"}
+]
 
 SUMMARY_FIELDS = [
     "family",
@@ -131,7 +134,7 @@ def main() -> None:
     parser.add_argument("--semantic-repair-config", default=None)
     parser.add_argument("--output-root", default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--lasdm-baselines", nargs="+", default=sorted(baseline_names()))
-    parser.add_argument("--semantic-baselines", nargs="+", default=DEFAULT_BASELINES)
+    parser.add_argument("--semantic-baselines", nargs="+", default=DEFAULT_RUNTIME_SEMANTIC_BASELINES)
     parser.add_argument("--semantic-service-role-sweeps", nargs="+", default=["full_hybrid"])
     parser.add_argument("--train-seeds", nargs="+", type=int, default=None)
     parser.add_argument("--eval-seeds", nargs="+", type=int, default=None)
@@ -423,6 +426,9 @@ def train_semantic_ippo_runtime(
             role = roles[episode % len(roles)]
             env, air_env = _build_semantic_runtime_env(config, scenario, role, seed, baseline, max_steps)
             try:
+                if policy is not None and getattr(policy, "semantic_scorer", None) is not None:
+                    env.config = replace(env.config, semantic_scorer=policy.semantic_scorer)
+                    env.rebuild_config_dependent_components()
                 observations = env.reset()
                 wrote_episode_traces = False
                 episode_summary: Dict[str, Any] = {}
@@ -441,6 +447,7 @@ def train_semantic_ippo_runtime(
                         alpha_min=sac_alpha_min,
                         alpha_max=sac_alpha_max,
                         tau=sac_tau,
+                        semantic_scorer=env.config.semantic_scorer,
                     )
                 total = 0.0
                 bc_steps = bc_pretrain_steps if pretrain_episode else bc_finetune_steps
@@ -942,7 +949,14 @@ def _run_semantic_runtime_single(
     try:
         env, air_env = _build_semantic_runtime_env(config, scenario, role, seed, baseline, max_steps)
         observations = env.reset()
-        policy = _semantic_policy_for_eval(config, baseline, seed, observations, checkpoint_root)
+        policy = _semantic_policy_for_eval(
+            config,
+            baseline,
+            seed,
+            observations,
+            checkpoint_root,
+            semantic_scorer=env.config.semantic_scorer,
+        )
         policy_metadata = {
             "policy_name": type(policy).__name__,
             "policy_source": str(getattr(policy, "policy_source", "")),
@@ -1035,6 +1049,7 @@ def _semantic_policy_for_eval(
     seed: int,
     observations: Mapping[str, Mapping[str, Any]],
     checkpoint_root: Path,
+    semantic_scorer: Any = None,
 ) -> Any:
     if is_ippo_checkpoint_baseline(baseline):
         policy_config = _config_with_baseline_updates(config, baseline)
@@ -1102,6 +1117,7 @@ def _semantic_policy_for_eval(
             alpha_min=float(marl_cfg.get("masac_alpha_min", 0.005) or 0.005),
             alpha_max=float(marl_cfg.get("masac_alpha_max", 0.25) or 0.25),
             tau=float(marl_cfg.get("masac_tau", 0.005) or 0.005),
+            semantic_scorer=semantic_scorer,
         )
         strict = _checkpoint_has_critic_body(actor_state)
         policy.load_sac_state_dict(state, strict=strict)
@@ -1281,7 +1297,7 @@ def _ippo_bc_quality_metrics(
                     sfc_node_id = str(contextual.get("sfc_node_id", ""))
                     target_id = None
                     if isinstance(agent_payload.get(sfc_id), Mapping):
-                        target_id = agent_payload.get(sfc_id, {}).get(sfc_node_id)
+                        target_id = _action_instance_id(agent_payload.get(sfc_id, {}).get(sfc_node_id))
                     if not target_id or str(target_id) not in ids[:mask_len]:
                         continue
                     base_logits = None if logits is None else logits[0, :mask_len]

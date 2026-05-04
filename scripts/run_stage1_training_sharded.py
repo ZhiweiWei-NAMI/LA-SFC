@@ -40,6 +40,16 @@ def main() -> int:
     parser.add_argument("--poll-s", type=float, default=60.0)
     parser.add_argument("--episodes", type=int, default=None, help="Override configured training episodes.")
     parser.add_argument("--max-steps", type=int, default=None, help="Override configured max steps per episode.")
+    parser.add_argument(
+        "--cuda-devices",
+        default="",
+        help=(
+            "Comma-separated physical CUDA device ids for shard workers, or 'auto' to use idle GPUs. "
+            "When set, each shard gets one CUDA_VISIBLE_DEVICES value in round-robin order."
+        ),
+    )
+    parser.add_argument("--idle-gpu-max-used-mib", type=int, default=2048)
+    parser.add_argument("--idle-gpu-max-util", type=int, default=10)
     args = parser.parse_args()
 
     root = Path(args.root)
@@ -54,6 +64,13 @@ def main() -> int:
 
     all_processes: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
+    cuda_devices = select_cuda_devices(
+        str(args.cuda_devices or ""),
+        max_used_mib=int(args.idle_gpu_max_used_mib),
+        max_util=int(args.idle_gpu_max_util),
+    )
+    if cuda_devices:
+        print("using CUDA devices for stage1 shards: " + ", ".join(cuda_devices), flush=True)
     variant_concurrency = max(1, int(args.variant_concurrency or 1))
     for batch_start in range(0, len(args.variants), variant_concurrency):
         variant_batch = list(args.variants[batch_start : batch_start + variant_concurrency])
@@ -76,11 +93,30 @@ def main() -> int:
         seed_concurrency = max(1, int(args.seed_concurrency or 1))
         for pending_start in range(0, len(pending), seed_concurrency):
             pending_chunk = pending[pending_start : pending_start + seed_concurrency]
-            processes = [start_shard(seed, variant, root, log_dir, args.episodes, args.max_steps) for variant, seed in pending_chunk]
+            processes = [
+                start_shard(
+                    seed,
+                    variant,
+                    root,
+                    log_dir,
+                    args.episodes,
+                    args.max_steps,
+                    cuda_devices[index % len(cuda_devices)] if cuda_devices else None,
+                )
+                for index, (variant, seed) in enumerate(pending_chunk)
+            ]
             all_processes.extend(processes)
             (root / "stage1_training_pids.json").write_text(
                 json.dumps(
-                    [{"seed": item["seed"], "variant": item["variant"], "pid": item["proc"].pid} for item in all_processes],
+                    [
+                        {
+                            "seed": item["seed"],
+                            "variant": item["variant"],
+                            "pid": item["proc"].pid,
+                            "cuda_device": item.get("cuda_device", ""),
+                        }
+                        for item in all_processes
+                    ],
                     indent=2,
                     ensure_ascii=False,
                 ),
@@ -146,6 +182,7 @@ def start_shard(
     log_dir: Path,
     episodes: int | None,
     max_steps: int | None,
+    cuda_device: str | None = None,
 ) -> dict[str, Any]:
     log = (log_dir / f"stage1_{variant}_seed_{seed}.log").open("w", encoding="utf-8")
     env = os.environ.copy()
@@ -155,6 +192,8 @@ def start_shard(
     env.setdefault("NUMEXPR_NUM_THREADS", "1")
     env.setdefault("VECLIB_MAXIMUM_THREADS", "1")
     env.setdefault("TOKENIZERS_PARALLELISM", "false")
+    if cuda_device:
+        env["CUDA_VISIBLE_DEVICES"] = str(cuda_device)
     cmd = [
         sys.executable,
         "-u",
@@ -168,7 +207,49 @@ def start_shard(
     ]
     proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env)
     variant_root = root / "semantic_runtime_train" if variant == "proposed_semantic_topology_marl" else root / "semantic_runtime_train" / variant
-    return {"seed": seed, "variant": variant, "proc": proc, "log": log, "out": variant_root / f"ippo_seed_{seed}"}
+    return {
+        "seed": seed,
+        "variant": variant,
+        "proc": proc,
+        "log": log,
+        "out": variant_root / f"ippo_seed_{seed}",
+        "cuda_device": str(cuda_device or ""),
+    }
+
+
+def select_cuda_devices(spec: str, *, max_used_mib: int, max_util: int) -> list[str]:
+    value = str(spec or "").strip()
+    if not value:
+        return []
+    if value.lower() != "auto":
+        return [item.strip() for item in value.split(",") if item.strip()]
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,memory.used,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return []
+    devices: list[str] = []
+    for line in result.stdout.splitlines():
+        parts = [item.strip() for item in line.split(",")]
+        if len(parts) < 3:
+            continue
+        try:
+            index = parts[0]
+            used_mib = int(float(parts[1]))
+            util = int(float(parts[2]))
+        except ValueError:
+            continue
+        if used_mib <= max(0, int(max_used_mib)) and util <= max(0, int(max_util)):
+            devices.append(index)
+    return devices
 
 
 def shard_completed(seed: int, variant: str, root: Path) -> bool:
@@ -246,7 +327,7 @@ result = train_semantic_ippo_variants_runtime(
     [seed],
     scenarios,
     ["full_hybrid"],
-    int(episodes_override or cfg.get("training", {}).get("episodes", 200)),
+    int(episodes_override or cfg.get("training", {}).get("episodes", 100)),
     int(max_steps_override or cfg.get("training", {}).get("max_steps", 100)),
 )
 (root / "logs" / f"stage1_{variant}_seed_{seed}_result.json").write_text(

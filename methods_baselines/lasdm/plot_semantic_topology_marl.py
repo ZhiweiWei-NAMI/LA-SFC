@@ -17,8 +17,11 @@ import pandas as pd
 METHOD_LABELS = {
     "intra_region_only": "Intra-Region Only",
     "cross_region_auction": "Cross-Region Auction",
-    "semantic_greedy_no_exchange": "Semantic Greedy\nNo Exchange",
-    "semantic_greedy_with_exchange": "Utility Prior\n+ Exchange",
+    "pure_semantic_greedy_no_exchange": "Semantic-Only Greedy\n(No Exchange)",
+    "local_semantic_runtime_greedy": "Local Semantic\n+ Runtime Greedy",
+    "nsga2_semantic_qos": "NSGA-II\nSemantic-QoS",
+    "mappo_ctde": "MAPPO-CTDE",
+    "iql_offline": "IQL\n(Offline)",
     "utility_prior_with_exchange": "Utility Prior\n+ Exchange",
     "topology_greedy": "Topology Greedy\n+ Exchange",
     "marl_no_semantic": "MARL-noSem",
@@ -31,7 +34,11 @@ METHOD_LABELS = {
 METHOD_ORDER = [
     "intra_region_only",
     "cross_region_auction",
-    "semantic_greedy_no_exchange",
+    "pure_semantic_greedy_no_exchange",
+    "local_semantic_runtime_greedy",
+    "nsga2_semantic_qos",
+    "mappo_ctde",
+    "iql_offline",
     "utility_prior_with_exchange",
     "topology_greedy",
     "marl_no_semantic",
@@ -59,8 +66,11 @@ SCENARIO_ORDER = [
 OKABE_ITO = {
     "intra_region_only": "#E69F00",
     "cross_region_auction": "#D55E00",
-    "semantic_greedy_no_exchange": "#E69F00",
-    "semantic_greedy_with_exchange": "#D55E00",
+    "pure_semantic_greedy_no_exchange": "#e377c2",
+    "local_semantic_runtime_greedy": "#bcbd22",
+    "nsga2_semantic_qos": "#17becf",
+    "mappo_ctde": "#e41a1c",
+    "iql_offline": "#4daf4a",
     "utility_prior_with_exchange": "#CC79A7",
     "topology_greedy": "#0072B2",
     "marl_no_semantic": "#999999",
@@ -73,8 +83,11 @@ OKABE_ITO = {
 METHOD_MARKERS = {
     "intra_region_only": "o",
     "cross_region_auction": "s",
-    "semantic_greedy_no_exchange": "o",
-    "semantic_greedy_with_exchange": "s",
+    "pure_semantic_greedy_no_exchange": "p",
+    "local_semantic_runtime_greedy": "h",
+    "nsga2_semantic_qos": "D",
+    "mappo_ctde": "x",
+    "iql_offline": "+",
     "utility_prior_with_exchange": "D",
     "topology_greedy": "^",
     "marl_no_semantic": "v",
@@ -95,7 +108,11 @@ SCENARIO_MARKERS = {
 PAPER_METHOD_ORDER = [
     "intra_region_only",
     "cross_region_auction",
-    "semantic_greedy_no_exchange",
+    "pure_semantic_greedy_no_exchange",
+    "local_semantic_runtime_greedy",
+    "nsga2_semantic_qos",
+    "mappo_ctde",
+    "iql_offline",
     "utility_prior_with_exchange",
     "topology_greedy",
     "marl_semantic_no_topology",
@@ -270,7 +287,6 @@ def normalize_summary(df: pd.DataFrame) -> pd.DataFrame:
     missing = sorted(required - set(df.columns))
     if missing:
         raise ValueError(f"Summary table missing required columns: {missing}")
-    df["baseline"] = df["baseline"].replace({"semantic_greedy_with_exchange": "utility_prior_with_exchange"})
     for col in [
         "submitted",
         "succeeded",
@@ -492,7 +508,7 @@ def plot_semantic_similarity_distribution(raw_root: Optional[Path]) -> plt.Figur
         return notice_figure("Semantic similarity distribution unavailable", ["Top semantic scores are empty or non-numeric."])
     df["method"] = df["__path"].map(method_from_path)
     fig, ax = plt.subplots(figsize=(6.8, 4.2))
-    selected = ["semantic_greedy_no_exchange", "utility_prior_with_exchange", "proposed_semantic_topology_marl", "centralized_planner"]
+    selected = ["pure_semantic_greedy_no_exchange", "local_semantic_runtime_greedy", "utility_prior_with_exchange", "proposed_semantic_topology_marl", "centralized_planner"]
     for method in selected:
         values = df.loc[df["method"].eq(method), score_col].dropna().to_numpy()
         if len(values):
@@ -1009,7 +1025,11 @@ def method_color(method: str) -> str:
 def method_linestyle(method: str) -> str:
     if method in {"centralized_planner", "centralized_oracle"}:
         return "--"
-    if method in {"semantic_greedy_with_exchange", "utility_prior_with_exchange", "marl_semantic_no_topology"}:
+    if method in {"pure_semantic_greedy_no_exchange", "local_semantic_runtime_greedy"}:
+        return "--"
+    if method == "nsga2_semantic_qos":
+        return "-."
+    if method in {"mappo_ctde", "iql_offline", "utility_prior_with_exchange", "marl_semantic_no_topology"}:
         return ":"
     return "-"
 

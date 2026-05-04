@@ -13,7 +13,11 @@ from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 BASELINES = [
     "intra_region_only",
     "cross_region_auction",
-    "semantic_greedy_no_exchange",
+    "pure_semantic_greedy_no_exchange",
+    "local_semantic_runtime_greedy",
+    "nsga2_semantic_qos",
+    "mappo_ctde",
+    "iql_offline",
     "utility_prior_with_exchange",
     "topology_greedy",
     "marl_no_semantic",
@@ -26,7 +30,9 @@ CENTRALIZED_PLANNER = "centralized_planner"
 ABLATIONS = [
     "intra_region_only",
     "cross_region_auction",
-    "semantic_greedy_no_exchange",
+    "pure_semantic_greedy_no_exchange",
+    "local_semantic_runtime_greedy",
+    "nsga2_semantic_qos",
     "utility_prior_with_exchange",
     "topology_greedy",
     "marl_no_semantic",
@@ -263,7 +269,15 @@ def proposed_better_two_metrics(grouped: Mapping[Tuple[str, str], Sequence[Mappi
     winning_metrics = set()
     for metric in metrics:
         direction = metric_direction(metric)
-        for baseline in ["semantic_greedy_with_exchange", "topology_greedy", "marl_semantic_no_topology", "marl_topology_no_semantic"]:
+        for baseline in [
+            "utility_prior_with_exchange",
+            "topology_greedy",
+            "nsga2_semantic_qos",
+            "mappo_ctde",
+            "iql_offline",
+            "marl_semantic_no_topology",
+            "marl_topology_no_semantic",
+        ]:
             proposed_values = []
             baseline_values = []
             for scenario in scenarios:
@@ -331,10 +345,10 @@ def semantic_exchange_improves(
     grouped: Mapping[Tuple[str, str], Sequence[Mapping[str, Any]]],
     candidate_rows: Sequence[Mapping[str, Any]],
 ) -> bool:
-    no_exchange_quality = selected_quality(candidate_rows, "semantic_greedy_no_exchange")
-    with_exchange_quality = selected_quality(candidate_rows, "semantic_greedy_with_exchange")
-    no_exchange_remote = mean_across(grouped, "semantic_greedy_no_exchange", "remote_candidate_ratio")
-    with_exchange_remote = mean_across(grouped, "semantic_greedy_with_exchange", "remote_candidate_ratio")
+    no_exchange_quality = selected_quality(candidate_rows, "pure_semantic_greedy_no_exchange")
+    with_exchange_quality = selected_quality(candidate_rows, "utility_prior_with_exchange")
+    no_exchange_remote = mean_across(grouped, "pure_semantic_greedy_no_exchange", "remote_candidate_ratio")
+    with_exchange_remote = mean_across(grouped, "utility_prior_with_exchange", "remote_candidate_ratio")
     return (with_exchange_remote or 0.0) > (no_exchange_remote or 0.0) or (
         with_exchange_quality is not None
         and no_exchange_quality is not None
@@ -552,8 +566,6 @@ def canonical_baseline(value: Any) -> str:
     baseline = str(value)
     if baseline == "centralized_oracle":
         return "centralized_planner"
-    if baseline == "semantic_greedy_with_exchange":
-        return "utility_prior_with_exchange"
     return baseline
 
 

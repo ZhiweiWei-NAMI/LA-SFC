@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from .distributed_catalog import CatalogCandidate, DistributedServiceCatalog
 from .semantic_encoder import sfc_node_text
 from .semantic_exchange import SemanticExchange
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -22,6 +25,8 @@ class DiscoveryRequest:
     min_similarity: float = -1.0
     allowed_node_types: Sequence[str] = field(default_factory=tuple)
     link_input_semantic: str = ""
+    request_type: str = ""
+    chain_position: int = 0
 
 
 @dataclass
@@ -105,6 +110,8 @@ class DistributedServiceDiscoveryProtocol:
             min_similarity=request.min_similarity,
             include_remote=include_remote,
             link_input_semantic=request.link_input_semantic or None,
+            request_type=request.request_type,
+            chain_position=request.chain_position,
         )
         record = DiscoveryTraceRecord(
             time_s=request.created_at_s,
@@ -135,6 +142,18 @@ class DistributedServiceDiscoveryProtocol:
         link_input_semantic: Optional[str] = None,
     ) -> List[CatalogCandidate]:
         sfc_node = chain.nodes[sfc_node_id]
+        chain_order = list(chain.topological_order())
+        context = dict(getattr(chain, "context", {}) or {})
+        request_type = str(context.get("request_type", "") or "")
+        if not request_type:
+            request_type = "forest_fire_monitoring"
+            LOGGER.warning(
+                "Discovery request for sfc=%s node=%s has no request_type; using %s. "
+                "V21 runtime configs should assign request_type before discovery.",
+                chain.sfc_id,
+                sfc_node_id,
+                request_type,
+            )
         request = DiscoveryRequest(
             request_id=f"{chain.sfc_id}:{sfc_node_id}:{now_s:.3f}:{agent_id}",
             agent_id=str(agent_id),
@@ -152,6 +171,8 @@ class DistributedServiceDiscoveryProtocol:
             created_at_s=float(now_s),
             top_k=int(top_k),
             min_similarity=float(min_similarity),
+            request_type=request_type,
+            chain_position=chain_order.index(sfc_node_id) if sfc_node_id in chain_order else 0,
         )
         return self.discover(request, include_remote=include_remote)
 
@@ -208,14 +229,6 @@ class DistributedServiceDiscoveryProtocol:
                     row["deadline_slack_s"] = _float(selected_metadata.get("deadline_slack_s"), _float(row.get("deadline_slack_s"), 0.0))
                     row["utility_prior"] = _float(selected_metadata.get("utility_prior"), _float(row.get("utility_prior"), 0.0))
                     row["link_similarity"] = _float(selected_metadata.get("link_similarity"), _float(row.get("link_similarity"), row.get("semantic_score", 0.0)))
-                    row["semantic_link_label_score"] = _float(
-                        selected_metadata.get("semantic_link_label_score"),
-                        _float(row.get("semantic_link_label_score"), 0.0),
-                    )
-                    row["semantic_link_relation"] = str(selected_metadata.get("semantic_link_relation", row.get("semantic_link_relation", "")) or "")
-                    row["semantic_link_matrix_cell"] = str(
-                        selected_metadata.get("semantic_link_matrix_cell", row.get("semantic_link_matrix_cell", "")) or ""
-                    )
                     row["semantic_cumulative_quality"] = _float(
                         selected_metadata.get("semantic_cumulative_quality_if_selected"),
                         _float(row.get("semantic_cumulative_quality"), row.get("semantic_score", 1.0)),
@@ -255,7 +268,8 @@ class DistributedServiceDiscoveryProtocol:
             "node_template_similarity",
             "semantic_quality_before",
             "semantic_cumulative_quality_if_selected",
-            "semantic_link_label_score",
+            "semantic_link_truth_score",
+            "semantic_link_truth_relation",
         }
         for candidate in candidates:
             metadata = dict(candidate.metadata or {})
@@ -291,10 +305,9 @@ class DistributedServiceDiscoveryProtocol:
                     row["node_template_similarity"] = _float(metadata.get("node_template_similarity"), 0.0)
                     row["semantic_quality_before"] = _float(metadata.get("semantic_quality_before"), 1.0)
                     row["semantic_cumulative_quality"] = _float(metadata.get("semantic_cumulative_quality_if_selected"), row["link_similarity"])
-                    row["semantic_link_label_score"] = _float(metadata.get("semantic_link_label_score"), 0.0)
-                    row["semantic_link_relation"] = str(metadata.get("semantic_link_relation", row.get("semantic_link_relation", "")) or "")
-                    row["semantic_link_matrix_cell"] = str(
-                        metadata.get("semantic_link_matrix_cell", row.get("semantic_link_matrix_cell", "")) or ""
+                    row["semantic_link_truth_score"] = _float(metadata.get("semantic_link_truth_score"), 0.0)
+                    row["semantic_link_truth_relation"] = str(
+                        metadata.get("semantic_link_truth_relation", row.get("semantic_link_truth_relation", "")) or ""
                     )
                     break
 
@@ -311,7 +324,7 @@ class DistributedServiceDiscoveryProtocol:
             ttl_s = float(exchange_cfg.ttl_s)
             ttl_retained_stale = (
                 bool(candidate.is_remote)
-                and str(metadata.get("semantic_group", "")) == "stale_remote_candidates"
+                and str(metadata.get("semantic_group", "")) == "stale_clone_exact"
                 and ttl_s >= 6.0
             )
             effective_staleness_s = float(candidate.staleness_s)
@@ -335,9 +348,11 @@ class DistributedServiceDiscoveryProtocol:
                     "link_source_semantic": str(metadata.get("link_source_semantic", request.link_input_semantic or "")),
                     "candidate_input_semantic": str(metadata.get("candidate_input_semantic", getattr(candidate, "input_semantic", ""))),
                     "candidate_output_semantic": str(metadata.get("candidate_output_semantic", getattr(candidate, "output_semantic", ""))),
-                    "semantic_link_relation": str(metadata.get("semantic_link_relation", "")),
-                    "semantic_link_label_score": _float(metadata.get("semantic_link_label_score"), 0.0),
-                    "semantic_link_matrix_cell": str(metadata.get("semantic_link_matrix_cell", "")),
+                    "semantic_link_truth_score": _float(metadata.get("semantic_link_truth_score"), 0.0),
+                    "semantic_link_truth_relation": str(metadata.get("semantic_link_truth_relation", "")),
+                    "semantic_link_truth_cell": str(metadata.get("semantic_link_truth_cell", "")),
+                    "implementation_id": str(metadata.get("implementation_id", "")),
+                    "semantic_variant_type": str(metadata.get("semantic_variant_type", "")),
                     "semantic_quality_before": _float(metadata.get("semantic_quality_before"), 1.0),
                     "semantic_cumulative_quality": _float(metadata.get("semantic_cumulative_quality_if_selected"), candidate.semantic_score),
                     "topology_score": max(0.0, min(1.0, 1.0 - topology_risk)),

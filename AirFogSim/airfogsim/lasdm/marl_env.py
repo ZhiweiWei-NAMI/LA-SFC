@@ -61,6 +61,9 @@ class MARLEnvConfig:
     region_agents: Tuple[str, ...] = ()
     sequential_capacity_enabled: bool = True
     sequential_deadline_pruning_enabled: bool = True
+    semantic_scorer: Optional[Any] = None
+    semantic_matrix: Optional[Any] = None
+    enable_semantic_profiles: bool = True
 
 
 @dataclass
@@ -407,6 +410,8 @@ class SemanticTopologyMARLEnv:
                 encoder=encoder,
                 compressor=compressor,
                 respect_local_visibility=not self.config.global_candidate_catalog,
+                semantic_scorer=self.config.semantic_scorer,
+                semantic_matrix=self.config.semantic_matrix,
             )
             for region_id, directory in per_region.items()
         }
@@ -617,7 +622,7 @@ class SemanticTopologyMARLEnv:
                     "node_template_similarity",
                     "semantic_quality_before",
                     "semantic_cumulative_quality_if_selected",
-                    "semantic_link_label_score",
+                    "semantic_link_truth_score",
                 ):
                     metadata[f"{field}_by_source"] = {
                         source: float(fields.get(field, 0.0) or 0.0) for source, fields in source_metrics.items()
@@ -759,7 +764,8 @@ class SemanticTopologyMARLEnv:
         fields["node_template_similarity"] = max(0.0, min(1.0, float(metadata.get("node_template_similarity", semantic_score) or 0.0)))
         fields["semantic_quality_before"] = semantic_quality_before
         fields["semantic_cumulative_quality_if_selected"] = semantic_cumulative_quality
-        fields["semantic_link_label_score"] = max(0.0, min(1.0, float(metadata.get("semantic_link_label_score", semantic_score) or 0.0)))
+        if "semantic_link_truth_score" in metadata:
+            fields["semantic_link_truth_score"] = max(0.0, min(1.0, float(metadata.get("semantic_link_truth_score", 0.0) or 0.0)))
         fields["semantic_min_score"] = semantic_min_score
         fields["semantic_shortfall"] = semantic_shortfall
         fields["semantic_quality_violation"] = 1.0 if semantic_shortfall > 0.0 and not chain.successors(str(sfc_node_id or "")) else 0.0
@@ -1177,7 +1183,7 @@ class SemanticTopologyMARLEnv:
             "node_template_similarity": "node_template_similarity_by_source",
             "semantic_quality_before": "semantic_quality_before_by_source",
             "semantic_cumulative_quality_if_selected": "semantic_cumulative_quality_if_selected_by_source",
-            "semantic_link_label_score": "semantic_link_label_score_by_source",
+            "semantic_link_truth_score": "semantic_link_truth_score_by_source",
         }
         for field, mapping_name in source_fields.items():
             mapping = metadata.get(mapping_name)
@@ -1264,9 +1270,7 @@ def _reward_aux_from_decisions(decisions: Sequence[LASDMDecision]) -> Dict[str, 
     if not selected:
         return {}
     semantic_scores = [_to_float(item.get("semantic_score"), 0.0) for item in selected]
-    semantic_link_label_scores = []
     semantic_cumulative_qualities = []
-    semantic_link_mismatches = []
     stale_values = []
     topology_risks = []
     mobility_risks = []
@@ -1287,16 +1291,13 @@ def _reward_aux_from_decisions(decisions: Sequence[LASDMDecision]) -> Dict[str, 
     route_unavailable = 0
     for item in selected:
         metadata = dict(item.get("metadata", {}) or {})
-        relation = str(metadata.get("semantic_link_relation", "") or "")
-        semantic_link_label_scores.append(_to_float(metadata.get("semantic_link_label_score"), _to_float(item.get("semantic_score"), 0.0)))
         semantic_cumulative_qualities.append(
             _to_float(metadata.get("semantic_cumulative_quality_if_selected"), _to_float(item.get("semantic_score"), 1.0))
         )
-        semantic_link_mismatches.append(1.0 if relation == "mismatch" else 0.0)
         stale = (
             _to_float(item.get("staleness_s"), 0.0) > 0.0
             or bool(item.get("stale", False))
-            or str(metadata.get("semantic_group", "")) == "stale_remote_candidates"
+            or str(metadata.get("semantic_group", "")) == "stale_clone_exact"
         )
         stale_values.append(1.0 if stale else 0.0)
         topology_risks.append(_to_float(metadata.get("topology_risk"), _to_float(item.get("topology_risk"), 0.0)))
@@ -1317,10 +1318,8 @@ def _reward_aux_from_decisions(decisions: Sequence[LASDMDecision]) -> Dict[str, 
         remaining_deadline_ratios.append(_to_float(metadata.get("remaining_deadline_ratio"), 1.0))
         semantic_group = str(metadata.get("semantic_group", item.get("semantic_group", "unknown")) or "unknown")
         semantic_group_counts[semantic_group] = semantic_group_counts.get(semantic_group, 0) + 1
-        semantic_link_relation = relation or "unknown"
-        semantic_group_counts[f"link_relation_{semantic_link_relation}"] = (
-            semantic_group_counts.get(f"link_relation_{semantic_link_relation}", 0) + 1
-        )
+        truth_relation = str(metadata.get("semantic_link_truth_relation", "") or "unknown")
+        semantic_group_counts[f"truth_relation_{truth_relation}"] = semantic_group_counts.get(f"truth_relation_{truth_relation}", 0) + 1
         if route_available <= 0.0:
             route_unavailable += 1
     aux = {
@@ -1348,9 +1347,7 @@ def _reward_aux_from_decisions(decisions: Sequence[LASDMDecision]) -> Dict[str, 
         "selected_mobility_risk_mean": _mean(mobility_risks),
         "selected_stale_remote_ratio": _mean(stale_values),
         "selected_semantic_group_count": float(len(selected)),
-        "selected_semantic_link_label_score_mean": _mean(semantic_link_label_scores),
         "selected_semantic_cumulative_quality_mean": _mean(semantic_cumulative_qualities),
-        "selected_semantic_link_mismatch_ratio": _mean(semantic_link_mismatches),
     }
     for group, count in semantic_group_counts.items():
         key = "".join(char if char.isalnum() else "_" for char in group.lower()).strip("_") or "unknown"

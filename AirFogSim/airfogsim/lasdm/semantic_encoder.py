@@ -200,6 +200,9 @@ class SemanticEncoder:
 
 def service_instance_text(instance: Any) -> str:
     metadata = dict(getattr(instance, "metadata", {}) or {})
+    profile_text = str(metadata.get("profile_text", "") or "").strip()
+    if profile_text:
+        return profile_text
     parts = [
         f"service {getattr(instance, 'service_id', '')}",
         f"capabilities {' '.join(getattr(instance, 'capabilities', []) or [])}",
@@ -207,6 +210,10 @@ def service_instance_text(instance: Any) -> str:
         f"output {getattr(instance, 'output_semantic', '')}",
         f"node_type {getattr(instance, 'node_type', '')}",
         f"region {getattr(instance, 'region_id', '')}",
+        str(metadata.get("implementation_id", "")),
+        str(metadata.get("model_family", "")),
+        str(metadata.get("modality", "")),
+        " ".join(str(item) for item in metadata.get("domain_tags", []) or []),
         str(metadata.get("description", "")),
         str(metadata.get("semantic_description", "")),
     ]

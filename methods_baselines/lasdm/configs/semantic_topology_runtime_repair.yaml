@@ -24,7 +24,11 @@ runtime_repair:
     zero_success_min_completed: 1
     min_success_by_baseline:
       topology_greedy: 0.50
-      semantic_greedy_no_exchange: 0.20
+      pure_semantic_greedy_no_exchange: 0.20
+      local_semantic_runtime_greedy: 0.25
+      nsga2_semantic_qos: 0.25
+      mappo_ctde: 0.25
+      iql_offline: 0.25
       utility_prior_with_exchange: 0.25
       proposed_semantic_topology_marl: 0.65
       centralized_planner: 0.60
@@ -41,7 +45,7 @@ runtime:
       hard_ddl: 90.0
 
 training:
-  episodes: 500
+  episodes: 100
   max_steps: 100
   train_seeds: [0, 1, 2, 3, 4]
   eval_seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
@@ -85,7 +89,7 @@ marl:
   ippo_expert_branch_width: 8
   ippo_utility_prior_logit_weight: 2.5
   ippo_route_unavailable_penalty: 20.0
-  ippo_behavior_clone_pretrain_episodes: 40
+  ippo_behavior_clone_pretrain_episodes: 10
   ippo_behavior_clone_steps_per_observation: 4
   ippo_bc_scenarios:
     - semantic_runtime_calibration_easy
@@ -158,9 +162,7 @@ marl:
     route_unavailable: -2.0
     deadline_slack: 0.05
     semantic_score: 0.50
-    semantic_link_label: 0.25
     semantic_cumulative: 0.50
-    semantic_link_mismatch: -1.00
     utility_prior: 1.0
     stale_remote: -0.75
     topology_risk: -0.50
@@ -272,10 +274,11 @@ semantic_topology_experiment:
       wireless_contention_factor: 1.0
       candidate_decoys:
         enabled: true
-        semantic_high_topology_bad: 2
-        semantic_medium_topology_good: 2
-        semantic_low_topology_good: 1
-        stale_remote_candidates: 1
+        remote_exact: 2
+        remote_compatible: 2
+        borderline_weak: 2
+        hard_negative_mismatch: 1
+        stale_clone_exact: 1
     - name: semantic_runtime_mobility_staleness_stress
       objective: stale semantic exchange under mobility and topology churn
       task_nodes: {vehicle: 30, uav: 5}
@@ -308,10 +311,11 @@ semantic_topology_experiment:
         stale_latency_penalty_s: 3.0
       candidate_decoys:
         enabled: true
-        semantic_high_topology_bad: 2
-        semantic_medium_topology_good: 2
-        semantic_low_topology_good: 1
-        stale_remote_candidates: 2
+        remote_exact: 2
+        remote_compatible: 2
+        borderline_weak: 2
+        hard_negative_mismatch: 1
+        stale_clone_exact: 2
     - name: distributed_service_discovery_calibrated
       objective: remote candidate discovery after centralized planner calibration passes
       task_nodes: {vehicle: 25, uav: 4}

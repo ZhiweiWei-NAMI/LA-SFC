@@ -16,7 +16,9 @@ import pandas as pd
 DEFAULT_BASELINES = [
     "intra_region_only",
     "cross_region_auction",
-    "semantic_greedy_no_exchange",
+    "pure_semantic_greedy_no_exchange",
+    "local_semantic_runtime_greedy",
+    "nsga2_semantic_qos",
     "utility_prior_with_exchange",
     "topology_greedy",
     "marl_no_semantic",

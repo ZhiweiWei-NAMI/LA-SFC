@@ -148,12 +148,6 @@ class GraphObservationBuilder:
         mobility_risk = min(1.0, float(metadata.get("mobility_risk", 0.0) or 0.0)) if temporal_enabled else 0.0
         cold_start_s = min(1.0, float(metadata.get("cold_start_s", 0.0) or 0.0) / 5.0) if topology_enabled else 0.0
         semantic_mismatch = max(0.0, 1.0 - semantic_score) if self.config.include_semantic_features else 0.0
-        semantic_link_label_score = (
-            min(1.0, max(0.0, float(metadata.get("semantic_link_label_score", semantic_score) or 0.0)))
-            if self.config.include_semantic_features
-            else 0.0
-        )
-        semantic_mismatch = max(semantic_mismatch, max(0.0, 1.0 - semantic_link_label_score))
         utility_value = float(metadata.get("utility_prior", 0.0) or 0.0)
         if topology_enabled and not self.config.include_semantic_features:
             utility_value -= raw_semantic_score

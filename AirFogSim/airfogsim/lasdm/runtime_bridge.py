@@ -423,8 +423,8 @@ class LASDMRuntimeBridge:
             ),
             "semantic_score": float(getattr(task, "_lasdm_semantic_score", 1.0) or 1.0),
             "semantic_cumulative_quality": float(getattr(task, "_lasdm_semantic_cumulative_quality", 1.0) or 1.0),
-            "semantic_link_relation": str(getattr(task, "_lasdm_semantic_link_relation", "") or ""),
-            "semantic_link_matrix_cell": str(getattr(task, "_lasdm_semantic_link_matrix_cell", "") or ""),
+            "semantic_link_truth_relation": str(getattr(task, "_lasdm_semantic_link_truth_relation", "") or ""),
+            "semantic_link_truth_score": float(getattr(task, "_lasdm_semantic_link_truth_score", 0.0) or 0.0),
             "semantic_min_score": float(getattr(task, "_lasdm_semantic_min_score", 0.0) or 0.0),
             "semantic_quality_violation": bool(getattr(task, "_lasdm_semantic_quality_violation", False)),
             "finish_time": current_time,
@@ -505,7 +505,7 @@ class LASDMRuntimeBridge:
         stale_penalty_s = _float(metadata.get("stale_latency_penalty_s"), 0.0)
         if (
             _float(candidate.get("staleness_s"), 0.0) <= 0.0
-            and str(metadata.get("semantic_group", "")) != "stale_remote_candidates"
+            and str(metadata.get("semantic_group", "")) != "stale_clone_exact"
         ):
             stale_penalty_s = 0.0
         semantic_score = _float(metadata.get("link_similarity"), _float(candidate.get("semantic_score"), 1.0))
@@ -526,9 +526,8 @@ class LASDMRuntimeBridge:
             "_lasdm_semantic_quality_violation",
             bool(getattr(task, "_lasdm_is_sink", False) and semantic_min_score > 0.0 and semantic_cumulative_quality < semantic_min_score),
         )
-        task.setAttribute("_lasdm_semantic_link_relation", str(metadata.get("semantic_link_relation", "")))
-        task.setAttribute("_lasdm_semantic_link_matrix_cell", str(metadata.get("semantic_link_matrix_cell", "")))
-        task.setAttribute("_lasdm_semantic_link_label_score", _float(metadata.get("semantic_link_label_score"), 0.0))
+        task.setAttribute("_lasdm_semantic_link_truth_relation", str(metadata.get("semantic_link_truth_relation", "")))
+        task.setAttribute("_lasdm_semantic_link_truth_score", _float(metadata.get("semantic_link_truth_score"), 0.0))
         if metadata.get("link_source_semantic"):
             task.setAttribute("_lasdm_input_semantic", str(metadata.get("link_source_semantic")))
         selected_output = str(candidate.get("output_semantic", metadata.get("candidate_output_semantic", "")) or "")
@@ -583,7 +582,7 @@ class LASDMRuntimeBridge:
             "payload_mb": float(getattr(task, "_lasdm_output_payload_mb", task.getTaskSize())),
             "semantic": getattr(task, "_lasdm_output_semantic", "any"),
             "semantic_cumulative_quality": float(getattr(task, "_lasdm_semantic_cumulative_quality", 1.0) or 1.0),
-            "semantic_link_relation": str(getattr(task, "_lasdm_semantic_link_relation", "") or ""),
+            "semantic_link_truth_relation": str(getattr(task, "_lasdm_semantic_link_truth_relation", "") or ""),
             "finish_time": current_time,
         }
 

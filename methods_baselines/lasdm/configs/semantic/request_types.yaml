@@ -1,0 +1,97 @@
+schema_version: lasdm.semantic.request_types.v21
+request_type_count: 4
+
+request_types:
+  - request_type: forest_fire_monitoring
+    description: >
+      Forest fire monitoring watches wide aerial scenes for early smoke, open
+      flame, and growing heat signatures, then escalates only when evidence is
+      consistent enough for an operational wildfire alert.
+    primary_domains: [forest, wildfire, aerial, thermal]
+    secondary_domains: [grassland, mountain, smoke, emergency_response]
+    goal_output_semantic: >
+      The terminal output should describe a verified wildfire event with enough
+      spatial and temporal context for downstream alert routing and incident
+      triage.
+    representative_service_chain:
+      - aerial_video_preprocessing
+      - thermal_frame_preprocessing
+      - multi_spectral_fusion_preprocessing
+      - fire_candidate_detection
+      - smoke_fire_fusion
+      - multi_sensor_event_fusion
+      - fire_event_verification
+      - emergency_alert_publish
+    preferred_node_types: [uav, rsu, edge_server, cloud_server]
+    qos_profile:
+      deadline_s: 6.0
+      accuracy_priority: high
+      continuity_priority: medium
+
+  - request_type: traffic_surveillance
+    description: >
+      Traffic surveillance tracks moving vehicles, estimates trajectory risk,
+      and preserves event evidence so operators can react to congestion,
+      dangerous maneuvers, or blocked corridors.
+    primary_domains: [traffic, roadway, aerial, mobility]
+    secondary_domains: [intersection, fleet, congestion, compliance]
+    goal_output_semantic: >
+      The terminal output should summarize verified traffic events, the tracks
+      that triggered them, and the archival references needed for review.
+    representative_service_chain:
+      - aerial_video_preprocessing
+      - vehicle_detection_and_tracking
+      - trajectory_risk_assessment
+      - emergency_alert_publish
+      - surveillance_event_archive
+    preferred_node_types: [uav, vehicle, rsu, edge_server, cloud_server]
+    qos_profile:
+      deadline_s: 5.0
+      accuracy_priority: high
+      continuity_priority: high
+
+  - request_type: urban_security
+    description: >
+      Urban security focuses on person-centric detection, identity checks, and
+      suspicious movement analysis across dense city views where false alarms
+      from crowds and occlusion are common.
+    primary_domains: [security, urban, pedestrian, identity]
+    secondary_domains: [crowd, intrusion, public_space, patrol]
+    goal_output_semantic: >
+      The terminal output should describe a validated security incident with
+      identity confidence, movement rationale, and evidence ready for audit.
+    representative_service_chain:
+      - aerial_video_preprocessing
+      - person_detection_and_reid
+      - identity_verification
+      - trajectory_risk_assessment
+      - emergency_alert_publish
+      - surveillance_event_archive
+    preferred_node_types: [uav, rsu, edge_server, cloud_server]
+    qos_profile:
+      deadline_s: 4.5
+      accuracy_priority: high
+      continuity_priority: high
+
+  - request_type: industrial_inspection
+    description: >
+      Industrial inspection reviews structured assets such as turbine blades,
+      weld seams, or panels, then classifies defect severity and produces a
+      report that maintenance staff can act on without rereading raw footage.
+    primary_domains: [industrial, inspection, defect, asset_health]
+    secondary_domains: [thermal, corrosion, maintenance, compliance]
+    goal_output_semantic: >
+      The terminal output should consolidate defect findings into a structured
+      inspection record with severity labels, supporting evidence, and a clear
+      maintenance recommendation.
+    representative_service_chain:
+      - thermal_frame_preprocessing
+      - multi_spectral_fusion_preprocessing
+      - industrial_defect_detection
+      - defect_classification
+      - inspection_report_generation
+    preferred_node_types: [uav, rsu, edge_server, cloud_server]
+    qos_profile:
+      deadline_s: 8.0
+      accuracy_priority: high
+      continuity_priority: medium

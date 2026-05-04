@@ -135,6 +135,6 @@ MARL observation = padded graph arrays + candidate semantic arrays + temporal su
 
 - proposed > marl_semantic_no_topology：说明 topology/temporal features 有贡献。
 - proposed > marl_topology_no_semantic：说明 semantic discovery/compression 有贡献。
-- semantic_greedy_with_exchange > semantic_greedy_no_exchange：说明 distributed exchange 有贡献。
+- utility_prior_with_exchange > pure_semantic_greedy_no_exchange：说明 distributed exchange 有贡献。
 - compressed_dim=64 与 full embedding close，但 overhead 显著更低：说明 semantic compression 有价值。
 - TTL 太短 remote discovery 下降；TTL 太长 stale ratio 上升：说明 TTL 存在最优区间。

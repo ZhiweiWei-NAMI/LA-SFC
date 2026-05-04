@@ -825,6 +825,7 @@ class IPPOPolicy(BaseMARLPolicy):
         learned_logit_scale: float = 1.0,
         prior_logit_scale: float = 1.0,
         learnable_logit_blend: bool = False,
+        semantic_scorer: Optional[Any] = None,
     ):
         try:
             import torch
@@ -855,6 +856,7 @@ class IPPOPolicy(BaseMARLPolicy):
         self.learned_logit_scale = float(learned_logit_scale)
         self.prior_logit_scale = float(prior_logit_scale)
         self.learnable_logit_blend = bool(learnable_logit_blend)
+        self.semantic_scorer = semantic_scorer
         self.rng = random.Random(seed)
         torch.manual_seed(seed)
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -1194,10 +1196,27 @@ class IPPOPolicy(BaseMARLPolicy):
             self.prior_logit_scale,
             self.learnable_logit_blend,
         ).to(self.device)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=float(lr))
+        optimizer_params = list(self.model.parameters())
+        if self.semantic_scorer is not None:
+            self.semantic_scorer.to(self.device)
+            optimizer_params.extend(list(self.semantic_scorer.parameters()))
+        self.optimizer = optim.Adam(optimizer_params, lr=float(lr))
         self.last_supervised_loss = 0.0
         self.last_supervised_samples = 0
         self.last_supervised_relabels = 0
+
+    def set_semantic_scorer(self, semantic_scorer: Any, lr: Optional[float] = None) -> None:
+        if semantic_scorer is None:
+            self.semantic_scorer = None
+            return
+        self.semantic_scorer = semantic_scorer.to(self.device)
+        existing = {id(parameter) for group in self.optimizer.param_groups for parameter in group.get("params", [])}
+        params = [parameter for parameter in self.semantic_scorer.parameters() if id(parameter) not in existing]
+        if params:
+            group = {"params": params}
+            if lr is not None:
+                group["lr"] = float(lr)
+            self.optimizer.add_param_group(group)
 
     def act(self, observations: Mapping[str, Mapping[str, Any]], deterministic: bool = False) -> Dict[str, Dict[str, Dict[str, str]]]:
         return self.act_with_logprobs(observations, deterministic=deterministic).actions
@@ -1471,7 +1490,24 @@ class IPPOPolicy(BaseMARLPolicy):
             features = self.torch.cat([features, pad], dim=-1)
         elif features.shape[-1] > self.candidate_feature_dim:
             features = features[:, : self.candidate_feature_dim]
+        if self.include_semantic_features and self.semantic_scorer is not None and features.shape[0] > 0:
+            semantic_scores = self._semantic_score_tensor_for_candidates(candidate_set, mask_len, features)
+            if semantic_scores.numel() > 0:
+                features = features.clone()
+                features[: semantic_scores.shape[0], 0] = semantic_scores.to(dtype=features.dtype, device=features.device)
+        elif not self.include_semantic_features and features.shape[-1] > 0:
+            features = features.clone()
+            features[:, 0] = 0.0
         return features
+
+    def _semantic_score_tensor_for_candidates(self, candidate_set: Mapping[str, Any], mask_len: int, reference: Any) -> Any:
+        raw_candidates = list(candidate_set.get("raw_candidates", []) or [])[:mask_len]
+        values = []
+        for candidate in raw_candidates:
+            values.append(self.semantic_scorer.score_candidate_tensor(candidate, candidate_set, reference))
+        if not values:
+            return self.torch.zeros((0,), dtype=reference.dtype, device=reference.device)
+        return self.torch.stack([value.reshape(()) for value in values])
 
     def _resource_logits(self, obs_tensor: Any, candidate_features: Any) -> Tuple[Any, Any]:
         if self.use_region_encoder:
@@ -1486,12 +1522,10 @@ class IPPOPolicy(BaseMARLPolicy):
             deadline_slack = float(metadata.get("deadline_slack_s", 0.0) or 0.0)
             deadline_violation = max(0.0, -deadline_slack) / budget
             semantic_score = float(candidate.get("semantic_score", metadata.get("semantic_score", 0.0)) or 0.0)
-            semantic_label_score = float(metadata.get("semantic_link_label_score", semantic_score) or 0.0)
-            semantic_signal = 0.75 * semantic_score + 0.25 * semantic_label_score
             runtime_utility = float(metadata.get("utility_prior", 0.0) or 0.0) - semantic_score
             rows.append(
                 [
-                    semantic_signal if self.include_semantic_features else 0.0,
+                    semantic_score if self.include_semantic_features else 0.0,
                     runtime_utility if self.include_topology_features else 0.0,
                     deadline_violation if self.include_topology_features else 0.0,
                     float(metadata.get("expected_runtime_penalty_s", 0.0) or 0.0) / budget
@@ -2103,6 +2137,7 @@ class MASACPolicy(IPPOPolicy):
             "target_entropy": self.target_entropy,
             "target_entropy_scale": float(self.target_entropy_scale),
             "tau": float(self.tau),
+            "semantic_scorer": self.semantic_scorer.state_dict() if self.semantic_scorer is not None else None,
         }
 
     def load_sac_state_dict(self, state: Mapping[str, Any], strict: bool = True) -> None:
@@ -2135,6 +2170,8 @@ class MASACPolicy(IPPOPolicy):
             if self.auto_alpha and self.alpha_optimizer is None:
                 self.alpha_optimizer = self.torch.optim.Adam([self.log_alpha], lr=float(self.alpha_lr))
             self.tau = float(state.get("tau", self.tau) or self.tau)
+            if self.semantic_scorer is not None and state.get("semantic_scorer") is not None:
+                self.semantic_scorer.load_state_dict(state["semantic_scorer"], strict=strict)
 
     def soft_update_targets(self, tau: Optional[float] = None) -> None:
         value = self.tau if tau is None else float(tau)
@@ -2420,28 +2457,25 @@ class MASACPolicy(IPPOPolicy):
         return q1[:, -1, -1], q2[:, -1, -1]
 
     def _masac_candidate_features(self, candidate_set: Mapping[str, Any], mask_len: int, reference: Any) -> Any:
-        array = np.asarray(candidate_set.get("candidate_features", []), dtype=np.float32)[:mask_len]
-        features = self.torch.tensor(array, dtype=reference.dtype, device=reference.device)
-        if features.ndim == 1:
-            features = features.reshape(1, -1)
-        if features.numel() == 0:
-            return self.torch.zeros((0, self.candidate_feature_dim), dtype=reference.dtype, device=reference.device)
-        if features.shape[-1] < self.candidate_feature_dim:
-            pad = self.torch.zeros(
-                (features.shape[0], self.candidate_feature_dim - features.shape[-1]),
-                dtype=features.dtype,
-                device=features.device,
-            )
-            features = self.torch.cat([features, pad], dim=-1)
-        elif features.shape[-1] > self.candidate_feature_dim:
-            features = features[:, : self.candidate_feature_dim]
-        return features
+        return self._candidate_feature_tensor(candidate_set, mask_len, reference)
 
 
 def policy_from_name(name: str, **kwargs: Any) -> BaseMARLPolicy:
     name = str(name)
-    if name in {"semantic_greedy_with_exchange", "utility_prior_with_exchange"}:
+    if name == "utility_prior_with_exchange":
         return UtilityPriorPolicy()
+    if name == "pure_semantic_greedy_no_exchange":
+        return SemanticGreedyPolicy(
+            prefer_local=False,
+            remote_penalty=0.0,
+            stale_penalty=0.0,
+        )
+    if name == "local_semantic_runtime_greedy":
+        return SemanticGreedyPolicy(
+            require_route_available=True,
+            prefer_runtime_feasible=True,
+            **_policy_kwargs(kwargs, "prefer_local", "remote_penalty", "stale_penalty"),
+        )
     if name == "intra_region_only":
         return IntraRegionOnlyPolicy(
             **_policy_kwargs(
@@ -2464,12 +2498,16 @@ def policy_from_name(name: str, **kwargs: Any) -> BaseMARLPolicy:
         )
     if name == "cross_region_auction":
         return CrossRegionAuctionPolicy(**_policy_kwargs(kwargs, "load_price", "remote_price", "stale_price"))
-    if name == "semantic_greedy_no_exchange":
-        return SemanticGreedyPolicy(
-            require_route_available=True,
-            prefer_runtime_feasible=True,
-            **_policy_kwargs(kwargs, "prefer_local", "remote_penalty", "stale_penalty"),
+    if name == "nsga2_semantic_qos":
+        from .nsga2_policy import NSGA2SemanticQoSPolicy
+
+        return NSGA2SemanticQoSPolicy(
+            **_policy_kwargs(kwargs, "pop_size", "generations", "crossover_p", "mutation_p", "seed")
         )
+    if name == "semantic_greedy_no_exchange":
+        raise ValueError("semantic_greedy_no_exchange was removed in V21; use pure_semantic_greedy_no_exchange or local_semantic_runtime_greedy")
+    if name == "semantic_greedy_with_exchange":
+        raise ValueError("semantic_greedy_with_exchange was removed in V21; use utility_prior_with_exchange")
     if name == "semantic_greedy":
         return SemanticGreedyPolicy(**_policy_kwargs(kwargs, "prefer_local", "remote_penalty", "stale_penalty"))
     if name == "marl_semantic_no_topology":
@@ -2480,6 +2518,10 @@ def policy_from_name(name: str, **kwargs: Any) -> BaseMARLPolicy:
         )
     if name == "proposed_semantic_topology_marl":
         raise ValueError("proposed_semantic_topology_marl requires an explicit MASAC checkpoint loader; heuristic policy is not allowed")
+    if name == "mappo_ctde":
+        raise ValueError("mappo_ctde requires a trained MAPPO checkpoint; heuristic policy construction is not allowed")
+    if name == "iql_offline":
+        raise ValueError("iql_offline requires a trained IQL checkpoint; heuristic policy construction is not allowed")
     if name == "utility_prior":
         return UtilityPriorPolicy()
     if name in {"centralized_planner", "centralized_oracle"}:

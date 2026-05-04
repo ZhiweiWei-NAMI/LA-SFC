@@ -16,7 +16,7 @@ for path in (AIRFOGSIM_ROOT, METHOD_ROOT):
     if path not in sys.path:
         sys.path.insert(0, path)
 
-from train_semantic_topology_marl import DEFAULT_CONFIG, build_offline_env, _load_yaml
+from train_semantic_topology_marl import DEFAULT_CONFIG, build_offline_env, _close_runtime_env, _load_yaml
 from airfogsim.lasdm.marl_policy import policy_from_name
 from airfogsim.lasdm.marl_trainer import HeuristicEvaluator, write_reward_curve
 
@@ -24,7 +24,11 @@ from airfogsim.lasdm.marl_trainer import HeuristicEvaluator, write_reward_curve
 DEFAULT_BASELINES = [
     "intra_region_only",
     "cross_region_auction",
-    "semantic_greedy_no_exchange",
+    "pure_semantic_greedy_no_exchange",
+    "local_semantic_runtime_greedy",
+    "nsga2_semantic_qos",
+    "mappo_ctde",
+    "iql_offline",
     "utility_prior_with_exchange",
     "topology_greedy",
     "marl_no_semantic",
@@ -92,6 +96,41 @@ IPPO_BASELINE_CONFIG_UPDATES: Dict[str, Dict[str, Any]] = {
         "include_topology_features": True,
         "include_temporal_features": True,
     },
+    "pure_semantic_greedy_no_exchange": {
+        "auto_exchange": False,
+        "include_remote_candidates": False,
+        "include_semantic_features": True,
+        "include_topology_features": False,
+        "include_temporal_features": False,
+    },
+    "local_semantic_runtime_greedy": {
+        "auto_exchange": False,
+        "include_remote_candidates": False,
+        "include_semantic_features": True,
+        "include_topology_features": True,
+        "include_temporal_features": True,
+    },
+    "nsga2_semantic_qos": {
+        "auto_exchange": True,
+        "include_remote_candidates": True,
+        "include_semantic_features": True,
+        "include_topology_features": True,
+        "include_temporal_features": True,
+    },
+    "mappo_ctde": {
+        "auto_exchange": True,
+        "include_remote_candidates": True,
+        "include_semantic_features": True,
+        "include_topology_features": True,
+        "include_temporal_features": True,
+    },
+    "iql_offline": {
+        "auto_exchange": True,
+        "include_remote_candidates": True,
+        "include_semantic_features": True,
+        "include_topology_features": True,
+        "include_temporal_features": True,
+    },
 }
 
 IPPO_BASELINE_EXPERT_POLICY: Dict[str, str] = {
@@ -134,34 +173,39 @@ def main() -> None:
                         max_steps=args.max_steps,
                         scenario=scenario,
                         service_role_sweep=role,
+                        attach_runtime=True,
+                        baseline=baseline,
                     )
-                    policy_name, cfg_updates = _baseline_settings(baseline)
-                    env.config = replace(env.config, **cfg_updates)
-                    env.rebuild_config_dependent_components()
-                    policy = policy_from_name(policy_name, seed=seed)
-                    rows = HeuristicEvaluator(env, policy).run(episodes=1, max_steps=args.max_steps)
-                    scenario_name = str(scenario.get("name", "default"))
-                    run_dir = out / f"{baseline}__{scenario_name}__{role}__seed_{seed}"
-                    run_dir.mkdir(parents=True, exist_ok=True)
-                    write_reward_curve(run_dir / "reward_curve.csv", rows)
-                    env.write_traces(str(run_dir))
-                    last = rows[-1].to_dict() if rows else {}
-                    metrics = dict(env.manager.summary())
-                    summary_rows.append(
-                        {
-                            "baseline": baseline,
-                            "scenario": scenario_name,
-                            "service_role_sweep": role,
-                            "seed": seed,
-                            "task_node_counts": json.dumps(scenario.get("task_nodes", {}), sort_keys=True),
-                            "service_node_counts": json.dumps(scenario.get("service_nodes", {}), sort_keys=True),
-                            "arrival_rate_sfc_per_s": scenario.get("arrival_rate_sfc_per_s", ""),
-                            "exchange_ttl_s": scenario.get("exchange_ttl_s", ""),
-                            "compressed_dim": config.get("semantic_exchange", {}).get("compressed_dim", ""),
-                            **last,
-                            **_flat_metrics(metrics),
-                        }
-                    )
+                    try:
+                        policy_name, cfg_updates = _baseline_settings(baseline)
+                        env.config = replace(env.config, **cfg_updates)
+                        env.rebuild_config_dependent_components()
+                        policy = policy_from_name(policy_name, seed=seed)
+                        rows = HeuristicEvaluator(env, policy).run(episodes=1, max_steps=args.max_steps)
+                        scenario_name = str(scenario.get("name", "default"))
+                        run_dir = out / f"{baseline}__{scenario_name}__{role}__seed_{seed}"
+                        run_dir.mkdir(parents=True, exist_ok=True)
+                        write_reward_curve(run_dir / "reward_curve.csv", rows)
+                        env.write_traces(str(run_dir))
+                        last = rows[-1].to_dict() if rows else {}
+                        metrics = dict(env.manager.summary())
+                        summary_rows.append(
+                            {
+                                "baseline": baseline,
+                                "scenario": scenario_name,
+                                "service_role_sweep": role,
+                                "seed": seed,
+                                "task_node_counts": json.dumps(scenario.get("task_nodes", {}), sort_keys=True),
+                                "service_node_counts": json.dumps(scenario.get("service_nodes", {}), sort_keys=True),
+                                "arrival_rate_sfc_per_s": scenario.get("arrival_rate_sfc_per_s", ""),
+                                "exchange_ttl_s": scenario.get("exchange_ttl_s", ""),
+                                "compressed_dim": config.get("semantic_exchange", {}).get("compressed_dim", ""),
+                                **last,
+                                **_flat_metrics(metrics),
+                            }
+                        )
+                    finally:
+                        _close_runtime_env(getattr(env, "env", None))
 
     with (out / "ablation_summary.csv").open("w", newline="", encoding="utf-8") as file:
         fieldnames = sorted({key for row in summary_rows for key in row})
@@ -179,12 +223,22 @@ def _baseline_settings(name: str) -> Tuple[str, Dict[str, Any]]:
     This evaluator gives deterministic smoke-test counterparts for every method label.
     """
     if name == "semantic_greedy_no_exchange":
-        return "semantic_greedy_no_exchange", {"auto_exchange": False, "include_remote_candidates": False}
+        raise ValueError("semantic_greedy_no_exchange was removed in V21; use pure_semantic_greedy_no_exchange or local_semantic_runtime_greedy")
+    if name == "pure_semantic_greedy_no_exchange":
+        return "pure_semantic_greedy_no_exchange", dict(IPPO_BASELINE_CONFIG_UPDATES[name])
+    if name == "local_semantic_runtime_greedy":
+        return "local_semantic_runtime_greedy", dict(IPPO_BASELINE_CONFIG_UPDATES[name])
+    if name == "nsga2_semantic_qos":
+        return "nsga2_semantic_qos", dict(IPPO_BASELINE_CONFIG_UPDATES[name])
+    if name in {"mappo_ctde", "iql_offline"}:
+        raise ValueError(f"{name} requires a trained checkpoint; use train_semantic_topology_marl.py --policy {name.split('_')[0]}")
     if name == "intra_region_only":
         return "intra_region_only", {"auto_exchange": False, "include_remote_candidates": False}
     if name == "cross_region_auction":
         return "cross_region_auction", {"auto_exchange": True, "include_remote_candidates": True}
-    if name in {"utility_prior_with_exchange", "semantic_greedy_with_exchange"}:
+    if name == "semantic_greedy_with_exchange":
+        raise ValueError("semantic_greedy_with_exchange was removed in V21; use utility_prior_with_exchange")
+    if name == "utility_prior_with_exchange":
         return "utility_prior_with_exchange", {"auto_exchange": True, "include_remote_candidates": True}
     if name == "topology_greedy":
         return "topology_greedy", {"auto_exchange": True, "include_remote_candidates": True}
@@ -200,7 +254,10 @@ def _baseline_settings(name: str) -> Tuple[str, Dict[str, Any]]:
 
 
 def is_ippo_checkpoint_baseline(name: str) -> bool:
-    return canonical_ippo_baseline(name) in IPPO_BASELINE_CONFIG_UPDATES
+    canonical = canonical_ippo_baseline(name)
+    if canonical in {"mappo_ctde", "iql_offline"}:
+        return False
+    return canonical in IPPO_BASELINE_CONFIG_UPDATES
 
 
 def checkpoint_subdir_for_baseline(name: str) -> str:

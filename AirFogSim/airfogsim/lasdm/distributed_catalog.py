@@ -6,8 +6,10 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 
 from .instance_directory import ServiceInstance, ServiceInstanceDirectory
+from .semantic_link_matrix import SemanticLinkMatrix
+from .semantic_link_predictor import SemanticLinkScorer
 from .semantic_cache import SemanticAdvertisement, SemanticAdvertisementCache
-from .semantic_encoder import SemanticEncoder, semantic_value_text, service_instance_text, sfc_node_text
+from .semantic_encoder import SemanticEncoder, service_instance_text, sfc_node_text
 from .semantic_exchange import SemanticCompressor
 
 
@@ -57,12 +59,16 @@ class DistributedServiceCatalog:
         encoder: Optional[SemanticEncoder] = None,
         compressor: Optional[SemanticCompressor] = None,
         respect_local_visibility: bool = True,
+        semantic_scorer: Optional[SemanticLinkScorer] = None,
+        semantic_matrix: Optional[SemanticLinkMatrix] = None,
     ):
         self.agent_id = str(agent_id)
         self.local_directory = local_directory or ServiceInstanceDirectory()
         self.encoder = encoder or SemanticEncoder(backend="hash")
         self.compressor = compressor or SemanticCompressor(input_dim=self.encoder.embedding_dim)
         self.respect_local_visibility = bool(respect_local_visibility)
+        self.semantic_scorer = semantic_scorer
+        self.semantic_matrix = semantic_matrix
         self.remote_cache = SemanticAdvertisementCache(owner_agent_id=self.agent_id)
         self._local_embedding_by_instance: Dict[str, np.ndarray] = {}
         self.query_trace: List[Dict[str, Any]] = []
@@ -85,12 +91,13 @@ class DistributedServiceCatalog:
         min_similarity: float = -1.0,
         include_remote: bool = True,
         link_input_semantic: Optional[str] = None,
+        request_type: str = "",
+        chain_position: int = 0,
     ) -> List[CatalogCandidate]:
         self.refresh_local_embeddings()
         required = set(required_capabilities or [])
         allowed_types = {str(item) for item in allowed_node_types or ()}
         query_vec = self.encoder.encode(query_text)
-        link_vec = self.encoder.encode(semantic_value_text(link_input_semantic)) if link_input_semantic is not None else None
         candidates: List[CatalogCandidate] = []
 
         for instance in self.local_directory.all():
@@ -103,21 +110,19 @@ class DistributedServiceCatalog:
             vector = self._local_embedding_by_instance.get(instance.instance_id)
             if vector is None:
                 vector = self.encoder.encode(service_instance_text(instance))
-            template_score = _biased_semantic_score(
-                float(self.encoder.similarity(query_vec, vector.reshape(1, -1))[0]),
-                instance.metadata,
+            template_score = _semantic_fidelity(float(self.encoder.similarity(query_vec, vector.reshape(1, -1))[0]))
+            score = self._score_candidate_for_discovery(
+                query_text=query_text,
+                candidate_metadata=instance.metadata,
+                service_id=instance.service_id,
+                node_type=instance.node_type,
+                region_id=instance.region_id,
+                is_remote=False,
+                chain_position=chain_position,
+                template_score=template_score,
             )
-            score = template_score
-            if link_vec is not None:
-                score = _semantic_fidelity(
-                    _biased_semantic_score(
-                        float(self.encoder.similarity(link_vec, self.encoder.encode(semantic_value_text(instance.input_semantic)).reshape(1, -1))[0]),
-                        instance.metadata,
-                    )
-                )
             if score >= min_similarity:
                 metadata = _candidate_metadata(instance)
-                link_metadata = _semantic_link_metadata(link_input_semantic, instance.input_semantic, score)
                 metadata.update(
                     {
                         "node_template_similarity": template_score,
@@ -125,9 +130,11 @@ class DistributedServiceCatalog:
                         "link_source_semantic": str(link_input_semantic or ""),
                         "candidate_input_semantic": str(instance.input_semantic),
                         "candidate_output_semantic": str(instance.output_semantic),
-                        **link_metadata,
+                        "request_context_text": str(query_text),
+                        "chain_position": int(chain_position),
                     }
                 )
+                metadata.update(self._truth_metadata(request_type, instance.service_id, metadata, link_input_semantic))
                 candidates.append(
                     CatalogCandidate(
                         instance_id=instance.instance_id,
@@ -154,22 +161,21 @@ class DistributedServiceCatalog:
                     continue
                 if allowed_types and str(ad.node_type) not in allowed_types:
                     continue
-                template_score = _biased_semantic_score(
-                    self.compressor.compressed_similarity(query_vec, ad.compressed_embedding),
-                    ad.metadata,
+                template_score = _semantic_fidelity(self.compressor.compressed_similarity(query_vec, ad.compressed_embedding))
+                score = self._score_candidate_for_discovery(
+                    query_text=query_text,
+                    candidate_metadata=ad.metadata,
+                    service_id=ad.service_id,
+                    node_type=ad.node_type,
+                    region_id=ad.region_id,
+                    is_remote=True,
+                    chain_position=chain_position,
+                    template_score=template_score,
+                    staleness_s=ad.age_s(now_s),
                 )
-                score = template_score
-                if link_vec is not None:
-                    score = _semantic_fidelity(
-                        _biased_semantic_score(
-                            float(self.encoder.similarity(link_vec, self.encoder.encode(semantic_value_text(ad.input_semantic)).reshape(1, -1))[0]),
-                            ad.metadata,
-                        )
-                    )
                 if score < min_similarity:
                     continue
                 metadata = _remote_candidate_metadata(ad, now_s)
-                link_metadata = _semantic_link_metadata(link_input_semantic, ad.input_semantic, score)
                 metadata.update(
                     {
                         "node_template_similarity": template_score,
@@ -177,9 +183,11 @@ class DistributedServiceCatalog:
                         "link_source_semantic": str(link_input_semantic or ""),
                         "candidate_input_semantic": str(ad.input_semantic),
                         "candidate_output_semantic": str(ad.output_semantic),
-                        **link_metadata,
+                        "request_context_text": str(query_text),
+                        "chain_position": int(chain_position),
                     }
                 )
+                metadata.update(self._truth_metadata(request_type, ad.service_id, metadata, link_input_semantic))
                 candidates.append(
                     CatalogCandidate(
                         instance_id=ad.instance_id,
@@ -216,6 +224,55 @@ class DistributedServiceCatalog:
         )
         return result
 
+    def _score_candidate_for_discovery(
+        self,
+        query_text: str,
+        candidate_metadata: Mapping[str, Any],
+        service_id: str,
+        node_type: str,
+        region_id: str,
+        is_remote: bool,
+        chain_position: int,
+        template_score: float,
+        staleness_s: float = 0.0,
+    ) -> float:
+        scorer = self.semantic_scorer
+        if scorer is None:
+            return _semantic_fidelity(template_score)
+        service_idx = scorer.service_type_index(service_id, dict(candidate_metadata or {}).get("service_type_idx"))
+        profile_text = str(dict(candidate_metadata or {}).get("profile_text", "") or "")
+        if not profile_text:
+            profile_text = str(dict(candidate_metadata or {}).get("semantic_description", "") or service_id)
+        return _semantic_fidelity(
+            scorer.score_for_discovery(
+                request_context_text=query_text,
+                instance_profile_text=profile_text,
+                service_type_idx=service_idx,
+                chain_position=int(chain_position),
+                node_type=str(node_type),
+                is_remote=bool(is_remote),
+                is_same_region=str(region_id) == self.agent_id,
+                staleness_s=float(staleness_s),
+                topology_risk=float(dict(candidate_metadata or {}).get("topology_risk", 0.0) or 0.0),
+            )
+        )
+
+    def _truth_metadata(
+        self,
+        request_type: str,
+        service_id: str,
+        candidate_metadata: Mapping[str, Any],
+        link_input_semantic: Optional[str],
+    ) -> Dict[str, Any]:
+        if self.semantic_matrix is None:
+            return {}
+        return self.semantic_matrix.truth_for_candidate(
+            request_type=str(request_type or ""),
+            service_type=str(service_id),
+            candidate_metadata=candidate_metadata,
+            link_input_semantic=link_input_semantic,
+        )
+
     def query_sfc_node(self, sfc_node: Any, payload_semantic: str = "", **kwargs: Any) -> List[CatalogCandidate]:
         return self.query(
             query_text=sfc_node_text(sfc_node, payload_semantic=payload_semantic),
@@ -246,56 +303,14 @@ def _instance_matches(instance: ServiceInstance, service_id: Optional[str], requ
     return True
 
 
-def _biased_semantic_score(base_score: float, metadata: Mapping[str, Any]) -> float:
-    """Apply scenario-controlled semantic bias for calibrated decoy candidates."""
-
-    bias = 0.0
-    try:
-        bias = float(dict(metadata or {}).get("semantic_score_bias", 0.0) or 0.0)
-    except Exception:
-        bias = 0.0
-    return max(-1.0, min(1.0, float(base_score) + bias))
-
-
 def _semantic_fidelity(score: float) -> float:
-    return max(0.0, min(1.0, float(score)))
-
-
-def _semantic_link_metadata(source_semantic: Optional[str], target_semantic: Any, score: float) -> Dict[str, Any]:
-    source = _normalize_semantic_label(source_semantic)
-    target = _normalize_semantic_label(target_semantic)
-    fidelity = _semantic_fidelity(score)
-    if source == target and source != "any":
-        relation = "exact"
-        label_score = 1.0
-    elif target == "any":
-        relation = "generic_accept"
-        label_score = 0.90
-    elif source == "any":
-        relation = "generic_source"
-        label_score = 0.75
-    elif fidelity >= 0.85:
-        relation = "strong"
-        label_score = 0.85
-    elif fidelity >= 0.65:
-        relation = "compatible"
-        label_score = 0.65
-    elif fidelity >= 0.45:
-        relation = "weak"
-        label_score = 0.45
-    else:
-        relation = "mismatch"
-        label_score = 0.0
-    return {
-        "semantic_link_relation": relation,
-        "semantic_link_label_score": label_score,
-        "semantic_link_matrix_cell": f"{source}->{target}:{relation}",
-    }
-
-
-def _normalize_semantic_label(value: Any) -> str:
-    text = str(value or "any").strip().lower()
-    return "_".join(text.replace("/", " ").replace("-", " ").split()) or "any"
+    value = float(score)
+    if value < 0.0:
+        # Encoder similarities are cosine-like in [-1, 1]; map them into the same
+        # [0, 1] fidelity range as learned scorer probabilities without discarding
+        # weak negative evidence through hard clipping.
+        value = 0.5 * (value + 1.0)
+    return max(0.0, min(1.0, value))
 
 
 def _candidate_metadata(instance: ServiceInstance) -> Dict[str, Any]:
@@ -313,7 +328,6 @@ def _candidate_metadata(instance: ServiceInstance) -> Dict[str, Any]:
             "mobility_risk": _float(raw.get("mobility_risk"), 0.0),
             "semantic_group": str(raw.get("semantic_group", "")),
             "is_decoy": bool(raw.get("is_decoy", False)),
-            "semantic_score_bias": _float(raw.get("semantic_score_bias"), 0.0),
             "cold_start_s": float(instance.cold_start_s),
         }
     )
@@ -329,7 +343,6 @@ def _remote_candidate_metadata(ad: Any, now_s: float) -> Dict[str, Any]:
     raw.setdefault("mobility_risk", _float(raw.get("mobility_risk"), 0.0))
     raw.setdefault("semantic_group", str(raw.get("semantic_group", "")))
     raw.setdefault("is_decoy", bool(raw.get("is_decoy", False)))
-    raw.setdefault("semantic_score_bias", _float(raw.get("semantic_score_bias"), 0.0))
     return raw
 
 
@@ -363,10 +376,11 @@ def _diverse_top_k(candidates: Sequence[CatalogCandidate], top_k: int) -> List[C
         add(candidate)
 
     group_order = [
-        "semantic_high_topology_bad",
-        "semantic_medium_topology_good",
-        "semantic_low_topology_good",
-        "stale_remote_candidates",
+        "remote_exact",
+        "remote_compatible",
+        "borderline_weak",
+        "hard_negative_mismatch",
+        "stale_clone_exact",
     ]
     for group in group_order:
         group_candidates = [

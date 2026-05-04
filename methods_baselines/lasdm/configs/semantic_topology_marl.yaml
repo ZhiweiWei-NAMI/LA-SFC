@@ -326,7 +326,7 @@ marl:
   ippo_critic_agent_count: 4
   ippo_device: cuda
   ippo_expert_policy: topology_greedy
-  ippo_behavior_clone_pretrain_episodes: 40
+  ippo_behavior_clone_pretrain_episodes: 10
   ippo_behavior_clone_steps_per_observation: 4
   ippo_behavior_clone_finetune_steps_per_observation: 0
   ippo_reward_curve_policy_only: true
@@ -376,6 +376,10 @@ semantic_exchange:
   per_hop_delay_s: 0.02
   top_k_per_agent: 32
 
+semantic_profiles:
+  config_root: methods_baselines/lasdm/configs/semantic
+  output_root: experiment_artifacts/raw_data/stage1_v21_learned_semantic_matrix_resource_20260504
+
 topology:
   temporal_window: 4
   region_agents: [RSU_0, RSU_1, RSU_2, RSU_3]
@@ -386,7 +390,7 @@ topology:
     full_hybrid: [rsu, cloud_server, vehicle, uav]
 
 training:
-  episodes: 500
+  episodes: 100
   max_steps: 100
   eval_seeds: [0,1,2,3,4,5,6,7,8,9]
   train_seeds: [0,1,2,3,4]
@@ -395,7 +399,11 @@ semantic_topology_experiment:
   baselines:
     - intra_region_only
     - cross_region_auction
-    - semantic_greedy_no_exchange
+    - pure_semantic_greedy_no_exchange
+    - local_semantic_runtime_greedy
+    - nsga2_semantic_qos
+    - mappo_ctde
+    - iql_offline
     - utility_prior_with_exchange
     - topology_greedy
     - marl_no_semantic
