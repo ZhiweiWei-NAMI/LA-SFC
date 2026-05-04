@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Mapping, Optional
 from .iql_policy import IQLPolicy
 from .marl_env import SemanticTopologyMARLEnv
 from .marl_policy import BaseMARLPolicy, policy_from_name
-from .marl_trainer import ReplayBuffer, SACTransition, TrainingMetrics, write_reward_curve
+from .marl_trainer import HeuristicEvaluator, ReplayBuffer, SACTransition, TrainingMetrics, write_reward_curve
 
 
 class IQLTrainer:
@@ -41,7 +41,7 @@ class IQLTrainer:
         self.replay = ReplayBuffer(replay_capacity, seed=seed)
 
     def train(self, episodes: int = 10, max_steps: int = 100, output_dir: Optional[str] = None) -> List[TrainingMetrics]:
-        rows: List[TrainingMetrics] = []
+        behavior_rows: List[TrainingMetrics] = []
         diagnostics: List[Dict[str, Any]] = []
         for episode in range(int(episodes)):
             observations = self.env.reset()
@@ -64,7 +64,7 @@ class IQLTrainer:
                     )
                 )
                 summary = info.get("summary", {})
-                rows.append(
+                behavior_rows.append(
                     TrainingMetrics(
                         episode=episode,
                         step=step,
@@ -94,14 +94,17 @@ class IQLTrainer:
             )
             if metrics:
                 diagnostics.append({"update_index": update_index + 1, "replay_size": len(self.replay), **metrics})
+        eval_rows = HeuristicEvaluator(self.env, self.policy).run(episodes=1, max_steps=max_steps)
         if output_dir is not None:
             target = Path(output_dir)
             target.mkdir(parents=True, exist_ok=True)
-            write_reward_curve(target / "reward_curve.csv", rows)
+            write_reward_curve(target / "iql_behavior_reward_curve.csv", behavior_rows)
+            write_reward_curve(target / "iql_eval_reward_curve.csv", eval_rows)
+            write_reward_curve(target / "reward_curve.csv", eval_rows)
             _write_diagnostics(target / "iql_diagnostics.csv", diagnostics)
             self.policy.torch.save(self.policy.iql_state_dict(), target / "iql_policy.pt")
             self.env.write_traces(str(target))
-        return rows
+        return eval_rows
 
 
 def expectile_loss(diff: Any, expectile: float) -> Any:

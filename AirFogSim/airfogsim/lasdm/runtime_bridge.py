@@ -262,17 +262,22 @@ class LASDMRuntimeBridge:
     def collect_step_metrics(self, current_time: Optional[float] = None) -> Dict[str, Any]:
         """Return manager summary plus bridge-local runtime counters."""
         summary = self.manager.summary()
-        chains = {
-            sfc_id: {
+        chains = {}
+        for sfc_id, chain in sorted(self.manager.chains.items()):
+            order = list(chain.topological_order())
+            completed = set(self.completed_nodes.get(sfc_id, set()) or set())
+            chains[sfc_id] = {
                 "status": chain.status.value,
-                "completed_nodes": sorted(self.completed_nodes.get(sfc_id, set())),
+                "completed_nodes": sorted(completed),
                 "spawned_tasks": len([key for key in self.sfc_node_to_task if key[0] == sfc_id]),
+                "stage_count": len(order),
+                "chain_progress_ratio": len(completed.intersection(order)) / max(1, len(order)),
             }
-            for sfc_id, chain in sorted(self.manager.chains.items())
-        }
+        progress_values = [float(item["chain_progress_ratio"]) for item in chains.values()]
         summary.update(
             {
                 "current_time": current_time,
+                "chain_progress_ratio_mean": sum(progress_values) / len(progress_values) if progress_values else 0.0,
                 "runtime_bridge": {
                     "spawned_tasks": len(self.task_to_sfc),
                     "completed_function_tasks": len(self.processed_done_tasks),

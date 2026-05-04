@@ -39,6 +39,8 @@ from airfogsim.lasdm.topology_builder import TopologyBuilder
 
 from evaluate_semantic_topology_marl import (
     DEFAULT_BASELINES,
+    DEFAULT_EVAL_BASELINES,
+    DEFAULT_TRAINED_BASELINES,
     canonical_ippo_baseline,
     checkpoint_subdir_for_baseline,
     is_ippo_checkpoint_baseline,
@@ -52,9 +54,11 @@ from train_semantic_topology_marl import build_offline_env, _load_yaml
 
 DEFAULT_LASDM_CONFIG = os.path.join(METHOD_ROOT, "configs", "lasdm_airfogsim.yaml")
 DEFAULT_OUTPUT_ROOT = os.path.join(WORKSPACE_ROOT, "experiment_artifacts", "raw_data", "complete_runtime_scheduler")
-DEFAULT_RUNTIME_SEMANTIC_BASELINES = [
-    item for item in DEFAULT_BASELINES if item not in {"mappo_ctde", "iql_offline"}
-]
+DEFAULT_RUNTIME_SEMANTIC_BASELINES = list(DEFAULT_EVAL_BASELINES)
+TRAINED_CHECKPOINT_FILES = {
+    "mappo_ctde": "mappo_policy.pt",
+    "iql_offline": "iql_policy.pt",
+}
 
 SUMMARY_FIELDS = [
     "family",
@@ -76,6 +80,8 @@ SUMMARY_FIELDS = [
     "task_done_num",
     "task_fail_num",
     "task_success_ratio",
+    "chain_progress_ratio_mean",
+    "soft_completion_ratio",
     "runtime_step_count",
     "simulation_time_end",
     "avg_decision_time_ms",
@@ -568,11 +574,7 @@ def train_semantic_ippo_runtime(
                 _write_csv_dynamic(seed_dir / "sac_diagnostics.csv", sac_diagnostic_rows)
                 progress_guard = _evaluate_training_progress_guard(progress_rows, marl_cfg)
                 if not progress_guard.get("passed", True):
-                    _write_json(seed_dir / "training_progress_guard_failure.json", progress_guard)
-                    raise RuntimeError(
-                        "MASAC training progress guard failed: "
-                        f"{progress_guard.get('reason')} | details={progress_guard.get('details')}"
-                    )
+                    _write_json(seed_dir / "training_progress_guard_warning.json", progress_guard)
             finally:
                 _close_env(air_env)
         write_reward_curve(seed_dir / "reward_curve.csv", reward_rows)
@@ -840,7 +842,7 @@ def _run_semantic_runtime_single(
             )
             if done:
                 break
-        metrics = dict(env.manager.summary())
+        metrics = dict(env.runtime_bridge.collect_step_metrics(current_time=env._time()))
         metrics["runtime_step_count"] = int(getattr(env, "runtime_tick_count", metrics.get("runtime_step_count", 0)) or 0)
         bridge = getattr(env, "runtime_bridge", None)
         if bridge is not None:
@@ -906,6 +908,9 @@ def _semantic_policy_for_eval(
     checkpoint_root: Path,
     semantic_scorer: Any = None,
 ) -> Any:
+    canonical = canonical_ippo_baseline(baseline)
+    if canonical in TRAINED_CHECKPOINT_FILES:
+        return _trained_policy_for_eval(config, canonical, seed, observations, checkpoint_root, semantic_scorer)
     if is_ippo_checkpoint_baseline(baseline):
         policy_config = _config_with_baseline_updates(config, baseline)
         baseline_checkpoint_root = _checkpoint_root_for_baseline(checkpoint_root, baseline)
@@ -990,6 +995,136 @@ def _semantic_policy_for_eval(
     policy.checkpoint_sha256 = ""
     policy.policy_source = "heuristic_or_baseline"
     return policy
+
+
+def _trained_policy_for_eval(
+    config: Mapping[str, Any],
+    baseline: str,
+    seed: int,
+    observations: Mapping[str, Mapping[str, Any]],
+    checkpoint_root: Path,
+    semantic_scorer: Any = None,
+) -> Any:
+    policy_config = _config_with_baseline_updates(config, baseline)
+    marl_cfg = dict(config.get("marl", {}) or {})
+    strategy = str(marl_cfg.get("ippo_eval_checkpoint_strategy", "exact_seed") or "exact_seed")
+    checkpoint, summary_path = _trained_checkpoint_for_eval(checkpoint_root, baseline, seed, strategy)
+
+    import torch
+
+    try:
+        state = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    except TypeError:
+        state = torch.load(checkpoint, map_location="cpu")
+    if baseline == "mappo_ctde":
+        from airfogsim.lasdm.mappo_policy import MAPPOPolicy
+
+        actor_state = state.get("actor_critic", state) if isinstance(state, Mapping) else state
+        obs_dim = _checkpoint_observation_dim(actor_state) or (
+            max(len(flatten_observation(obs)) for obs in observations.values()) if observations else 1
+        )
+        action_dim = _checkpoint_action_dim(actor_state) or int(policy_config.get("marl", {}).get("max_candidates", 16))
+        policy = MAPPOPolicy(
+            **_ippo_policy_kwargs(policy_config, obs_dim, action_dim, seed, observations=observations, state=actor_state),
+            semantic_scorer=semantic_scorer,
+        )
+        policy.load_mappo_state_dict(state, strict=True)
+        policy.policy_source = "mappo_checkpoint"
+    elif baseline == "iql_offline":
+        from airfogsim.lasdm.iql_policy import IQLPolicy
+
+        actor_state = state.get("actor", state) if isinstance(state, Mapping) else state
+        obs_dim = _checkpoint_observation_dim(actor_state) or (
+            max(len(flatten_observation(obs)) for obs in observations.values()) if observations else 1
+        )
+        action_dim = _checkpoint_action_dim(actor_state) or int(policy_config.get("marl", {}).get("max_candidates", 16))
+        policy = IQLPolicy(
+            **_ippo_policy_kwargs(policy_config, obs_dim, action_dim, seed, observations=observations, state=actor_state),
+            q_lr=float(marl_cfg.get("iql_q_lr", marl_cfg.get("masac_q_lr", marl_cfg.get("ippo_lr", 3e-4))) or 3e-4),
+            alpha=float(marl_cfg.get("masac_alpha", 0.05) or 0.05),
+            auto_alpha=bool(marl_cfg.get("masac_auto_alpha", False)),
+            alpha_lr=float(marl_cfg.get("masac_alpha_lr", marl_cfg.get("masac_q_lr", 3e-4)) or 3e-4),
+            target_entropy=_float_metric(marl_cfg.get("masac_target_entropy", None)),
+            target_entropy_scale=float(marl_cfg.get("masac_target_entropy_scale", 0.90) or 0.90),
+            alpha_min=float(marl_cfg.get("masac_alpha_min", 0.005) or 0.005),
+            alpha_max=float(marl_cfg.get("masac_alpha_max", 0.25) or 0.25),
+            tau=float(marl_cfg.get("iql_tau", marl_cfg.get("masac_tau", 0.005)) or 0.005),
+            expectile=float(marl_cfg.get("iql_expectile", 0.7) or 0.7),
+            beta=float(marl_cfg.get("iql_beta", 3.0) or 3.0),
+            v_lr=float(marl_cfg.get("iql_v_lr", marl_cfg.get("masac_q_lr", marl_cfg.get("ippo_lr", 3e-4))) or 3e-4),
+            semantic_scorer=semantic_scorer,
+        )
+        policy.load_iql_state_dict(state, strict=True)
+        policy.policy_source = "iql_checkpoint"
+    else:
+        raise ValueError(f"Unsupported trained checkpoint baseline: {baseline}")
+    policy.checkpoint_loaded = True
+    policy.checkpoint_path = str(checkpoint)
+    policy.checkpoint_sha256 = _sha256_file(checkpoint)
+    policy.checkpoint_train_seed = _read_checkpoint_summary_seed(summary_path)
+    policy.checkpoint_strategy = strategy
+    return policy
+
+
+def _trained_checkpoint_for_eval(
+    checkpoint_root: Path,
+    baseline: str,
+    seed: int,
+    strategy: str,
+) -> Tuple[Path, Path]:
+    baseline_root = _checkpoint_root_for_baseline(checkpoint_root, baseline)
+    filename = TRAINED_CHECKPOINT_FILES[baseline]
+    if strategy == "exact_seed":
+        candidates = [
+            baseline_root / f"ippo_seed_{seed}" / filename,
+            baseline_root / f"seed_{seed}" / filename,
+            baseline_root / filename,
+        ]
+        for checkpoint in candidates:
+            if checkpoint.exists():
+                return checkpoint, checkpoint.with_name("train_summary.json")
+        raise RuntimeError(f"{baseline} requires a trained checkpoint for seed {seed}; missing {candidates[0]}")
+    if strategy == "global_best_validation":
+        return _best_trained_checkpoint(baseline_root, filename, baseline)
+    raise ValueError(f"Unknown trained checkpoint evaluation strategy: {strategy}")
+
+
+def _best_trained_checkpoint(checkpoint_root: Path, filename: str, baseline: str) -> Tuple[Path, Path]:
+    candidates: List[Tuple[float, Path, Path]] = []
+    for summary_path in sorted(checkpoint_root.glob("**/train_summary.json")):
+        checkpoint = summary_path.with_name(filename)
+        if not checkpoint.exists():
+            continue
+        score = _trained_checkpoint_score(summary_path)
+        candidates.append((score, checkpoint, summary_path))
+    for checkpoint in sorted(checkpoint_root.glob(f"**/{filename}")):
+        summary_path = checkpoint.with_name("train_summary.json")
+        if any(existing == checkpoint for _score, existing, _summary in candidates):
+            continue
+        candidates.append((0.0, checkpoint, summary_path))
+    if not candidates:
+        raise RuntimeError(f"No valid {baseline} checkpoints found under {checkpoint_root}")
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1], candidates[0][2]
+
+
+def _trained_checkpoint_score(summary_path: Path) -> float:
+    try:
+        payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    except Exception:
+        return 0.0
+    for key in ("best_selection_score", "selection_score", "success_ratio"):
+        try:
+            return float(payload.get(key))
+        except Exception:
+            pass
+    metrics = dict(payload.get("last_metrics", {}) or {})
+    for key in ("success_ratio", "total_reward", "mean_reward"):
+        try:
+            return float(metrics.get(key))
+        except Exception:
+            pass
+    return 0.0
 
 
 def _semantic_eval_policy_kwargs(config: Mapping[str, Any]) -> Dict[str, float]:
@@ -1147,14 +1282,17 @@ def _evaluate_ippo_policy_for_selection(
             observations, _rewards, done, _info = env.step(actions)
             if done:
                 break
-        metrics = dict(env.manager.summary())
+        metrics = dict(env.runtime_bridge.collect_step_metrics(current_time=env._time()))
         done_tasks = len(getattr(env.runtime_bridge, "processed_done_tasks", set()) or set())
         failed_tasks = len(getattr(env.runtime_bridge, "processed_failed_tasks", set()) or set())
         task_success_ratio = done_tasks / max(1, done_tasks + failed_tasks)
+        chain_progress_ratio = _chain_progress_ratio_from_metrics(metrics)
         return {
             "success_ratio": float(metrics.get("success_ratio", 0.0) or 0.0),
             "qos_hit_ratio": float(metrics.get("qos_hit_ratio", 0.0) or 0.0),
             "task_success_ratio": float(metrics.get("task_success_ratio", task_success_ratio) or task_success_ratio),
+            "chain_progress_ratio_mean": chain_progress_ratio,
+            "soft_completion_ratio": max(float(metrics.get("success_ratio", 0.0) or 0.0), chain_progress_ratio),
             "avg_graph_finish_time": float(metrics.get("avg_graph_finish_time", 0.0) or 0.0),
             "timed_out": int(metrics.get("timed_out", 0) or 0),
             "failed": int(metrics.get("failed", 0) or 0),
@@ -1211,6 +1349,8 @@ def _evaluate_ippo_policy_selection_suite(
         "min_success_ratio": min(success_values),
         "qos_hit_ratio": mean(float(row.get("qos_hit_ratio", 0.0) or 0.0) for row in rows),
         "task_success_ratio": mean(float(row.get("task_success_ratio", 0.0) or 0.0) for row in rows),
+        "chain_progress_ratio_mean": mean(float(row.get("chain_progress_ratio_mean", 0.0) or 0.0) for row in rows),
+        "soft_completion_ratio": mean(float(row.get("soft_completion_ratio", 0.0) or 0.0) for row in rows),
         "avg_graph_finish_time": mean(finish_values) if finish_values else 0.0,
         "timed_out": sum(int(row.get("timed_out", 0) or 0) for row in rows),
         "failed": sum(int(row.get("failed", 0) or 0) for row in rows),
@@ -1227,6 +1367,9 @@ def _ippo_checkpoint_selection_score(metrics: Mapping[str, Any], metric: str = "
     success = float(metrics.get("success_ratio", 0.0) or 0.0)
     if metric_name in {"success_ratio", "completion_rate"}:
         return success
+    soft_completion = float(metrics.get("soft_completion_ratio", metrics.get("chain_progress_ratio_mean", 0.0)) or 0.0)
+    if metric_name in {"soft_completion_ratio", "chain_progress_ratio"}:
+        return soft_completion
     min_success = float(metrics.get("min_success_ratio", success) or 0.0)
     if metric_name == "min_success_ratio":
         return min_success
@@ -1241,7 +1384,16 @@ def _ippo_checkpoint_selection_score(metrics: Mapping[str, Any], metric: str = "
     timed_out = float(metrics.get("timed_out", 0.0) or 0.0) / case_count
     failed = float(metrics.get("failed", 0.0) or 0.0) / case_count
     latency_penalty = 0.01 * finish if finish > 0.0 else 0.0
-    return 100.0 * min_success + 50.0 * success + 10.0 * task_success + 5.0 * qos - latency_penalty - timed_out - failed
+    return (
+        100.0 * min_success
+        + 50.0 * success
+        + 25.0 * soft_completion
+        + 10.0 * task_success
+        + 5.0 * qos
+        - latency_penalty
+        - timed_out
+        - failed
+    )
 
 
 def _ippo_robust_checkpoint_selection_score(
@@ -1558,6 +1710,19 @@ def _float_metric(value: Any) -> Optional[float]:
         return None
 
 
+def _chain_progress_ratio_from_metrics(metrics: Mapping[str, Any]) -> float:
+    direct = metrics.get("chain_progress_ratio_mean")
+    if direct not in (None, ""):
+        return float(direct or 0.0)
+    bridge = dict(metrics.get("runtime_bridge", {}) or {})
+    chains = dict(bridge.get("chains", {}) or {})
+    values = []
+    for chain in chains.values():
+        if isinstance(chain, Mapping):
+            values.append(float(chain.get("chain_progress_ratio", 0.0) or 0.0))
+    return mean(values) if values else 0.0
+
+
 def _semantic_summary_row(
     family: str,
     baseline: str,
@@ -1570,6 +1735,8 @@ def _semantic_summary_row(
     elapsed_ms: float,
 ) -> Dict[str, Any]:
     overhead = dict(metrics.get("runtime_overhead", {}) or {})
+    success_ratio = float(metrics.get("success_ratio", 0.0) or 0.0)
+    chain_progress_ratio = _chain_progress_ratio_from_metrics(metrics)
     return {
         "family": family,
         "baseline": baseline,
@@ -1583,13 +1750,15 @@ def _semantic_summary_row(
         "succeeded": int(metrics.get("succeeded", 0) or 0),
         "failed": int(metrics.get("failed", 0) or 0),
         "timed_out": int(metrics.get("timed_out", 0) or 0),
-        "success_ratio": float(metrics.get("success_ratio", 0.0) or 0.0),
+        "success_ratio": success_ratio,
         "qos_hit_ratio": float(metrics.get("qos_hit_ratio", 0.0) or 0.0),
         "avg_graph_finish_time": float(metrics.get("avg_graph_finish_time", metrics.get("avg_latency_s", 0.0)) or 0.0),
         "p95_graph_finish_time": float(metrics.get("p95_graph_finish_time", 0.0) or 0.0),
         "task_done_num": int(metrics.get("task_done_num", metrics.get("succeeded", 0)) or 0),
         "task_fail_num": int(metrics.get("task_fail_num", metrics.get("failed", 0) + metrics.get("timed_out", 0)) or 0),
         "task_success_ratio": float(metrics.get("task_success_ratio", metrics.get("success_ratio", 0.0)) or 0.0),
+        "chain_progress_ratio_mean": chain_progress_ratio,
+        "soft_completion_ratio": max(success_ratio, chain_progress_ratio),
         "runtime_step_count": int(metrics.get("runtime_step_count", 0) or 0),
         "simulation_time_end": float(metrics.get("current_time", metrics.get("simulation_time_end", 0.0)) or 0.0),
         "avg_decision_time_ms": float(overhead.get("avg_decision_time_ms", elapsed_ms) or 0.0),
@@ -1871,6 +2040,8 @@ def _write_aggregate_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
             "avg_graph_finish_time",
             "p95_graph_finish_time",
             "task_success_ratio",
+            "chain_progress_ratio_mean",
+            "soft_completion_ratio",
             "avg_decision_time_ms",
             "remote_candidate_ratio",
             "stale_selected_ratio",

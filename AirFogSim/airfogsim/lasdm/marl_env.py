@@ -206,6 +206,9 @@ class SemanticTopologyMARLEnv:
     def step(self, actions: Optional[Mapping[str, Any]] = None) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, float], bool, Dict[str, Any]]:
         now = self._time()
         previous_summary = dict(self.manager.summary())
+        previous_gs2l_progress = _gs2l_chain_progress_snapshot(self.runtime_bridge, self.manager.chains)
+        previous_done_tasks = len(getattr(self.runtime_bridge, "processed_done_tasks", set()) or set())
+        previous_failed_tasks = len(getattr(self.runtime_bridge, "processed_failed_tasks", set()) or set())
         topology = self._update_topology(now)
         if self.config.auto_exchange:
             self._semantic_exchange_tick(now, topology)
@@ -261,6 +264,16 @@ class SemanticTopologyMARLEnv:
         overhead = self.discovery_protocol.exchange.overhead_summary().get("payload_bytes", 0.0)
         aux = reward_aux_from_observations(observations, overhead_bytes=overhead)
         aux.update(_reward_aux_from_decisions(decoded_decisions))
+        aux.update(
+            _gs2l_progress_aux(
+                previous_gs2l_progress,
+                _gs2l_chain_progress_snapshot(self.runtime_bridge, self.manager.chains),
+                previous_done_tasks,
+                previous_failed_tasks,
+                self.runtime_bridge,
+                self.manager.chains,
+            )
+        )
         reward_value = self.reward_fn(previous_summary, self.manager.summary(), aux)
         rewards = {agent_id: reward_value for agent_id in self.agent_ids}
         done = self.done()
@@ -1353,6 +1366,46 @@ def _reward_aux_from_decisions(decisions: Sequence[LASDMDecision]) -> Dict[str, 
         key = "".join(char if char.isalnum() else "_" for char in group.lower()).strip("_") or "unknown"
         aux[f"selected_semantic_group_{key}_count"] = float(count)
     return aux
+
+
+def _gs2l_chain_progress_snapshot(
+    bridge: LASDMRuntimeBridge,
+    chains: Mapping[str, LASDMServiceChain],
+) -> Dict[str, float]:
+    completed_by_chain = getattr(bridge, "completed_nodes", {}) or {}
+    progress: Dict[str, float] = {}
+    for sfc_id, chain in chains.items():
+        order = list(chain.topological_order())
+        if not order:
+            continue
+        completed = set(completed_by_chain.get(sfc_id, set()) or set())
+        progress[str(sfc_id)] = len(completed.intersection(order)) / max(1, len(order))
+    return progress
+
+
+def _gs2l_progress_aux(
+    previous_progress: Mapping[str, float],
+    current_progress: Mapping[str, float],
+    previous_done_tasks: int,
+    previous_failed_tasks: int,
+    bridge: LASDMRuntimeBridge,
+    chains: Mapping[str, LASDMServiceChain],
+) -> Dict[str, float]:
+    all_sfc_ids = set(previous_progress) | set(current_progress)
+    progress_delta = 0.0
+    for sfc_id in all_sfc_ids:
+        progress_delta += max(0.0, float(current_progress.get(sfc_id, 0.0)) - float(previous_progress.get(sfc_id, 0.0)))
+    current_done_tasks = len(getattr(bridge, "processed_done_tasks", set()) or set())
+    current_failed_tasks = len(getattr(bridge, "processed_failed_tasks", set()) or set())
+    stage_counts = [len(list(chain.topological_order())) for chain in chains.values() if len(list(chain.topological_order())) > 0]
+    progress_values = [float(value) for value in current_progress.values()]
+    return {
+        "gs2l_chain_progress_delta": progress_delta,
+        "gs2l_chain_progress_mean": _mean(progress_values),
+        "gs2l_stage_success_delta": float(max(0, current_done_tasks - int(previous_done_tasks))),
+        "gs2l_stage_failure_delta": float(max(0, current_failed_tasks - int(previous_failed_tasks))),
+        "gs2l_stage_count_mean": _mean([float(value) for value in stage_counts]) if stage_counts else 1.0,
+    }
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:

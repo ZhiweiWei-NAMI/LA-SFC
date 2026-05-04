@@ -1022,6 +1022,8 @@ class AirFogSimEnv():
         uav_traffic_infos = self.traffic_manager.getUAVTrafficInfos()
         existing_vehicle_ids = list(self.vehicles.keys())
         certain_vehicle_ids = list(vehicle_traffic_infos.keys())
+        existing_uav_ids = list(self.UAVs.keys())
+        certain_uav_ids = list(uav_traffic_infos.keys())
         added_veh_nums = 0
 
         for vehicle_id, vehicle_traffic_info in vehicle_traffic_infos.items():
@@ -1054,6 +1056,9 @@ class AirFogSimEnv():
         for vehicle_id in to_delete_vehicle_ids.copy():
             vehicle_index = self._removeVehicle(vehicle_id)
             removed_veh_indexes.append(vehicle_index)
+        to_delete_uav_ids = list(set(existing_uav_ids) - set(certain_uav_ids))
+        for uav_id in to_delete_uav_ids.copy():
+            self._removeUAV(uav_id)
 
         n_vehicles = len(self.vehicles)
         n_UAVs = len(self.UAVs)

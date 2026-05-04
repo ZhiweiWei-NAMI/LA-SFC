@@ -21,14 +21,12 @@ from airfogsim.lasdm.marl_policy import policy_from_name
 from airfogsim.lasdm.marl_trainer import HeuristicEvaluator, write_reward_curve
 
 
-DEFAULT_BASELINES = [
+DEFAULT_EVAL_BASELINES = [
     "intra_region_only",
     "cross_region_auction",
     "pure_semantic_greedy_no_exchange",
     "local_semantic_runtime_greedy",
     "nsga2_semantic_qos",
-    "mappo_ctde",
-    "iql_offline",
     "utility_prior_with_exchange",
     "topology_greedy",
     "marl_no_semantic",
@@ -38,6 +36,11 @@ DEFAULT_BASELINES = [
     "marl_no_cross_region",
     "proposed_semantic_topology_marl",
 ]
+DEFAULT_TRAINED_BASELINES = [
+    "mappo_ctde",
+    "iql_offline",
+]
+DEFAULT_BASELINES = list(DEFAULT_EVAL_BASELINES)
 
 IPPO_BASELINE_CONFIG_UPDATES: Dict[str, Dict[str, Any]] = {
     "proposed_semantic_topology_marl": {
@@ -142,7 +145,7 @@ IPPO_BASELINE_ALIASES: Dict[str, str] = {
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate semantic-topology LASDM baselines/ablations.")
     parser.add_argument("--config", default=DEFAULT_CONFIG)
-    parser.add_argument("--baselines", nargs="+", default=DEFAULT_BASELINES)
+    parser.add_argument("--baselines", nargs="+", default=DEFAULT_EVAL_BASELINES)
     parser.add_argument("--scenarios", nargs="+", default=None)
     parser.add_argument("--service-role-sweeps", nargs="+", default=["full_hybrid"])
     parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2, 3, 4])
@@ -223,8 +226,8 @@ def _baseline_settings(name: str) -> Tuple[str, Dict[str, Any]]:
         return "local_semantic_runtime_greedy", dict(IPPO_BASELINE_CONFIG_UPDATES[name])
     if name == "nsga2_semantic_qos":
         return "nsga2_semantic_qos", dict(IPPO_BASELINE_CONFIG_UPDATES[name])
-    if name in {"mappo_ctde", "iql_offline"}:
-        raise ValueError(f"{name} requires a trained checkpoint; use train_semantic_topology_marl.py --policy {name.split('_')[0]}")
+    if name in DEFAULT_TRAINED_BASELINES:
+        return name, dict(IPPO_BASELINE_CONFIG_UPDATES[name])
     if name == "intra_region_only":
         return "intra_region_only", {"auto_exchange": False, "include_remote_candidates": False}
     if name == "cross_region_auction":

@@ -8,6 +8,13 @@ from typing import Any, Dict, Mapping, Optional
 class SFCRewardConfig:
     success: float = 10.0
     timeout: float = -5.0
+    gs2l_stage_progress: float = 6.0
+    gs2l_stage_success: float = 0.8
+    gs2l_stage_failure_discount: float = 0.15
+    gs2l_bandwidth_price: float = 0.5
+    gs2l_resource_price: float = 1.0
+    gs2l_quality_weight: float = 0.5
+    gs2l_clip: float = 8.0
     route_unavailable: float = -2.0
     deadline_slack: float = 0.05
     semantic_score: float = 0.50
@@ -50,7 +57,15 @@ def compute_sfc_reward(
     config: SFCRewardConfig,
 ) -> float:
     reward = _terminal_reward(previous_summary, current_summary, config)
-    reward += _selected_candidate_dense_reward(aux, config)
+    reward += _gs2l_stage_reward(aux, config)
+    dense = _selected_candidate_dense_reward(aux, config)
+    if (
+        float(aux.get("gs2l_stage_failure_delta", 0.0) or 0.0) > 0.0
+        and float(aux.get("gs2l_stage_success_delta", 0.0) or 0.0) <= 0.0
+        and float(aux.get("gs2l_chain_progress_delta", 0.0) or 0.0) <= 0.0
+    ):
+        dense = min(0.0, dense)
+    reward += dense
     return float(reward)
 
 
@@ -68,6 +83,32 @@ def _terminal_reward(
     success_rate = success_delta / completed_delta
     failure_rate = (failed_delta + timeout_delta) / completed_delta
     return float(config.success * success_rate + config.timeout * failure_rate)
+
+
+def _gs2l_stage_reward(aux: Mapping[str, Any], config: SFCRewardConfig) -> float:
+    progress_delta = float(aux.get("gs2l_chain_progress_delta", 0.0) or 0.0)
+    stage_success_delta = float(aux.get("gs2l_stage_success_delta", 0.0) or 0.0)
+    stage_failure_delta = float(aux.get("gs2l_stage_failure_delta", 0.0) or 0.0)
+    if progress_delta <= 0.0 and stage_success_delta <= 0.0 and stage_failure_delta <= 0.0:
+        return 0.0
+    stage_value = float(config.gs2l_bandwidth_price) + float(config.gs2l_resource_price)
+    stage_count = max(1.0, float(aux.get("gs2l_stage_count_mean", 1.0) or 1.0))
+    quality = _mean(
+        [
+            float(aux.get("selected_route_available_mean", 0.0) or 0.0),
+            float(aux.get("selected_resource_available_ratio_mean", 0.0) or 0.0),
+            float(aux.get("selected_remaining_deadline_ratio_mean", 0.0) or 0.0),
+            float(aux.get("selected_semantic_cumulative_quality_mean", 0.0) or 0.0),
+        ]
+    )
+    quality_scale = 1.0 + max(0.0, float(config.gs2l_quality_weight)) * max(0.0, min(1.0, quality))
+    reward = float(config.gs2l_stage_progress) * progress_delta * stage_value * quality_scale
+    reward += float(config.gs2l_stage_success) * stage_success_delta * stage_value * max(0.0, min(1.0, quality))
+    reward -= float(config.gs2l_stage_failure_discount) * stage_failure_delta * stage_value * stage_count
+    clip = max(0.0, float(config.gs2l_clip))
+    if clip > 0.0:
+        reward = max(-clip, min(clip, reward))
+    return float(reward)
 
 
 def _selected_candidate_dense_reward(aux: Mapping[str, Any], config: SFCRewardConfig) -> float:

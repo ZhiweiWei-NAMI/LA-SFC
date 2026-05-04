@@ -45,7 +45,7 @@ DEFAULT_NONLEARNING_BASELINES = (
     "topology_greedy",
     "centralized_planner",
 )
-DEFAULT_LEARNING_EVAL_BASELINES = DEFAULT_LEARNING_VARIANTS
+DEFAULT_LEARNING_EVAL_BASELINES = (*DEFAULT_LEARNING_VARIANTS, *OPTIONAL_MARL_COMPARISON_VARIANTS)
 CHECKPOINT_NAMES = ("masac_policy.pt", "mappo_policy.pt", "iql_policy.pt")
 
 
@@ -194,9 +194,7 @@ def render_training(root: Path, expected_episodes: int, process_rows: Sequence[M
         "last_succ",
         "last_reward",
         "best",
-        "w100(s/r)",
-        "w50(s/r)",
-        "w30(s/r)",
+        "w10(s/r)",
     ]
     lines = [title, table(headers, rows)]
     return lines
@@ -250,9 +248,7 @@ def training_row(
         fmt_float(row_success(latest)),
         fmt_float(row_reward(latest)),
         best,
-        window_pair(filtered or rows, 100),
-        window_pair(filtered or rows, 50),
-        window_pair(filtered or rows, 30),
+        window_pair(filtered or rows, 10),
     ]
 
 
@@ -321,7 +317,7 @@ def render_eval_suite(
         f"{title}: state={status} completion={complete} last_update={age(last, now) if last else '-'}",
     ]
     rows = eval_rows_by_baseline(runs, suite_root, expected_baselines)
-    headers = ["baseline", "runs", "succ_avg", "min_succ", "task_avg", "reward_avg", "timeouts"]
+    headers = ["baseline", "runs", "succ_avg", "min_succ", "task_avg", "soft_avg", "reward_avg", "timeouts"]
     lines.append(table(headers, rows))
     return lines
 
@@ -349,6 +345,16 @@ def eval_rows_by_baseline(
                 rewards.append(reward)
         successes = [value for item in items if (value := safe_float(item.get("success_ratio"))) is not None]
         tasks = [value for item in items if (value := safe_float(item.get("task_success_ratio"))) is not None]
+        soft = [
+            value
+            for item in items
+            if (
+                value := safe_float(
+                    item.get("soft_completion_ratio", item.get("chain_progress_ratio_mean"))
+                )
+            )
+            is not None
+        ]
         timeouts = [value for item in items if (value := safe_float(item.get("timed_out"))) is not None]
         rows.append([
             baseline,
@@ -356,6 +362,7 @@ def eval_rows_by_baseline(
             fmt_mean(successes),
             fmt_float(min(successes) if successes else None),
             fmt_mean(tasks),
+            fmt_mean(soft),
             fmt_mean(rewards),
             fmt_mean(timeouts),
         ])

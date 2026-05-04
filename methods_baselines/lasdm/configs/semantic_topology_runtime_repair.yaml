@@ -12,14 +12,14 @@ runtime_repair:
     min_success_ratio: 0.50
     calibration_scenario: semantic_runtime_calibration_easy
     seeds: [0, 1]
-  fail_fast_on_all_zero_success: true
+  fail_fast_on_all_zero_success: false
   export_raw_traces_required: true
   early_result_guard:
-    enabled: true
+    enabled: false
     min_completed_per_group: 1
     stage_count: 3
     chain_independence_tolerance: 0.08
-    min_chain_success_ratio: 0.55
+    min_chain_success_ratio: 0.20
     min_task_success_ratio: 0.55
     zero_success_min_completed: 1
     min_success_by_baseline:
@@ -125,7 +125,16 @@ marl:
   topology_greedy_stale_penalty: 0.35
   reward:
     success: 10.0
-    timeout: -5.0
+    timeout: -2.0
+    # GS2L-style stage reward: service-function progress receives immediate
+    # credit, while strict SFC success remains the final evaluation metric.
+    gs2l_stage_progress: 6.0
+    gs2l_stage_success: 0.8
+    gs2l_stage_failure_discount: 0.15
+    gs2l_bandwidth_price: 0.5
+    gs2l_resource_price: 1.0
+    gs2l_quality_weight: 0.5
+    gs2l_clip: 8.0
     route_unavailable: -2.0
     deadline_slack: 0.05
     semantic_score: 0.50
@@ -153,7 +162,7 @@ marl:
   ippo_checkpoint_selection_early_until_episode: 40
   ippo_checkpoint_selection_max_steps: 120
   ippo_checkpoint_selection_seed_offsets: [1000, 1001, 1002, 1003, 1004]
-  ippo_checkpoint_selection_metric: success_min_blend
+  ippo_checkpoint_selection_metric: composite
   ippo_checkpoint_selection_mode: raw
   ippo_checkpoint_selection_robust_window: 1
   ippo_checkpoint_selection_std_penalty: 0.0

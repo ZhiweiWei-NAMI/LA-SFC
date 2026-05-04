@@ -30,6 +30,16 @@ DEFAULT_BASELINES = [
     "centralized_planner",
 ]
 
+DEFAULT_TRAINED_BASELINES = [
+    "mappo_ctde",
+    "iql_offline",
+]
+
+TRAINED_CHECKPOINT_FILES = {
+    "mappo_ctde": "mappo_policy.pt",
+    "iql_offline": "iql_policy.pt",
+}
+
 COMBINED_FILES = [
     "function_execution_trace.csv",
     "runtime_task_lifecycle_trace.csv",
@@ -48,7 +58,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run Semantic-Topology stage2 evaluation by eval-seed shards.")
     parser.add_argument("--root", required=True, help="Stage1 root containing semantic_runtime_train.")
     parser.add_argument("--seeds", nargs="+", type=int, default=list(range(10)))
-    parser.add_argument("--baselines", nargs="+", default=DEFAULT_BASELINES)
+    parser.add_argument("--baselines", nargs="+", default=None)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--poll-s", type=float, default=60.0)
     parser.add_argument(
@@ -69,6 +79,7 @@ def main() -> int:
     checkpoint_root = root / "semantic_runtime_train"
     if not checkpoint_root.exists():
         raise FileNotFoundError(f"Missing checkpoint root: {checkpoint_root}")
+    baselines = list(args.baselines) if args.baselines else default_stage2_baselines(checkpoint_root)
     if args.force and not args.combine_only:
         shutil.rmtree(shards, ignore_errors=True)
         shutil.rmtree(final, ignore_errors=True)
@@ -88,7 +99,7 @@ def main() -> int:
         for seed_start in range(0, len(args.seeds), seed_concurrency):
             batch = list(args.seeds[seed_start : seed_start + seed_concurrency])
             batch_processes = [
-                start_shard(seed, shards, checkpoint_root, args.baselines, log_dir)
+                start_shard(seed, shards, checkpoint_root, baselines, log_dir)
                 for seed in batch
             ]
             processes.extend(batch_processes)
@@ -126,7 +137,7 @@ def main() -> int:
         "completed": False,
         "failed": failed,
         "seeds": list(args.seeds),
-        "baselines": list(args.baselines),
+        "baselines": baselines,
         "checkpoint_root": str(checkpoint_root),
         "shard_root": str(shards),
         "output_dir": str(final),
@@ -149,6 +160,23 @@ def main() -> int:
     (root / "stage2_eval_manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
     print(json.dumps(manifest, indent=2, ensure_ascii=False), flush=True)
     return 0 if manifest["completed"] else 1
+
+
+def default_stage2_baselines(checkpoint_root: Path) -> list[str]:
+    baselines = list(DEFAULT_BASELINES)
+    baselines.extend(
+        baseline
+        for baseline in DEFAULT_TRAINED_BASELINES
+        if trained_checkpoint_available(checkpoint_root, baseline)
+    )
+    return baselines
+
+
+def trained_checkpoint_available(checkpoint_root: Path, baseline: str) -> bool:
+    filename = TRAINED_CHECKPOINT_FILES.get(str(baseline))
+    if not filename:
+        return False
+    return any((checkpoint_root / str(baseline)).glob(f"**/{filename}"))
 
 
 def start_shard(seed: int, shards: Path, checkpoint_root: Path, baselines: list[str], log_dir: Path) -> dict[str, Any]:

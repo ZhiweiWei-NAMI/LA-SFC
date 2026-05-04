@@ -569,13 +569,14 @@ class TrafficManager():
         return self._current_time
 
     def removeUAV(self,UAV_id):
-        assert UAV_id in self._UAV_infos.keys(),'UAV_id not in _UAV_infos'
-        del self._UAV_infos[UAV_id]
+        if UAV_id in self._UAV_infos:
+            del self._UAV_infos[UAV_id]
 
     def checkIsRemovingByUAVId(self,UAV_id):
-        UAV_info=self._UAV_infos[UAV_id]
-        assert UAV_id in self._UAV_infos.keys(), 'UAV_id not in _UAV_infos'
-        return UAV_info['speed']>0
+        UAV_info = self._UAV_infos.get(UAV_id)
+        if UAV_info is None:
+            return False
+        return float(UAV_info.get("speed", 0.0) or 0.0) > 0.0
 
     def getConfig(self,name):
         return self._config_traffic.get(name,None)
