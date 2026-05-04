@@ -71,11 +71,23 @@ class DistributedServiceCatalog:
         self.semantic_matrix = semantic_matrix
         self.remote_cache = SemanticAdvertisementCache(owner_agent_id=self.agent_id)
         self._local_embedding_by_instance: Dict[str, np.ndarray] = {}
+        self._local_embedding_key_by_instance: Dict[str, Tuple[str, str]] = {}
         self.query_trace: List[Dict[str, Any]] = []
 
     def refresh_local_embeddings(self) -> None:
+        active_ids = set()
         for instance in self.local_directory.all():
-            self._local_embedding_by_instance[instance.instance_id] = self.encoder.encode(service_instance_text(instance))
+            active_ids.add(instance.instance_id)
+            text = service_instance_text(instance)
+            key = (str(instance.version), text)
+            if self._local_embedding_key_by_instance.get(instance.instance_id) == key:
+                continue
+            self._local_embedding_by_instance[instance.instance_id] = self.encoder.encode(text)
+            self._local_embedding_key_by_instance[instance.instance_id] = key
+        stale_ids = set(self._local_embedding_by_instance) - active_ids
+        for instance_id in stale_ids:
+            self._local_embedding_by_instance.pop(instance_id, None)
+            self._local_embedding_key_by_instance.pop(instance_id, None)
 
     def ingest_remote(self, ads: Iterable[SemanticAdvertisement], now_s: float) -> int:
         return self.remote_cache.upsert_many(ads, now_s)

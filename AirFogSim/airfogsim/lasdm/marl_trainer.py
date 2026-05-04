@@ -121,6 +121,7 @@ class MASACTrainer:
         batch_size: int = 128,
         replay_capacity: int = 10000,
         replay_warmup_steps: int = 64,
+        update_interval: int = 1,
         updates_per_env_step: int = 1,
         max_grad_norm: float = 1.0,
         reward_scale: float = 1.0,
@@ -133,6 +134,7 @@ class MASACTrainer:
         self.tau = float(tau)
         self.batch_size = int(batch_size)
         self.replay_warmup_steps = int(replay_warmup_steps)
+        self.update_interval = max(1, int(update_interval))
         self.updates_per_env_step = int(updates_per_env_step)
         self.max_grad_norm = float(max_grad_norm)
         self.reward_scale = float(reward_scale)
@@ -162,7 +164,7 @@ class MASACTrainer:
                         episode=int(episode),
                     )
                 )
-                if len(self.replay) >= max(1, self.replay_warmup_steps):
+                if len(self.replay) >= max(1, self.replay_warmup_steps) and len(self.replay) % self.update_interval == 0:
                     metrics = masac_update_policy(
                         self.policy,
                         self.replay,

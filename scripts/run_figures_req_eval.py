@@ -58,7 +58,7 @@ def main() -> int:
     combined_root.mkdir(parents=True, exist_ok=True)
 
     cfg = _load_semantic_config(args.semantic_config, args.semantic_repair_config)
-    cfg.setdefault("marl", {})["ippo_eval_checkpoint_strategy"] = "global_best_validation"
+    cfg.setdefault("marl", {})["ippo_eval_checkpoint_strategy"] = "exact_seed"
     cfg.setdefault("runtime_repair", {}).setdefault("early_result_guard", {})["enabled"] = False
     cfg.setdefault("runtime_repair", {})["fail_fast_on_all_zero_success"] = False
 

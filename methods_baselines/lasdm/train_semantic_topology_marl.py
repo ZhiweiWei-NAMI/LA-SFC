@@ -8,6 +8,7 @@ import math
 import os
 import random
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
@@ -136,6 +137,7 @@ def main() -> None:
                 batch_size=int(marl_cfg.get("masac_batch_size", 128) or 128),
                 replay_capacity=int(marl_cfg.get("masac_replay_capacity", 20000) or 20000),
                 replay_warmup_steps=int(marl_cfg.get("masac_replay_warmup_steps", 128) or 128),
+                update_interval=int(marl_cfg.get("masac_update_interval", 1) or 1),
                 updates_per_env_step=int(marl_cfg.get("masac_updates_per_env_step", 1) or 1),
                 max_grad_norm=float(marl_cfg.get("masac_max_grad_norm", 1.0) or 1.0),
                 reward_scale=float(marl_cfg.get("masac_reward_scale", 1.0) or 1.0),
@@ -481,9 +483,46 @@ def _materialize_offline_config(
     semantic_output_root = Path(
         str(dict(run_config.get("semantic_profiles", {}) or {}).get("output_root", DEFAULT_V21_OUTPUT_ROOT))
     )
-    semantic_matrix.export_artifacts(semantic_output_root, materialized_instances=instances, encoder_config=exchange_cfg)
+    _export_semantic_artifacts(semantic_matrix, semantic_output_root, instances, exchange_cfg, run_config)
     run_config["_semantic_matrix"] = semantic_matrix
     return run_config
+
+
+def _export_semantic_artifacts(
+    semantic_matrix: SemanticLinkMatrix,
+    output_root: Path,
+    instances: Sequence[Mapping[str, Any]],
+    encoder_config: Mapping[str, Any],
+    run_config: Mapping[str, Any],
+) -> None:
+    profile_cfg = dict(run_config.get("semantic_profiles", {}) or {})
+    if not bool(profile_cfg.get("export_artifacts_once", True)):
+        semantic_matrix.export_artifacts(output_root, materialized_instances=instances, encoder_config=encoder_config)
+        return
+    audit_path = output_root / "semantic_dataset_audit.json"
+    if audit_path.exists():
+        return
+    output_root.mkdir(parents=True, exist_ok=True)
+    lock_path = output_root / ".semantic_artifacts_once.lock"
+    started = time.time()
+    while True:
+        try:
+            lock_path.mkdir()
+            break
+        except FileExistsError:
+            if audit_path.exists():
+                return
+            if time.time() - started > 300.0:
+                raise TimeoutError(f"Timed out waiting for semantic artifact export lock: {lock_path}")
+            time.sleep(0.5)
+    try:
+        if not audit_path.exists():
+            semantic_matrix.export_artifacts(output_root, materialized_instances=instances, encoder_config=encoder_config)
+    finally:
+        try:
+            lock_path.rmdir()
+        except OSError:
+            pass
 
 
 def _allowed_service_node_types(config: Mapping[str, Any], role_name: str) -> set[str]:

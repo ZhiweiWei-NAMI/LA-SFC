@@ -387,9 +387,9 @@ def train_semantic_ippo_runtime(
         policy: Optional[MASACPolicy] = None
         marl_cfg = dict(config.get("marl", {}) or {})
         policy_config = _config_with_baseline_updates(config, baseline)
-        selection_interval = int(marl_cfg.get("ippo_checkpoint_selection_interval", 0) or 0)
-        early_selection_interval = int(marl_cfg.get("ippo_checkpoint_selection_early_interval", 0) or 0)
-        early_selection_until = int(marl_cfg.get("ippo_checkpoint_selection_early_until_episode", 0) or 0)
+        selection_interval = 0
+        early_selection_interval = 0
+        early_selection_until = 0
         selection_max_steps = int(marl_cfg.get("ippo_checkpoint_selection_max_steps", max_steps) or max_steps)
         raw_seed_offsets = marl_cfg.get("ippo_checkpoint_selection_seed_offsets", [0, 1000])
         selection_seed_offsets = [int(item) for item in raw_seed_offsets] if isinstance(raw_seed_offsets, Sequence) and not isinstance(raw_seed_offsets, str) else [0, 1000]
@@ -411,6 +411,7 @@ def train_semantic_ippo_runtime(
         sac_update_index = 0
         sac_batch_size = int(marl_cfg.get("masac_batch_size", 128) or 128)
         sac_replay_warmup_steps = int(marl_cfg.get("masac_replay_warmup_steps", 128) or 128)
+        sac_update_interval = max(1, int(marl_cfg.get("masac_update_interval", 1) or 1))
         sac_updates_per_env_step = int(marl_cfg.get("masac_updates_per_env_step", 1) or 1)
         sac_tau = float(marl_cfg.get("masac_tau", 0.005) or 0.005)
         sac_auto_alpha = bool(marl_cfg.get("masac_auto_alpha", False))
@@ -559,7 +560,7 @@ def train_semantic_ippo_runtime(
                             source="policy",
                         )
                     )
-                    if len(replay_buffer) >= max(1, sac_replay_warmup_steps):
+                    if len(replay_buffer) >= max(1, sac_replay_warmup_steps) and len(replay_buffer) % sac_update_interval == 0:
                         _append_runtime_debug_event(
                             debug_path,
                             "sac_update_start",
@@ -650,7 +651,10 @@ def train_semantic_ippo_runtime(
                     active_selection_interval = early_selection_interval
                 selection_due = (
                     active_selection_interval > 0
-                    and ((episode + 1) % active_selection_interval == 0 or episode == episodes - 1)
+                    and (
+                        (episode + 1) % active_selection_interval == 0
+                        or (episode == episodes - 1 and int(episodes) >= active_selection_interval)
+                    )
                 )
                 if policy is not None and selection_due:
                     _append_runtime_debug_event(
@@ -786,7 +790,8 @@ def train_semantic_ippo_runtime(
                 )
                 _close_env(air_env)
         write_reward_curve(seed_dir / "reward_curve.csv", reward_rows)
-        _write_csv_dynamic(seed_dir / "checkpoint_selection.csv", selection_rows)
+        if selection_rows:
+            _write_csv_dynamic(seed_dir / "checkpoint_selection.csv", selection_rows)
         checkpoint_path = seed_dir / "masac_policy.pt"
         checkpoint_saved = False
         checkpoint_error = ""
@@ -829,6 +834,7 @@ def train_semantic_ippo_runtime(
             "masac_critic_agent_count": int(marl_cfg.get("ippo_critic_agent_count", 4) or 4),
             "masac_replay_size": len(replay_buffer),
             "masac_batch_size": sac_batch_size,
+            "masac_update_interval": sac_update_interval,
             "masac_alpha": float(marl_cfg.get("masac_alpha", 0.05) or 0.05),
             "masac_auto_alpha": sac_auto_alpha,
             "masac_alpha_lr": sac_alpha_lr,

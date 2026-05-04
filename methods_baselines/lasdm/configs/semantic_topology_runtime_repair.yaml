@@ -102,9 +102,10 @@ marl:
   masac_alpha_max: 0.25
   masac_tau: 0.005
   masac_q_lr: 0.0003
-  masac_batch_size: 128
+  masac_batch_size: 32
   masac_replay_capacity: 20000
   masac_replay_warmup_steps: 128
+  masac_update_interval: 4
   masac_updates_per_env_step: 1
   masac_max_grad_norm: 1.0
   masac_reward_scale: 1.0
@@ -153,24 +154,12 @@ marl:
     resource_available: 0.25
     remaining_deadline: 0.25
     dense_clip: 3.0
-  # Save the checkpoint that performs best on a small live-runtime validation
-  # copy instead of blindly saving the final stochastic RL episode.  This is
-  # standard model selection: success/task-success dominate, latency is a
-  # secondary tie-breaker.
-  ippo_checkpoint_selection_interval: 100
-  ippo_checkpoint_selection_early_interval: 100
-  ippo_checkpoint_selection_early_until_episode: 40
-  ippo_checkpoint_selection_max_steps: 120
-  ippo_checkpoint_selection_seed_offsets: [1000, 1001, 1002, 1003, 1004]
-  ippo_checkpoint_selection_metric: composite
-  ippo_checkpoint_selection_mode: raw
-  ippo_checkpoint_selection_robust_window: 1
-  ippo_checkpoint_selection_std_penalty: 0.0
-  # Use the checkpoint with the best live-runtime validation score across
-  # random restarts; evaluation still runs on held-out eval seeds.
-  ippo_eval_checkpoint_strategy: global_best_validation
+  ippo_checkpoint_selection_interval: 0
+  ippo_checkpoint_selection_early_interval: 0
+  ippo_checkpoint_selection_early_until_episode: 0
+  ippo_eval_checkpoint_strategy: exact_seed
   masac_eval_prefer_sac_for_proposed: false
-  masac_eval_min_proposed_sac_selected_count: 3
+  masac_eval_min_proposed_sac_selected_count: 0
   ippo_training_progress_guard_enabled: true
   ippo_training_guard_min_episodes: 12
   ippo_training_guard_recent_window: 3

@@ -338,7 +338,7 @@ cfg = _load_semantic_config(
     "methods_baselines/lasdm/configs/semantic_topology_marl.yaml",
     "methods_baselines/lasdm/configs/semantic_topology_runtime_repair.yaml",
 )
-cfg.setdefault("marl", {})["ippo_eval_checkpoint_strategy"] = "global_best_validation"
+cfg.setdefault("marl", {})["ippo_eval_checkpoint_strategy"] = "exact_seed"
 cfg.setdefault("runtime_repair", {}).setdefault("early_result_guard", {})["enabled"] = False
 scenarios = _select_scenarios(cfg, None)
 result = evaluate_semantic_runtime(

@@ -80,6 +80,7 @@ class SemanticLinkScorer(nn.Module):
         self.embedding_dim = int(embedding_dim)
         self.service_type_to_idx = {str(key): int(value) for key, value in dict(service_type_to_idx or {}).items()}
         self.module = _TorchScorer()
+        self._text_tensor_cache: Dict[tuple[str, str, str], Any] = {}
 
     def parameters(self):
         return self.module.parameters()
@@ -118,14 +119,21 @@ class SemanticLinkScorer(nn.Module):
         return int(self.service_type_to_idx.get(str(service_type), 0))
 
     def encode_text_tensor(self, text: Any, dtype: Any = None, device: Any = None) -> Any:
-        vector = np.asarray(self.encoder.encode(str(text or "")), dtype=np.float32).reshape(-1)
+        target_device = device if device is not None else self.device
+        target_dtype = dtype if dtype is not None else self.torch.float32
+        text_key = str(text or "")
+        cache_key = (text_key, str(target_device), str(target_dtype))
+        cached = self._text_tensor_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        vector = np.asarray(self.encoder.encode(text_key), dtype=np.float32).reshape(-1)
         if vector.size < self.embedding_dim:
             vector = np.pad(vector, (0, self.embedding_dim - vector.size), mode="constant")
         elif vector.size > self.embedding_dim:
             vector = vector[: self.embedding_dim]
-        target_device = device if device is not None else self.device
-        target_dtype = dtype if dtype is not None else self.torch.float32
-        return self.torch.as_tensor(vector, dtype=target_dtype, device=target_device)
+        tensor = self.torch.as_tensor(vector, dtype=target_dtype, device=target_device)
+        self._text_tensor_cache[cache_key] = tensor
+        return tensor
 
     @property
     def no_grad(self):

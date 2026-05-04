@@ -11,7 +11,7 @@ import numpy as np
 from .graph_observation import flatten_observation
 
 
-RESOURCE_LEVEL_VALUES: Tuple[float, ...] = tuple(round(0.1 * index, 1) for index in range(1, 11))
+RESOURCE_LEVEL_VALUES: Tuple[float, ...] = (0.2, 0.4, 0.6, 0.8, 1.0)
 RESOURCE_ACTION_DIM = len(RESOURCE_LEVEL_VALUES)
 
 
