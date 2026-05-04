@@ -131,6 +131,10 @@ class MAPPOTrainer:
                     env.write_traces(str(target))
             finally:
                 self._close_episode_env(env)
+            if target is not None:
+                target.mkdir(parents=True, exist_ok=True)
+                write_reward_curve(target / "reward_curve.csv", rows)
+                _write_diagnostics(target / "mappo_diagnostics.csv", diagnostics)
         if output_dir is not None:
             target = Path(output_dir)
             target.mkdir(parents=True, exist_ok=True)

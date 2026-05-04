@@ -195,6 +195,8 @@ def render_training(root: Path, expected_episodes: int, process_rows: Sequence[M
         "last_reward",
         "best",
         "w10(s/r)",
+        "diag",
+        "phase",
         "dataset",
         "offline",
         "eval",
@@ -223,6 +225,9 @@ def training_row(
 ) -> list[str]:
     rows = read_csv_rows(progress_path)
     summary = read_json(summary_path)
+    seed_dir = progress_path.parent
+    diag_text, diag_paths = diagnostic_progress(seed_dir, variant)
+    phase_text, phase_paths = runtime_phase_progress(seed_dir, now)
     filtered = filter_expected_rows(rows, expected_episodes)
     latest = filtered[-1] if filtered else (rows[-1] if rows else {})
     latest_ep = safe_int(latest.get("episode")) if latest else None
@@ -242,7 +247,9 @@ def training_row(
         state = "CHECKPOINT_PARTIAL"
     elif rows:
         state = "PARTIAL"
-    last_update = path_age(progress_path, now)
+    activity_paths = [progress_path, selection_path, summary_path, *diag_paths, *phase_paths]
+    last_activity = newest_mtime(activity_paths)
+    last_update = age(last_activity, now) if last_activity else "-"
     best = best_selection(selection_path, summary, progress_path.parent)
     dataset_progress, offline_progress, eval_progress = iql_progress_fields(progress_path.parent, variant, expected_episodes)
     return [
@@ -255,10 +262,65 @@ def training_row(
         fmt_float(row_reward(latest)),
         best,
         window_pair(filtered or rows, 10),
+        diag_text,
+        phase_text,
         dataset_progress,
         offline_progress,
         eval_progress,
     ]
+
+
+def runtime_phase_progress(seed_dir: Path, now: float) -> tuple[str, list[Path]]:
+    heartbeat_path = seed_dir / "runtime_heartbeat.json"
+    heartbeat = read_json(heartbeat_path)
+    if not isinstance(heartbeat, Mapping):
+        return "-", [heartbeat_path, seed_dir / "runtime_debug.jsonl"]
+    event = str(heartbeat.get("event", "") or "-")
+    episode = safe_int(heartbeat.get("episode"))
+    step = safe_int(heartbeat.get("step"))
+    update = safe_int(heartbeat.get("update_index"))
+    timestamp = safe_float(heartbeat.get("time_s"))
+    age_text = age(timestamp, now) if timestamp is not None else "-"
+    suffix = ""
+    if episode is not None and step is not None:
+        suffix = f"@e{episode}s{step}"
+    elif episode is not None:
+        suffix = f"@e{episode}"
+    if update is not None:
+        suffix += f"u{update}"
+    return f"{event}{suffix}/{age_text}", [heartbeat_path, seed_dir / "runtime_debug.jsonl"]
+
+
+def diagnostic_progress(seed_dir: Path, variant: str) -> tuple[str, list[Path]]:
+    if variant == "iql_offline":
+        path = seed_dir / "iql_diagnostics.csv"
+        rows = read_csv_rows(path)
+        if not rows:
+            return "-", [path, seed_dir / "iql_behavior_reward_curve.csv", seed_dir / "iql_eval_reward_curve.csv"]
+        last = rows[-1]
+        return f"iql:{len(rows)}", [path, seed_dir / "iql_behavior_reward_curve.csv", seed_dir / "iql_eval_reward_curve.csv"]
+    if variant == "mappo_ctde":
+        path = seed_dir / "mappo_diagnostics.csv"
+        rows = read_csv_rows(path)
+        if not rows:
+            return "-", [path]
+        update = safe_int(rows[-1].get("update_index")) or len(rows)
+        episode = safe_int(rows[-1].get("episode"))
+        return f"ppo:{update}" + (f"@e{episode}" if episode is not None else ""), [path]
+    path = seed_dir / "sac_diagnostics.csv"
+    rows = read_csv_rows(path)
+    if not rows:
+        return "-", [path]
+    last = rows[-1]
+    update = safe_int(last.get("update_index")) or len(rows)
+    episode = safe_int(last.get("episode"))
+    step = safe_int(last.get("step"))
+    suffix = ""
+    if episode is not None and step is not None:
+        suffix = f"@e{episode}s{step}"
+    elif episode is not None:
+        suffix = f"@e{episode}"
+    return f"sac:{update}{suffix}", [path]
 
 
 def iql_progress_fields(seed_dir: Path, variant: str, expected_episodes: int) -> tuple[str, str, str]:

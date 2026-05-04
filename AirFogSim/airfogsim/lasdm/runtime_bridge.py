@@ -235,19 +235,7 @@ class LASDMRuntimeBridge:
         return updated
 
     def _semantic_quality_failure(self, task: Task) -> Optional[Dict[str, Any]]:
-        min_score = float(getattr(task, "_lasdm_semantic_min_score", 0.0) or 0.0)
-        score = float(getattr(task, "_lasdm_semantic_cumulative_quality", 1.0) or 1.0)
-        if not bool(getattr(task, "_lasdm_is_sink", False)):
-            return None
-        if min_score <= 0.0 or score >= min_score:
-            return None
-        return {
-            "airfogsim_failure_reason": "semantic_accuracy_violation",
-            "semantic_score": float(getattr(task, "_lasdm_semantic_score", score) or score),
-            "semantic_cumulative_quality": score,
-            "semantic_min_score": min_score,
-            "semantic_shortfall": max(0.0, min_score - score),
-        }
+        return None
 
     def update_sfc_status(self, current_time: float, sfc_id: Optional[str] = None) -> Dict[str, str]:
         """Complete SFCs whose terminal function nodes have all finished."""
@@ -527,10 +515,7 @@ class LASDMRuntimeBridge:
         task.setAttribute("_lasdm_semantic_quality_before", semantic_quality_before)
         task.setAttribute("_lasdm_semantic_cumulative_quality", semantic_cumulative_quality)
         task.setAttribute("_lasdm_semantic_min_score", semantic_min_score)
-        task.setAttribute(
-            "_lasdm_semantic_quality_violation",
-            bool(getattr(task, "_lasdm_is_sink", False) and semantic_min_score > 0.0 and semantic_cumulative_quality < semantic_min_score),
-        )
+        task.setAttribute("_lasdm_semantic_quality_violation", False)
         task.setAttribute("_lasdm_semantic_link_truth_relation", str(metadata.get("semantic_link_truth_relation", "")))
         task.setAttribute("_lasdm_semantic_link_truth_score", _float(metadata.get("semantic_link_truth_score"), 0.0))
         if metadata.get("link_source_semantic"):

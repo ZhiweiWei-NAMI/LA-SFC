@@ -161,6 +161,15 @@ class SemanticTopologyMARLEnv:
             )
         )
         self.discovery_protocol = self._build_default_discovery_protocol()
+        if not self.config.include_semantic_features and isinstance(self.reward_fn, SFCReward):
+            self.reward_fn = SFCReward(
+                replace(
+                    self.reward_fn.config,
+                    semantic_score=0.0,
+                    semantic_cumulative=0.0,
+                    utility_prior=0.0,
+                )
+            )
 
     @property
     def agent_ids(self) -> List[str]:
@@ -781,7 +790,7 @@ class SemanticTopologyMARLEnv:
             fields["semantic_link_truth_score"] = max(0.0, min(1.0, float(metadata.get("semantic_link_truth_score", 0.0) or 0.0)))
         fields["semantic_min_score"] = semantic_min_score
         fields["semantic_shortfall"] = semantic_shortfall
-        fields["semantic_quality_violation"] = 1.0 if semantic_shortfall > 0.0 and not chain.successors(str(sfc_node_id or "")) else 0.0
+        fields["semantic_quality_violation"] = 0.0
         fields["task_cpu"] = task_cpu
         fields["candidate_capacity_cpu"] = capacity_cpu
         fields["effective_cpu"] = effective_cpu

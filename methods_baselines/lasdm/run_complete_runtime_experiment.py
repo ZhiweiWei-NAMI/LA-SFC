@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import copy
 import csv
+import faulthandler
 import hashlib
 import json
 import os
@@ -59,6 +60,39 @@ TRAINED_CHECKPOINT_FILES = {
     "mappo_ctde": "mappo_policy.pt",
     "iql_offline": "iql_policy.pt",
 }
+_RUNTIME_STACK_WATCHDOG_FILES: Dict[str, Any] = {}
+
+
+def _append_runtime_debug_event(path: Path, event: str, **fields: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _arm_runtime_stack_watchdog(path)
+    payload = {
+        "time_s": time.time(),
+        "pid": os.getpid(),
+        "event": str(event),
+        **fields,
+    }
+    with path.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+        file.flush()
+    heartbeat_path = path.with_name("runtime_heartbeat.json")
+    tmp_path = heartbeat_path.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+    os.replace(tmp_path, heartbeat_path)
+
+
+def _arm_runtime_stack_watchdog(debug_path: Path) -> None:
+    timeout_s = int(os.environ.get("RUNTIME_DEBUG_STACK_TIMEOUT_S", "600") or "600")
+    if timeout_s <= 0:
+        return
+    faulthandler.cancel_dump_traceback_later()
+    stack_path = debug_path.with_name("runtime_stack_timeout.log")
+    key = str(stack_path)
+    handle = _RUNTIME_STACK_WATCHDOG_FILES.get(key)
+    if handle is None or getattr(handle, "closed", False):
+        handle = stack_path.open("a", encoding="utf-8")
+        _RUNTIME_STACK_WATCHDOG_FILES[key] = handle
+    faulthandler.dump_traceback_later(timeout_s, repeat=False, file=handle)
 
 SUMMARY_FIELDS = [
     "family",
@@ -341,6 +375,15 @@ def train_semantic_ippo_runtime(
         if seed_dir.exists():
             shutil.rmtree(seed_dir)
         seed_dir.mkdir(parents=True, exist_ok=True)
+        debug_path = seed_dir / "runtime_debug.jsonl"
+        _append_runtime_debug_event(
+            debug_path,
+            "seed_start",
+            baseline=baseline,
+            seed=int(seed),
+            episodes=int(episodes),
+            max_steps=int(max_steps),
+        )
         policy: Optional[MASACPolicy] = None
         marl_cfg = dict(config.get("marl", {}) or {})
         policy_config = _config_with_baseline_updates(config, baseline)
@@ -387,16 +430,72 @@ def train_semantic_ippo_runtime(
                 max(1, int(episodes)),
             )
             role = roles[episode % len(roles)]
+            _append_runtime_debug_event(
+                debug_path,
+                "episode_env_build_start",
+                baseline=baseline,
+                seed=int(seed),
+                episode=int(episode),
+                scenario=str(scenario.get("name", "default")),
+                role=str(role),
+            )
             env, air_env = _build_semantic_runtime_env(config, scenario, role, seed, baseline, max_steps)
+            _append_runtime_debug_event(
+                debug_path,
+                "episode_env_build_end",
+                baseline=baseline,
+                seed=int(seed),
+                episode=int(episode),
+                scenario=str(scenario.get("name", "default")),
+                role=str(role),
+                service_chains=len(getattr(env, "chains", []) or []),
+            )
             try:
                 if policy is not None and getattr(policy, "semantic_scorer", None) is not None:
+                    _append_runtime_debug_event(
+                        debug_path,
+                        "semantic_scorer_rebind_start",
+                        baseline=baseline,
+                        seed=int(seed),
+                        episode=int(episode),
+                    )
                     env.config = replace(env.config, semantic_scorer=policy.semantic_scorer)
                     env.rebuild_config_dependent_components()
+                    _append_runtime_debug_event(
+                        debug_path,
+                        "semantic_scorer_rebind_end",
+                        baseline=baseline,
+                        seed=int(seed),
+                        episode=int(episode),
+                    )
+                _append_runtime_debug_event(
+                    debug_path,
+                    "env_reset_start",
+                    baseline=baseline,
+                    seed=int(seed),
+                    episode=int(episode),
+                )
                 observations = env.reset()
+                _append_runtime_debug_event(
+                    debug_path,
+                    "env_reset_end",
+                    baseline=baseline,
+                    seed=int(seed),
+                    episode=int(episode),
+                    agent_count=len(observations),
+                    candidate_set_count=sum(len(obs.get("candidate_sets", []) or []) for obs in observations.values()),
+                )
                 wrote_episode_traces = False
                 episode_summary: Dict[str, Any] = {}
                 episode_step_count = 0
                 if policy is None:
+                    _append_runtime_debug_event(
+                        debug_path,
+                        "policy_init_start",
+                        baseline=baseline,
+                        seed=int(seed),
+                        episode=int(episode),
+                    )
                     obs_dim = max(len(flatten_observation(obs)) for obs in observations.values()) if observations else 1
                     max_candidates = int(config.get("marl", {}).get("max_candidates", 16))
                     policy = MASACPolicy(
@@ -412,11 +511,39 @@ def train_semantic_ippo_runtime(
                         tau=sac_tau,
                         semantic_scorer=env.config.semantic_scorer,
                     )
+                    _append_runtime_debug_event(
+                        debug_path,
+                        "policy_init_end",
+                        baseline=baseline,
+                        seed=int(seed),
+                        episode=int(episode),
+                        obs_dim=int(obs_dim),
+                        max_candidates=int(max_candidates),
+                    )
                 total = 0.0
                 for step in range(int(max_steps)):
                     current_observations = observations
+                    _append_runtime_debug_event(
+                        debug_path,
+                        "step_policy_start",
+                        baseline=baseline,
+                        seed=int(seed),
+                        episode=int(episode),
+                        step=int(step),
+                        replay_size=len(replay_buffer),
+                    )
                     policy_step = policy.act_with_logprobs(current_observations, deterministic=False, track_grad=False)
                     actions = policy_step.actions
+                    action_count = sum(len(agent_actions or []) for agent_actions in actions.values())
+                    _append_runtime_debug_event(
+                        debug_path,
+                        "step_env_start",
+                        baseline=baseline,
+                        seed=int(seed),
+                        episode=int(episode),
+                        step=int(step),
+                        action_count=int(action_count),
+                    )
                     observations, rewards, done, info = env.step(actions)
                     mean_reward = sum(rewards.values()) / max(1, len(rewards))
                     total += mean_reward
@@ -433,6 +560,16 @@ def train_semantic_ippo_runtime(
                         )
                     )
                     if len(replay_buffer) >= max(1, sac_replay_warmup_steps):
+                        _append_runtime_debug_event(
+                            debug_path,
+                            "sac_update_start",
+                            baseline=baseline,
+                            seed=int(seed),
+                            episode=int(episode),
+                            step=int(step),
+                            replay_size=len(replay_buffer),
+                            update_index=int(sac_update_index + 1),
+                        )
                         metrics = masac_update_policy(
                             policy,
                             replay_buffer,
@@ -444,6 +581,17 @@ def train_semantic_ippo_runtime(
                             reward_scale=sac_reward_scale,
                             sample_strategy=sac_replay_sample_strategy,
                             update_actor=True,
+                        )
+                        _append_runtime_debug_event(
+                            debug_path,
+                            "sac_update_end",
+                            baseline=baseline,
+                            seed=int(seed),
+                            episode=int(episode),
+                            step=int(step),
+                            replay_size=len(replay_buffer),
+                            update_index=int(sac_update_index + 1),
+                            metric_count=len(metrics or {}),
                         )
                         if metrics:
                             sac_update_index += 1
@@ -463,6 +611,22 @@ def train_semantic_ippo_runtime(
                     summary_dict = info.get("summary", {})
                     episode_summary = dict(summary_dict)
                     episode_step_count = step + 1
+                    _append_runtime_debug_event(
+                        debug_path,
+                        "step_end",
+                        baseline=baseline,
+                        seed=int(seed),
+                        episode=int(episode),
+                        step=int(step),
+                        done=bool(done),
+                        mean_reward=float(mean_reward),
+                        total_reward=float(total),
+                        succeeded=int(summary_dict.get("succeeded", 0) or 0),
+                        failed=int(summary_dict.get("failed", 0) or 0),
+                        timed_out=int(summary_dict.get("timed_out", 0) or 0),
+                        active_graphs=int(summary_dict.get("active_graphs", 0) or 0),
+                        next_candidate_set_count=sum(len(obs.get("candidate_sets", []) or []) for obs in observations.values()),
+                    )
                     reward_rows.append(
                         TrainingMetrics(
                             episode=episode,
@@ -489,6 +653,13 @@ def train_semantic_ippo_runtime(
                     and ((episode + 1) % active_selection_interval == 0 or episode == episodes - 1)
                 )
                 if policy is not None and selection_due:
+                    _append_runtime_debug_event(
+                        debug_path,
+                        "checkpoint_selection_start",
+                        baseline=baseline,
+                        seed=int(seed),
+                        episode=int(episode),
+                    )
                     _close_env(air_env)
                     air_env = None
                     validation_seeds = [
@@ -503,6 +674,14 @@ def train_semantic_ippo_runtime(
                         policy,
                         selection_max_steps,
                         baseline,
+                    )
+                    _append_runtime_debug_event(
+                        debug_path,
+                        "checkpoint_selection_eval_end",
+                        baseline=baseline,
+                        seed=int(seed),
+                        episode=int(episode),
+                        validation_success=float(validation_metrics.get("success_ratio_mean", 0.0) or 0.0),
                     )
                     raw_validation_score = _ippo_checkpoint_selection_score(validation_metrics, metric=selection_metric)
                     selection_row = {
@@ -556,6 +735,14 @@ def train_semantic_ippo_runtime(
                             selection_row["checkpoint_sha256"] = ""
                             selection_row["checkpoint_error"] = str(exc)
                     _write_csv_dynamic(seed_dir / "checkpoint_selection.csv", selection_rows)
+                    _append_runtime_debug_event(
+                        debug_path,
+                        "checkpoint_selection_end",
+                        baseline=baseline,
+                        seed=int(seed),
+                        episode=int(episode),
+                        selection_score=float(selection_score),
+                    )
                 if episode == episodes - 1 and not wrote_episode_traces:
                     env.write_traces(str(seed_dir))
                     _write_runtime_trace_files(seed_dir, "semantic_runtime_train", baseline, scenario, role, seed, env)
@@ -575,7 +762,28 @@ def train_semantic_ippo_runtime(
                 progress_guard = _evaluate_training_progress_guard(progress_rows, marl_cfg)
                 if not progress_guard.get("passed", True):
                     _write_json(seed_dir / "training_progress_guard_warning.json", progress_guard)
+                _append_runtime_debug_event(
+                    debug_path,
+                    "episode_end",
+                    baseline=baseline,
+                    seed=int(seed),
+                    episode=int(episode),
+                    step_count=int(episode_step_count),
+                    total_reward=float(total),
+                    sac_update_index=int(sac_update_index),
+                    succeeded=int(episode_summary.get("succeeded", 0) or 0),
+                    failed=int(episode_summary.get("failed", 0) or 0),
+                    timed_out=int(episode_summary.get("timed_out", 0) or 0),
+                    active_graphs=int(episode_summary.get("active_graphs", 0) or 0),
+                )
             finally:
+                _append_runtime_debug_event(
+                    debug_path,
+                    "episode_close_env",
+                    baseline=baseline,
+                    seed=int(seed),
+                    episode=int(episode),
+                )
                 _close_env(air_env)
         write_reward_curve(seed_dir / "reward_curve.csv", reward_rows)
         _write_csv_dynamic(seed_dir / "checkpoint_selection.csv", selection_rows)
@@ -583,6 +791,12 @@ def train_semantic_ippo_runtime(
         checkpoint_saved = False
         checkpoint_error = ""
         if policy is not None:
+            _append_runtime_debug_event(
+                debug_path,
+                "final_checkpoint_start",
+                baseline=baseline,
+                seed=int(seed),
+            )
             try:
                 if best_state is not None:
                     policy.load_sac_state_dict(best_state, strict=True)
@@ -590,6 +804,14 @@ def train_semantic_ippo_runtime(
                 checkpoint_saved = checkpoint_path.exists()
             except Exception as exc:
                 checkpoint_error = str(exc)
+            _append_runtime_debug_event(
+                debug_path,
+                "final_checkpoint_end",
+                baseline=baseline,
+                seed=int(seed),
+                checkpoint_saved=bool(checkpoint_saved),
+                checkpoint_error=str(checkpoint_error),
+            )
         train_summary = {
             "baseline": baseline,
             "seed": seed,
@@ -627,6 +849,14 @@ def train_semantic_ippo_runtime(
             "last_metrics": reward_rows[-1].to_dict() if reward_rows else {},
         }
         _write_json(seed_dir / "train_summary.json", train_summary)
+        _append_runtime_debug_event(
+            debug_path,
+            "seed_end",
+            baseline=baseline,
+            seed=int(seed),
+            checkpoint_saved=bool(checkpoint_saved),
+            reward_rows=len(reward_rows),
+        )
         summary.append(train_summary)
     return {"completed": True, "seed_count": len(seeds), "output_dir": str(output_root), "runs": summary}
 

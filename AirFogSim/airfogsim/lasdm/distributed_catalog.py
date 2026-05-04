@@ -94,10 +94,8 @@ class DistributedServiceCatalog:
         request_type: str = "",
         chain_position: int = 0,
     ) -> List[CatalogCandidate]:
-        self.refresh_local_embeddings()
         required = set(required_capabilities or [])
         allowed_types = {str(item) for item in allowed_node_types or ()}
-        query_vec = self.encoder.encode(query_text)
         candidates: List[CatalogCandidate] = []
 
         for instance in self.local_directory.all():
@@ -107,51 +105,39 @@ class DistributedServiceCatalog:
                 continue
             if self.respect_local_visibility and instance.metadata.get("local_catalog_visible") is False:
                 continue
-            vector = self._local_embedding_by_instance.get(instance.instance_id)
-            if vector is None:
-                vector = self.encoder.encode(service_instance_text(instance))
-            template_score = _semantic_fidelity(float(self.encoder.similarity(query_vec, vector.reshape(1, -1))[0]))
-            score = self._score_candidate_for_discovery(
-                query_text=query_text,
-                candidate_metadata=instance.metadata,
-                service_id=instance.service_id,
-                node_type=instance.node_type,
-                region_id=instance.region_id,
-                is_remote=False,
-                chain_position=chain_position,
-                template_score=template_score,
+            metadata = _candidate_metadata(instance)
+            truth = self._truth_metadata(request_type, instance.service_id, metadata, link_input_semantic)
+            score = _semantic_fidelity(float(truth.get("semantic_link_truth_score", 1.0) or 1.0))
+            metadata.update(
+                {
+                    "node_template_similarity": score,
+                    "link_similarity": score,
+                    "link_source_semantic": str(link_input_semantic or ""),
+                    "candidate_input_semantic": str(instance.input_semantic),
+                    "candidate_output_semantic": str(instance.output_semantic),
+                    "request_context_text": str(query_text),
+                    "chain_position": int(chain_position),
+                    "semantic_discovery": "hard_type",
+                }
             )
-            if score >= min_similarity:
-                metadata = _candidate_metadata(instance)
-                metadata.update(
-                    {
-                        "node_template_similarity": template_score,
-                        "link_similarity": score,
-                        "link_source_semantic": str(link_input_semantic or ""),
-                        "candidate_input_semantic": str(instance.input_semantic),
-                        "candidate_output_semantic": str(instance.output_semantic),
-                        "request_context_text": str(query_text),
-                        "chain_position": int(chain_position),
-                    }
+            metadata.update(truth)
+            candidates.append(
+                CatalogCandidate(
+                    instance_id=instance.instance_id,
+                    service_id=instance.service_id,
+                    node_id=instance.node_id,
+                    region_id=instance.region_id,
+                    node_type=instance.node_type,
+                    source="local",
+                    owner_agent_id=self.agent_id,
+                    semantic_score=score,
+                    staleness_s=0.0,
+                    is_remote=False,
+                    input_semantic=str(instance.input_semantic),
+                    output_semantic=str(instance.output_semantic),
+                    metadata=metadata,
                 )
-                metadata.update(self._truth_metadata(request_type, instance.service_id, metadata, link_input_semantic))
-                candidates.append(
-                    CatalogCandidate(
-                        instance_id=instance.instance_id,
-                        service_id=instance.service_id,
-                        node_id=instance.node_id,
-                        region_id=instance.region_id,
-                        node_type=instance.node_type,
-                        source="local",
-                        owner_agent_id=self.agent_id,
-                        semantic_score=score,
-                        staleness_s=0.0,
-                        is_remote=False,
-                        input_semantic=str(instance.input_semantic),
-                        output_semantic=str(instance.output_semantic),
-                        metadata=metadata,
-                    )
-                )
+            )
 
         if include_remote:
             for ad in self.remote_cache.fresh(now_s):
@@ -161,33 +147,22 @@ class DistributedServiceCatalog:
                     continue
                 if allowed_types and str(ad.node_type) not in allowed_types:
                     continue
-                template_score = _semantic_fidelity(self.compressor.compressed_similarity(query_vec, ad.compressed_embedding))
-                score = self._score_candidate_for_discovery(
-                    query_text=query_text,
-                    candidate_metadata=ad.metadata,
-                    service_id=ad.service_id,
-                    node_type=ad.node_type,
-                    region_id=ad.region_id,
-                    is_remote=True,
-                    chain_position=chain_position,
-                    template_score=template_score,
-                    staleness_s=ad.age_s(now_s),
-                )
-                if score < min_similarity:
-                    continue
                 metadata = _remote_candidate_metadata(ad, now_s)
+                truth = self._truth_metadata(request_type, ad.service_id, metadata, link_input_semantic)
+                score = _semantic_fidelity(float(truth.get("semantic_link_truth_score", 1.0) or 1.0))
                 metadata.update(
                     {
-                        "node_template_similarity": template_score,
+                        "node_template_similarity": score,
                         "link_similarity": score,
                         "link_source_semantic": str(link_input_semantic or ""),
                         "candidate_input_semantic": str(ad.input_semantic),
                         "candidate_output_semantic": str(ad.output_semantic),
                         "request_context_text": str(query_text),
                         "chain_position": int(chain_position),
+                        "semantic_discovery": "hard_type",
                     }
                 )
-                metadata.update(self._truth_metadata(request_type, ad.service_id, metadata, link_input_semantic))
+                metadata.update(truth)
                 candidates.append(
                     CatalogCandidate(
                         instance_id=ad.instance_id,
@@ -207,7 +182,7 @@ class DistributedServiceCatalog:
                     )
                 )
 
-        candidates.sort(key=lambda item: (-item.semantic_score, item.is_remote, item.staleness_s, item.instance_id))
+        candidates.sort(key=lambda item: (item.is_remote, item.staleness_s, item.node_type, item.node_id, item.instance_id))
         result = _diverse_top_k(candidates, max(0, int(top_k)))
         self.query_trace.append(
             {
@@ -220,42 +195,10 @@ class DistributedServiceCatalog:
                 "remote_count": sum(1 for item in result if item.is_remote),
                 "stale_ratio": self.remote_cache.stale_ratio(now_s),
                 "top_score": result[0].semantic_score if result else None,
+                "semantic_discovery": "hard_type",
             }
         )
         return result
-
-    def _score_candidate_for_discovery(
-        self,
-        query_text: str,
-        candidate_metadata: Mapping[str, Any],
-        service_id: str,
-        node_type: str,
-        region_id: str,
-        is_remote: bool,
-        chain_position: int,
-        template_score: float,
-        staleness_s: float = 0.0,
-    ) -> float:
-        scorer = self.semantic_scorer
-        if scorer is None:
-            return _semantic_fidelity(template_score)
-        service_idx = scorer.service_type_index(service_id, dict(candidate_metadata or {}).get("service_type_idx"))
-        profile_text = str(dict(candidate_metadata or {}).get("profile_text", "") or "")
-        if not profile_text:
-            profile_text = str(dict(candidate_metadata or {}).get("semantic_description", "") or service_id)
-        return _semantic_fidelity(
-            scorer.score_for_discovery(
-                request_context_text=query_text,
-                instance_profile_text=profile_text,
-                service_type_idx=service_idx,
-                chain_position=int(chain_position),
-                node_type=str(node_type),
-                is_remote=bool(is_remote),
-                is_same_region=str(region_id) == self.agent_id,
-                staleness_s=float(staleness_s),
-                topology_risk=float(dict(candidate_metadata or {}).get("topology_risk", 0.0) or 0.0),
-            )
-        )
 
     def _truth_metadata(
         self,
@@ -347,73 +290,11 @@ def _remote_candidate_metadata(ad: Any, now_s: float) -> Dict[str, Any]:
 
 
 def _diverse_top_k(candidates: Sequence[CatalogCandidate], top_k: int) -> List[CatalogCandidate]:
-    """Return semantically ranked candidates while preserving topology trade-offs.
-
-    The discovery layer is semantic-first, but a pure semantic top-k can remove
-    all low-risk candidates before topology-aware policies or MARL observe them.
-    This selector keeps the best semantic candidates and then fills the remaining
-    budget with the best candidates from each calibrated semantic/topology group
-    and low-risk candidates. It does not change the selected action; it only
-    exposes the trade-off to the policy.
-    """
+    """Return the hard-matched candidate prefix; semantic never affects discovery."""
 
     if top_k <= 0:
-        return []
-    ranked = list(candidates)
-    if len(ranked) <= top_k:
-        return ranked
-    selected: List[CatalogCandidate] = []
-    seen: set[str] = set()
-
-    def add(candidate: CatalogCandidate) -> None:
-        if len(selected) >= top_k or candidate.instance_id in seen:
-            return
-        selected.append(candidate)
-        seen.add(candidate.instance_id)
-
-    semantic_quota = max(1, min(len(ranked), top_k // 2))
-    for candidate in ranked[:semantic_quota]:
-        add(candidate)
-
-    group_order = [
-        "remote_exact",
-        "remote_compatible",
-        "borderline_weak",
-        "hard_negative_mismatch",
-        "stale_clone_exact",
-    ]
-    for group in group_order:
-        group_candidates = [
-            item
-            for item in ranked
-            if str(dict(item.metadata or {}).get("semantic_group", "")) == group
-        ]
-        group_candidates.sort(
-            key=lambda item: (
-                _float(dict(item.metadata or {}).get("topology_risk"), 0.0),
-                _float(dict(item.metadata or {}).get("load_ratio"), 0.0),
-                -item.semantic_score,
-                item.instance_id,
-            )
-        )
-        if group_candidates:
-            add(group_candidates[0])
-
-    low_risk = sorted(
-        ranked,
-        key=lambda item: (
-            _float(dict(item.metadata or {}).get("topology_risk"), 0.0),
-            _float(dict(item.metadata or {}).get("mobility_risk"), 0.0),
-            _float(dict(item.metadata or {}).get("load_ratio"), 0.0),
-            -item.semantic_score,
-            item.instance_id,
-        ),
-    )
-    for candidate in low_risk:
-        add(candidate)
-    for candidate in ranked:
-        add(candidate)
-    return selected[:top_k]
+        return list(candidates)
+    return list(candidates)[:top_k]
 
 
 def _float(value: Any, default: float) -> float:

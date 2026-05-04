@@ -88,6 +88,10 @@ class IQLTrainer:
                         break
             finally:
                 self._close_episode_env(env)
+            if output_dir is not None:
+                target = Path(output_dir)
+                target.mkdir(parents=True, exist_ok=True)
+                write_reward_curve(target / "iql_behavior_reward_curve.csv", behavior_rows)
         update_count = self.offline_updates
         if update_count <= 0:
             update_count = max(1, int(round(len(self.replay) * self.updates_per_transition)))

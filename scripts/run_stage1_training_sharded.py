@@ -219,6 +219,9 @@ def start_shard(
     env.setdefault("NUMEXPR_NUM_THREADS", "1")
     env.setdefault("VECLIB_MAXIMUM_THREADS", "1")
     env.setdefault("TOKENIZERS_PARALLELISM", "false")
+    env.setdefault("HF_HUB_OFFLINE", "1")
+    env.setdefault("TRANSFORMERS_OFFLINE", "1")
+    env.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
     if cuda_device:
         env["CUDA_VISIBLE_DEVICES"] = str(cuda_device)
     cmd = [

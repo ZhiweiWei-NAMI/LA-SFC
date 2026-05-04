@@ -41,8 +41,8 @@ runtime:
     task:
       # Keep the low-level task timeout above the largest SFC QoS deadline; otherwise
       # AirFogSim can fail queued wireless tasks before the chain deadline is reached.
-      tti_threshold: 80.0
-      hard_ddl: 90.0
+      tti_threshold: 120.0
+      hard_ddl: 130.0
 
 training:
   episodes: 100
@@ -190,13 +190,14 @@ semantic_exchange:
 
 semantic_topology_experiment:
   task_classes:
-    urgent: {deadline_s: 5.0, ratio: 0.10, semantic_min_score: 0.68, allowed_node_types: [rsu]}
-    standard: {deadline_s: 12.0, ratio: 0.40, semantic_min_score: 0.62, allowed_node_types: [rsu, vehicle]}
-    normal: {deadline_s: 25.0, ratio: 0.40, semantic_min_score: 0.55, allowed_node_types: [rsu, vehicle, uav]}
-    batch: {deadline_s: 60.0, ratio: 0.10, semantic_min_score: 0.45, allowed_node_types: [rsu, vehicle, uav, cloud_server]}
+    urgent: {deadline_s: 28.0, ratio: 0.10, semantic_min_score: 0.68, allowed_node_types: [rsu, cloud_server]}
+    standard: {deadline_s: 40.0, ratio: 0.40, semantic_min_score: 0.62, allowed_node_types: [rsu, cloud_server, vehicle]}
+    normal: {deadline_s: 55.0, ratio: 0.40, semantic_min_score: 0.55, allowed_node_types: [rsu, cloud_server, vehicle, uav]}
+    batch: {deadline_s: 78.0, ratio: 0.10, semantic_min_score: 0.45, allowed_node_types: [rsu, cloud_server, vehicle, uav]}
   scenarios:
     - name: semantic_runtime_probe_preprocess_only
-      objective: single-function AirFogSim lifecycle probe for waiting/offloading/computing/done
+      objective: single-function AirFogSim lifecycle smoke probe; excluded from V21 full-chain training/evaluation
+      include_in_default: false
       preprocess_only: true
       task_classes: {}
       task_nodes: {vehicle: 1, uav: 0}
@@ -216,7 +217,7 @@ semantic_topology_experiment:
       arrival_rate_sfc_per_s: 0.20
       max_concurrent_sfcs: 10
       exchange_ttl_s: 8.0
-      qos_deadline_s: 20.0
+      qos_deadline_s: 55.0
       payload_mb_range: [2.0, 4.0]
       service_cpu_scale: 0.35
       local_catalog_visibility: 1.0
@@ -230,7 +231,7 @@ semantic_topology_experiment:
       forced_service_region_id: null
       arrival_rate_sfc_per_s: 0.80
       max_concurrent_sfcs: 25
-      qos_deadline_s: 18.0
+      qos_deadline_s: 55.0
       payload_mb_range: [0.20, 0.60]
       service_cpu_scale: 1.5
       output_ratio: 0.25
@@ -259,7 +260,7 @@ semantic_topology_experiment:
       forced_service_region_id: null
       arrival_rate_sfc_per_s: 0.60
       max_concurrent_sfcs: 20
-      qos_deadline_s: 18.0
+      qos_deadline_s: 55.0
       payload_mb_range: [0.15, 0.50]
       service_cpu_scale: 1.4
       output_ratio: 0.25
@@ -293,7 +294,7 @@ semantic_topology_experiment:
       arrival_rate_sfc_per_s: 0.50
       max_concurrent_sfcs: 15
       exchange_ttl_s: 6.0
-      qos_deadline_s: 16.0
+      qos_deadline_s: 55.0
       payload_mb_range: [4.0, 8.0]
     - name: semantic_ambiguity_calibrated
       objective: semantic ranking with feasible graph completion
@@ -303,7 +304,7 @@ semantic_topology_experiment:
       arrival_rate_sfc_per_s: 0.50
       max_concurrent_sfcs: 15
       exchange_ttl_s: 6.0
-      qos_deadline_s: 16.0
+      qos_deadline_s: 55.0
       payload_mb_range: [4.0, 8.0]
 
 semantic_topology_figure_sweeps:

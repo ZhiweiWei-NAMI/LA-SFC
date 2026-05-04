@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import random
+import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -251,7 +252,9 @@ def masac_update_policy(
     torch = policy.torch
     metrics: Dict[str, float] = {}
     for _ in range(max(1, int(updates))):
+        update_start = time.perf_counter()
         batch = replay.sample(batch_size, strategy=sample_strategy)
+        sample_end = time.perf_counter()
         q1_items = []
         q2_items = []
         target_items = []
@@ -274,6 +277,7 @@ def masac_update_policy(
             selected_actions += int(selected.get("action_count", 0) or 0)
         if not q1_items:
             continue
+        critic_eval_end = time.perf_counter()
         q1_values = torch.stack([item.reshape(()) for item in q1_items])
         q2_values = torch.stack([item.reshape(()) for item in q2_items])
         targets = torch.stack([item.reshape(()) for item in target_items]).detach()
@@ -285,6 +289,7 @@ def masac_update_policy(
             float(max_grad_norm),
         )
         policy.q_optimizer.step()
+        critic_backward_end = time.perf_counter()
 
         actor_losses = []
         entropy_values = []
@@ -299,6 +304,7 @@ def masac_update_policy(
                 entropy_values.append(entropy.reshape(()))
                 target_entropy_values.append(target_entropy.reshape(()))
                 actor_candidate_sets += int(count)
+        actor_eval_end = time.perf_counter()
         if update_actor and actor_losses:
             actor_loss = torch.stack(actor_losses).mean()
             entropy_mean = torch.stack(entropy_values).mean()
@@ -314,7 +320,9 @@ def masac_update_policy(
             target_entropy_mean = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
             actor_grad_norm = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
             alpha_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
+        actor_backward_end = time.perf_counter()
         policy.soft_update_targets(float(tau))
+        target_update_end = time.perf_counter()
         with torch.no_grad():
             td_error = (q1_values - targets).abs().mean()
             q_min_mean = torch.minimum(q1_values, q2_values).mean()
@@ -334,6 +342,13 @@ def masac_update_policy(
             "selected_actions": float(selected_actions),
             "actor_candidate_sets": float(actor_candidate_sets),
             "actor_updated": float(1.0 if update_actor and actor_losses else 0.0),
+            "sample_s": float(sample_end - update_start),
+            "critic_eval_s": float(critic_eval_end - sample_end),
+            "critic_backward_s": float(critic_backward_end - critic_eval_end),
+            "actor_eval_s": float(actor_eval_end - critic_backward_end),
+            "actor_backward_s": float(actor_backward_end - actor_eval_end),
+            "target_update_s": float(target_update_end - actor_backward_end),
+            "update_total_s": float(target_update_end - update_start),
             "updates": float(metrics.get("updates", 0.0) + 1.0),
         }
     return metrics

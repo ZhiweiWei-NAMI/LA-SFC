@@ -293,6 +293,9 @@ def build_offline_env(
 def _build_semantic_scorer(run_config: Mapping[str, Any], semantic_matrix: Optional[SemanticLinkMatrix]) -> Any:
     if semantic_matrix is None:
         return None
+    marl_cfg = dict(run_config.get("marl", {}) or {})
+    if not bool(marl_cfg.get("include_semantic_features", True)):
+        return None
     exchange_cfg = dict(run_config.get("semantic_exchange", {}) or {})
     encoder = SemanticEncoder(
         backend=str(exchange_cfg.get("encoder_backend", "hash")),
@@ -349,6 +352,10 @@ def _build_reward_fn(marl_cfg: Mapping[str, Any]) -> SFCReward:
     reward_cfg = dict(marl_cfg.get("reward", {}) or {})
     if not reward_cfg:
         return SFCReward()
+    if not bool(marl_cfg.get("include_semantic_features", True)):
+        reward_cfg["semantic_score"] = 0.0
+        reward_cfg["semantic_cumulative"] = 0.0
+        reward_cfg["utility_prior"] = 0.0
     allowed = set(SFCRewardConfig.__dataclass_fields__)
     values = {}
     for key, value in reward_cfg.items():
@@ -428,6 +435,10 @@ def _resolve_scenario(config: Mapping[str, Any], scenario: Optional[str | Mappin
     if not scenarios:
         scenarios = list(config.get("experiment", {}).get("scenarios", []) or [])
     if scenario is None:
+        for item in scenarios:
+            item_dict = dict(item)
+            if bool(item_dict.get("include_in_default", item_dict.get("enabled", True))):
+                return item_dict
         return dict(scenarios[0]) if scenarios else {"name": "default"}
     for item in scenarios:
         if str(item.get("name")) == str(scenario):
@@ -526,6 +537,8 @@ def _materialized_service_instances(
         if node_type not in allowed_node_types:
             continue
         requested = int(service_nodes.get(node_type, 1 if node_type == "cloud_server" else 0) or 0)
+        if not bool(scenario.get("preprocess_only", False)) and node_type in {"rsu", "cloud_server"}:
+            requested = max(1, requested)
         node_count = min(max_nodes, max(0, int(round(requested * supply_ratio))))
         for node_index in range(node_count):
             node_id = _materialized_node_id(node_type, node_index)
@@ -637,6 +650,7 @@ def _scenario_chains(
         context.update(
             {
                 "scenario": scenario_cfg.get("name", "default"),
+                "preprocess_only": bool(scenario_cfg.get("preprocess_only", False)),
                 "service_role_sweep": service_role_sweep,
                 "preferred_region_id": _scenario_preferred_region(scenario_cfg, index, source),
                 "task_node_counts": task_nodes,
@@ -694,6 +708,8 @@ def _assign_v21_request_types(chains: Sequence[Dict[str, Any]], semantic_matrix:
         chain["context"] = context
         request_type = str(context["request_type"])
         sequence = _representative_service_sequence(request_type, semantic_matrix)
+        if context.get("preprocess_only"):
+            sequence = sequence[:1]
         nodes = list(chain.get("nodes", []) or [])
         if len(nodes) < len(sequence):
             LOGGER.warning(

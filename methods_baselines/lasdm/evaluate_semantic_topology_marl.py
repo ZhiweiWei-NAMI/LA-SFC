@@ -56,6 +56,7 @@ IPPO_BASELINE_CONFIG_UPDATES: Dict[str, Dict[str, Any]] = {
         "include_semantic_features": False,
         "include_topology_features": True,
         "include_temporal_features": True,
+        "semantic_scorer": None,
     },
     "marl_topology_no_semantic": {
         "auto_exchange": True,
@@ -63,6 +64,7 @@ IPPO_BASELINE_CONFIG_UPDATES: Dict[str, Dict[str, Any]] = {
         "include_semantic_features": False,
         "include_topology_features": True,
         "include_temporal_features": True,
+        "semantic_scorer": None,
     },
     "marl_semantic_no_topology": {
         "auto_exchange": True,
@@ -271,7 +273,11 @@ def _select_scenarios(config: Mapping[str, Any], names: List[str] | None) -> Lis
         scenarios = list(config.get("experiment", {}).get("scenarios", []) or [{"name": "default"}])
     normalized = [dict(item) if isinstance(item, Mapping) else {"name": str(item)} for item in scenarios]
     if not names:
-        return normalized
+        return [
+            item
+            for item in normalized
+            if bool(item.get("include_in_default", item.get("enabled", True)))
+        ]
     requested = {str(name) for name in names}
     selected = [item for item in normalized if str(item.get("name")) in requested]
     missing = sorted(requested - {str(item.get("name")) for item in selected})
