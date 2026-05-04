@@ -195,6 +195,9 @@ def render_training(root: Path, expected_episodes: int, process_rows: Sequence[M
         "last_reward",
         "best",
         "w10(s/r)",
+        "dataset",
+        "offline",
+        "eval",
     ]
     lines = [title, table(headers, rows)]
     return lines
@@ -233,12 +236,15 @@ def training_row(
     state = "PENDING"
     if pid is not None and pid_alive(pid, process_rows):
         state = f"READY:{pid}" if threshold_met else f"RUN:{pid}"
-    elif threshold_met or isinstance(summary, Mapping) or checkpoint_exists(progress_path.parent):
+    elif threshold_met:
         state = "DONE"
+    elif checkpoint_exists(progress_path.parent) or isinstance(summary, Mapping):
+        state = "CHECKPOINT_PARTIAL"
     elif rows:
         state = "PARTIAL"
     last_update = path_age(progress_path, now)
     best = best_selection(selection_path, summary, progress_path.parent)
+    dataset_progress, offline_progress, eval_progress = iql_progress_fields(progress_path.parent, variant, expected_episodes)
     return [
         variant,
         state,
@@ -249,7 +255,32 @@ def training_row(
         fmt_float(row_reward(latest)),
         best,
         window_pair(filtered or rows, 10),
+        dataset_progress,
+        offline_progress,
+        eval_progress,
     ]
+
+
+def iql_progress_fields(seed_dir: Path, variant: str, expected_episodes: int) -> tuple[str, str, str]:
+    if variant != "iql_offline":
+        return "-", "-", "-"
+    behavior_rows = read_csv_rows(seed_dir / "iql_behavior_reward_curve.csv")
+    diagnostics_rows = read_csv_rows(seed_dir / "iql_diagnostics.csv")
+    eval_rows = read_csv_rows(seed_dir / "iql_eval_reward_curve.csv")
+    dataset = episode_progress(behavior_rows, expected_episodes)
+    offline = str(len(diagnostics_rows)) if diagnostics_rows else "0"
+    evaluation = "1/1" if eval_rows else "0/1"
+    return dataset, offline, evaluation
+
+
+def episode_progress(rows: Sequence[Mapping[str, str]], expected_episodes: int) -> str:
+    if not rows:
+        return f"0/{expected_episodes}"
+    episodes = [value for row in rows if (value := safe_int(row.get("episode"))) is not None]
+    if not episodes:
+        return f"{min(len(rows), expected_episodes)}/{expected_episodes}"
+    count = min(expected_episodes, max(episodes) + 1)
+    return f"{count}/{expected_episodes}"
 
 
 def filter_expected_rows(rows: Sequence[Mapping[str, str]], expected_episodes: int) -> list[Mapping[str, str]]:

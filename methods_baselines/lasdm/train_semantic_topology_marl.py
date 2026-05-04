@@ -79,6 +79,10 @@ def main() -> None:
     config = _load_yaml(args.config)
     episodes = int(args.episodes if args.episodes is not None else config.get("training", {}).get("episodes", 10))
     max_steps = int(args.max_steps if args.max_steps is not None else config.get("training", {}).get("max_steps", 100))
+    baseline_name = {"masac": "proposed_semantic_topology_marl", "mappo": "mappo_ctde", "iql": "iql_offline"}.get(
+        args.policy,
+        args.policy,
+    )
     env = build_offline_env(
         config,
         seed=args.seed,
@@ -86,7 +90,7 @@ def main() -> None:
         scenario=args.scenario,
         service_role_sweep=args.service_role_sweep,
         attach_runtime=True,
-        baseline="proposed_semantic_topology_marl" if args.policy == "masac" else args.policy,
+        baseline=baseline_name,
     )
     try:
         observations = env.reset()
@@ -96,6 +100,20 @@ def main() -> None:
 
         marl_cfg = dict(config.get("marl", {}) or {})
         policy_kwargs = _actor_policy_kwargs(config, observations, env.config.semantic_scorer, args.seed)
+        def fresh_env(offset: int) -> SemanticTopologyMARLEnv:
+            return build_offline_env(
+                config,
+                seed=args.seed * 100000 + int(offset),
+                max_steps=max_steps,
+                scenario=args.scenario,
+                service_role_sweep=args.service_role_sweep,
+                attach_runtime=True,
+                baseline=baseline_name,
+            )
+
+        def close_semantic_env(item: SemanticTopologyMARLEnv) -> None:
+            _close_runtime_env(getattr(item, "env", None))
+
         if args.policy == "masac":
             target_entropy_raw = marl_cfg.get("masac_target_entropy", None)
             policy = MASACPolicy(
@@ -132,6 +150,8 @@ def main() -> None:
             trainer = MAPPOTrainer(
                 env,
                 policy,
+                env_factory=fresh_env,
+                close_env=close_semantic_env,
                 gamma=float(marl_cfg.get("mappo_gamma", marl_cfg.get("masac_gamma", 0.99)) or 0.99),
                 lam=float(marl_cfg.get("mappo_gae_lambda", 0.95) or 0.95),
                 clip_eps=float(marl_cfg.get("mappo_clip_eps", 0.2) or 0.2),
@@ -159,6 +179,9 @@ def main() -> None:
                 env,
                 policy,
                 behavior_policy=behavior_policy,
+                env_factory=fresh_env,
+                eval_env_factory=lambda: fresh_env(900000),
+                close_env=close_semantic_env,
                 gamma=float(marl_cfg.get("iql_gamma", marl_cfg.get("masac_gamma", 0.99)) or 0.99),
                 tau=float(marl_cfg.get("iql_tau", marl_cfg.get("masac_tau", 0.005)) or 0.005),
                 batch_size=int(marl_cfg.get("iql_batch_size", marl_cfg.get("masac_batch_size", 128)) or 128),
@@ -672,6 +695,30 @@ def _assign_v21_request_types(chains: Sequence[Dict[str, Any]], semantic_matrix:
         request_type = str(context["request_type"])
         sequence = _representative_service_sequence(request_type, semantic_matrix)
         nodes = list(chain.get("nodes", []) or [])
+        if len(nodes) < len(sequence):
+            LOGGER.warning(
+                "V21 request_type %s expands chain %s from %d structural nodes to %d representative services.",
+                request_type,
+                chain_id,
+                len(nodes),
+                len(sequence),
+            )
+            template = copy.deepcopy(nodes[-1]) if nodes else {}
+            for extra_index in range(len(nodes), len(sequence)):
+                service_type = sequence[extra_index]
+                input_semantic, output_semantic = SERVICE_IO_DEFAULTS.get(service_type, ("any", "any"))
+                node = copy.deepcopy(template)
+                node["node_id"] = f"v21_{extra_index}_{service_type}"
+                node["service_type"] = service_type
+                node["required_capabilities"] = [service_type]
+                node["input_semantic"] = input_semantic
+                node["output_semantic"] = output_semantic
+                node.setdefault("cpu_mb", float(template.get("cpu_mb", template.get("cpu", 4.0)) or 4.0))
+                node.setdefault("memory_mb", float(template.get("memory_mb", 512.0) or 512.0))
+                nodes.append(node)
+            chain["nodes"] = nodes
+            node_ids = [str(node.get("node_id")) for node in nodes]
+            chain["edges"] = [{"from": node_ids[index], "to": node_ids[index + 1]} for index in range(len(node_ids) - 1)]
         if len(nodes) > len(sequence):
             LOGGER.warning(
                 "V21 request_type %s has %d representative services but chain %s has %d nodes; "

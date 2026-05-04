@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from .mappo_policy import MAPPOPolicy
 from .marl_env import SemanticTopologyMARLEnv
@@ -54,6 +54,8 @@ class MAPPOTrainer:
         self,
         env: SemanticTopologyMARLEnv,
         policy: MAPPOPolicy,
+        env_factory: Optional[Callable[[int], SemanticTopologyMARLEnv]] = None,
+        close_env: Optional[Callable[[SemanticTopologyMARLEnv], None]] = None,
         gamma: float = 0.99,
         lam: float = 0.95,
         clip_eps: float = 0.2,
@@ -64,6 +66,8 @@ class MAPPOTrainer:
         max_grad_norm: float = 0.5,
     ):
         self.env = env
+        self.env_factory = env_factory
+        self.close_env = close_env
         self.policy = policy
         self.gamma = float(gamma)
         self.lam = float(lam)
@@ -79,54 +83,70 @@ class MAPPOTrainer:
         diagnostics: List[Dict[str, Any]] = []
         buffer = MAPPORolloutBuffer()
         update_index = 0
+        target = Path(output_dir) if output_dir is not None else None
         for episode in range(int(episodes)):
-            observations = self.env.reset()
-            total = 0.0
-            for step in range(int(max_steps)):
-                current = observations
-                policy_step = self.policy.act_with_logprobs(current, deterministic=False, track_grad=False)
-                observations, rewards, done, info = self.env.step(policy_step.actions)
-                mean_reward = sum(rewards.values()) / max(1, len(rewards))
-                total += mean_reward
-                buffer.add(
-                    MAPPORolloutItem(
-                        observations=current,
-                        actions=policy_step.actions,
-                        old_log_prob=_mean_tensor_value(policy_step.log_prob_tensors),
-                        value=_mean_value(policy_step.values),
-                        reward=float(mean_reward),
-                        done=bool(done or step + 1 >= int(max_steps)),
+            env = self._episode_env(episode)
+            try:
+                observations = env.reset()
+                total = 0.0
+                for step in range(int(max_steps)):
+                    current = observations
+                    policy_step = self.policy.act_with_logprobs(current, deterministic=False, track_grad=False)
+                    observations, rewards, done, info = env.step(policy_step.actions)
+                    mean_reward = sum(rewards.values()) / max(1, len(rewards))
+                    total += mean_reward
+                    buffer.add(
+                        MAPPORolloutItem(
+                            observations=current,
+                            actions=policy_step.actions,
+                            old_log_prob=_mean_tensor_value(policy_step.log_prob_tensors),
+                            value=_mean_value(policy_step.values),
+                            reward=float(mean_reward),
+                            done=bool(done or step + 1 >= int(max_steps)),
+                        )
                     )
-                )
-                if len(buffer) >= max(1, self.rollout_steps) or done or step + 1 >= int(max_steps):
-                    last_value = 0.0 if done else self._value_estimate(observations)
-                    buffer.compute_gae(last_value, self.gamma, self.lam)
-                    update_index += 1
-                    diagnostics.append({"update_index": update_index, **self._ppo_update(buffer)})
-                    buffer.clear()
-                summary = info.get("summary", {})
-                rows.append(
-                    TrainingMetrics(
-                        episode=episode,
-                        step=step,
-                        mean_reward=mean_reward,
-                        total_reward=total,
-                        succeeded=int(summary.get("succeeded", 0) or 0),
-                        failed=int(summary.get("failed", 0) or 0),
-                        timed_out=int(summary.get("timed_out", 0) or 0),
-                        active_graphs=int(summary.get("active_graphs", 0) or 0),
+                    if len(buffer) >= max(1, self.rollout_steps) or done or step + 1 >= int(max_steps):
+                        last_value = 0.0 if done else self._value_estimate(observations)
+                        buffer.compute_gae(last_value, self.gamma, self.lam)
+                        update_index += 1
+                        diagnostics.append({"update_index": update_index, **self._ppo_update(buffer)})
+                        buffer.clear()
+                    summary = info.get("summary", {})
+                    rows.append(
+                        TrainingMetrics(
+                            episode=episode,
+                            step=step,
+                            mean_reward=mean_reward,
+                            total_reward=total,
+                            succeeded=int(summary.get("succeeded", 0) or 0),
+                            failed=int(summary.get("failed", 0) or 0),
+                            timed_out=int(summary.get("timed_out", 0) or 0),
+                            active_graphs=int(summary.get("active_graphs", 0) or 0),
+                        )
                     )
-                )
-                if done:
-                    break
+                    if done:
+                        break
+                if target is not None and episode + 1 == int(episodes):
+                    target.mkdir(parents=True, exist_ok=True)
+                    env.write_traces(str(target))
+            finally:
+                self._close_episode_env(env)
         if output_dir is not None:
             target = Path(output_dir)
             target.mkdir(parents=True, exist_ok=True)
             write_reward_curve(target / "reward_curve.csv", rows)
             _write_diagnostics(target / "mappo_diagnostics.csv", diagnostics)
             self.policy.torch.save(self.policy.mappo_state_dict(), target / "mappo_policy.pt")
-            self.env.write_traces(str(target))
         return rows
+
+    def _episode_env(self, episode: int) -> SemanticTopologyMARLEnv:
+        if self.env_factory is None:
+            return self.env
+        return self.env_factory(int(episode))
+
+    def _close_episode_env(self, env: SemanticTopologyMARLEnv) -> None:
+        if self.env_factory is not None and self.close_env is not None:
+            self.close_env(env)
 
     def _ppo_update(self, buffer: MAPPORolloutBuffer) -> Dict[str, float]:
         if not buffer.items:

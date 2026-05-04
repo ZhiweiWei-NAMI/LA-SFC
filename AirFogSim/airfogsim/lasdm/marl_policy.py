@@ -13,7 +13,6 @@ from .graph_observation import flatten_observation
 
 RESOURCE_LEVEL_VALUES: Tuple[float, ...] = tuple(round(0.1 * index, 1) for index in range(1, 11))
 RESOURCE_ACTION_DIM = len(RESOURCE_LEVEL_VALUES)
-RESOURCE_Q_FEATURE_DIM = 2
 
 
 def _resource_level_index(value: Any, default: float = 1.0) -> int:
@@ -1821,9 +1820,23 @@ class MASACPolicy(IPPOPolicy):
             self.torch.tensor(math.log(self.fixed_alpha), dtype=self.torch.float32, device=self.device)
         )
         hidden_dim = int(getattr(self.model, "hidden_dim", 128))
-        q_input_dim = hidden_dim * self.max_critic_agents + hidden_dim + self.candidate_feature_dim + RESOURCE_Q_FEATURE_DIM
-        self.q1 = self._build_q_network(q_input_dim, hidden_dim).to(self.device)
-        self.q2 = self._build_q_network(q_input_dim, hidden_dim).to(self.device)
+        q_context_dim = hidden_dim * self.max_critic_agents + hidden_dim
+        candidate_q_input_dim = q_context_dim + self.candidate_feature_dim
+        resource_q_input_dim = q_context_dim
+        self.q1 = self.nn.ModuleDict(
+            {
+                "candidate": self._build_q_network(candidate_q_input_dim, hidden_dim),
+                "compute": self._build_q_vector_network(resource_q_input_dim, hidden_dim, RESOURCE_ACTION_DIM),
+                "bandwidth": self._build_q_vector_network(resource_q_input_dim, hidden_dim, RESOURCE_ACTION_DIM),
+            }
+        ).to(self.device)
+        self.q2 = self.nn.ModuleDict(
+            {
+                "candidate": self._build_q_network(candidate_q_input_dim, hidden_dim),
+                "compute": self._build_q_vector_network(resource_q_input_dim, hidden_dim, RESOURCE_ACTION_DIM),
+                "bandwidth": self._build_q_vector_network(resource_q_input_dim, hidden_dim, RESOURCE_ACTION_DIM),
+            }
+        ).to(self.device)
         self.target_q1 = copy.deepcopy(self.q1).to(self.device)
         self.target_q2 = copy.deepcopy(self.q2).to(self.device)
         for module in (self.target_q1, self.target_q2):
@@ -1845,6 +1858,15 @@ class MASACPolicy(IPPOPolicy):
             self.nn.Linear(int(hidden_dim), int(hidden_dim)),
             self.nn.ReLU(),
             self.nn.Linear(int(hidden_dim), 1),
+        )
+
+    def _build_q_vector_network(self, input_dim: int, hidden_dim: int, output_dim: int) -> Any:
+        return self.nn.Sequential(
+            self.nn.Linear(int(input_dim), int(hidden_dim)),
+            self.nn.ReLU(),
+            self.nn.Linear(int(hidden_dim), int(hidden_dim)),
+            self.nn.ReLU(),
+            self.nn.Linear(int(hidden_dim), int(output_dim)),
         )
 
     @property
@@ -2175,22 +2197,21 @@ class MASACPolicy(IPPOPolicy):
                 device=global_context.device,
             )
             return zero, zero
-        resource_pairs = self.torch.cartesian_prod(
-            self.resource_levels_tensor.to(dtype=global_context.dtype, device=global_context.device),
-            self.resource_levels_tensor.to(dtype=global_context.dtype, device=global_context.device),
-        )
-        pair_count = int(resource_pairs.shape[0])
         candidate_count = int(features.shape[0])
-        global_expanded = global_context.reshape(1, -1).expand(candidate_count * pair_count, -1)
-        local_expanded = local_context.reshape(1, -1).expand(candidate_count * pair_count, -1)
-        features_expanded = features.repeat_interleave(pair_count, dim=0)
-        resources_expanded = resource_pairs.repeat(candidate_count, 1)
-        q_input = self.torch.cat([global_expanded, local_expanded, features_expanded, resources_expanded], dim=-1)
+        context = self.torch.cat([global_context.reshape(1, -1), local_context.reshape(1, -1)], dim=-1)
+        candidate_input = self.torch.cat([context.expand(candidate_count, -1), features], dim=-1)
         if detach_encoder:
-            q_input = q_input.detach()
+            context = context.detach()
+            candidate_input = candidate_input.detach()
         q1_net, q2_net = (self.target_q1, self.target_q2) if target else (self.q1, self.q2)
-        q1 = q1_net(q_input).squeeze(-1).reshape(candidate_count, RESOURCE_ACTION_DIM, RESOURCE_ACTION_DIM)
-        q2 = q2_net(q_input).squeeze(-1).reshape(candidate_count, RESOURCE_ACTION_DIM, RESOURCE_ACTION_DIM)
+        q1_candidate = q1_net["candidate"](candidate_input).squeeze(-1)
+        q1_compute = q1_net["compute"](context).squeeze(0)
+        q1_bandwidth = q1_net["bandwidth"](context).squeeze(0)
+        q2_candidate = q2_net["candidate"](candidate_input).squeeze(-1)
+        q2_compute = q2_net["compute"](context).squeeze(0)
+        q2_bandwidth = q2_net["bandwidth"](context).squeeze(0)
+        q1 = q1_candidate[:, None, None] + q1_compute[None, :, None] + q1_bandwidth[None, None, :]
+        q2 = q2_candidate[:, None, None] + q2_compute[None, :, None] + q2_bandwidth[None, None, :]
         return q1, q2
 
     def _masac_q_values(

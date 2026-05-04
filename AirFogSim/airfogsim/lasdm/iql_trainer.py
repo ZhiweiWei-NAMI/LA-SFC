@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import csv
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from .iql_policy import IQLPolicy
 from .marl_env import SemanticTopologyMARLEnv
@@ -18,6 +18,9 @@ class IQLTrainer:
         env: SemanticTopologyMARLEnv,
         policy: IQLPolicy,
         behavior_policy: Optional[BaseMARLPolicy] = None,
+        env_factory: Optional[Callable[[int], SemanticTopologyMARLEnv]] = None,
+        eval_env_factory: Optional[Callable[[], SemanticTopologyMARLEnv]] = None,
+        close_env: Optional[Callable[[SemanticTopologyMARLEnv], None]] = None,
         gamma: float = 0.99,
         tau: float = 0.005,
         batch_size: int = 128,
@@ -29,6 +32,9 @@ class IQLTrainer:
         seed: int = 0,
     ):
         self.env = env
+        self.env_factory = env_factory
+        self.eval_env_factory = eval_env_factory
+        self.close_env = close_env
         self.policy = policy
         self.behavior_policy = behavior_policy or policy_from_name("utility_prior_with_exchange", seed=seed)
         self.gamma = float(gamma)
@@ -44,40 +50,44 @@ class IQLTrainer:
         behavior_rows: List[TrainingMetrics] = []
         diagnostics: List[Dict[str, Any]] = []
         for episode in range(int(episodes)):
-            observations = self.env.reset()
-            total = 0.0
-            for step in range(int(max_steps)):
-                current = observations
-                actions = self.behavior_policy.act(current, deterministic=True)
-                observations, rewards, done, info = self.env.step(actions)
-                mean_reward = sum(rewards.values()) / max(1, len(rewards))
-                total += mean_reward
-                self.replay.add(
-                    SACTransition(
-                        observations=current,
-                        actions=actions,
-                        reward=float(mean_reward),
-                        next_observations=observations,
-                        done=bool(done or step + 1 >= int(max_steps)),
-                        episode=int(episode),
-                        source="offline_behavior",
+            env = self._behavior_env(episode)
+            try:
+                observations = env.reset()
+                total = 0.0
+                for step in range(int(max_steps)):
+                    current = observations
+                    actions = self.behavior_policy.act(current, deterministic=True)
+                    observations, rewards, done, info = env.step(actions)
+                    mean_reward = sum(rewards.values()) / max(1, len(rewards))
+                    total += mean_reward
+                    self.replay.add(
+                        SACTransition(
+                            observations=current,
+                            actions=actions,
+                            reward=float(mean_reward),
+                            next_observations=observations,
+                            done=bool(done or step + 1 >= int(max_steps)),
+                            episode=int(episode),
+                            source="offline_behavior",
+                        )
                     )
-                )
-                summary = info.get("summary", {})
-                behavior_rows.append(
-                    TrainingMetrics(
-                        episode=episode,
-                        step=step,
-                        mean_reward=mean_reward,
-                        total_reward=total,
-                        succeeded=int(summary.get("succeeded", 0) or 0),
-                        failed=int(summary.get("failed", 0) or 0),
-                        timed_out=int(summary.get("timed_out", 0) or 0),
-                        active_graphs=int(summary.get("active_graphs", 0) or 0),
+                    summary = info.get("summary", {})
+                    behavior_rows.append(
+                        TrainingMetrics(
+                            episode=episode,
+                            step=step,
+                            mean_reward=mean_reward,
+                            total_reward=total,
+                            succeeded=int(summary.get("succeeded", 0) or 0),
+                            failed=int(summary.get("failed", 0) or 0),
+                            timed_out=int(summary.get("timed_out", 0) or 0),
+                            active_graphs=int(summary.get("active_graphs", 0) or 0),
+                        )
                     )
-                )
-                if done:
-                    break
+                    if done:
+                        break
+            finally:
+                self._close_episode_env(env)
         update_count = self.offline_updates
         if update_count <= 0:
             update_count = max(1, int(round(len(self.replay) * self.updates_per_transition)))
@@ -94,7 +104,14 @@ class IQLTrainer:
             )
             if metrics:
                 diagnostics.append({"update_index": update_index + 1, "replay_size": len(self.replay), **metrics})
-        eval_rows = HeuristicEvaluator(self.env, self.policy).run(episodes=1, max_steps=max_steps)
+        eval_env = self._eval_env()
+        try:
+            eval_rows = HeuristicEvaluator(eval_env, self.policy).run(episodes=1, max_steps=max_steps)
+            if output_dir is not None:
+                Path(output_dir).mkdir(parents=True, exist_ok=True)
+                eval_env.write_traces(str(output_dir))
+        finally:
+            self._close_eval_env(eval_env)
         if output_dir is not None:
             target = Path(output_dir)
             target.mkdir(parents=True, exist_ok=True)
@@ -103,8 +120,27 @@ class IQLTrainer:
             write_reward_curve(target / "reward_curve.csv", eval_rows)
             _write_diagnostics(target / "iql_diagnostics.csv", diagnostics)
             self.policy.torch.save(self.policy.iql_state_dict(), target / "iql_policy.pt")
-            self.env.write_traces(str(target))
         return eval_rows
+
+    def _behavior_env(self, episode: int) -> SemanticTopologyMARLEnv:
+        if self.env_factory is None:
+            return self.env
+        return self.env_factory(int(episode))
+
+    def _eval_env(self) -> SemanticTopologyMARLEnv:
+        if self.eval_env_factory is not None:
+            return self.eval_env_factory()
+        if self.env_factory is not None:
+            return self.env_factory(900000)
+        return self.env
+
+    def _close_episode_env(self, env: SemanticTopologyMARLEnv) -> None:
+        if self.env_factory is not None and self.close_env is not None:
+            self.close_env(env)
+
+    def _close_eval_env(self, env: SemanticTopologyMARLEnv) -> None:
+        if (self.env_factory is not None or self.eval_env_factory is not None) and self.close_env is not None:
+            self.close_env(env)
 
 
 def expectile_loss(diff: Any, expectile: float) -> Any:

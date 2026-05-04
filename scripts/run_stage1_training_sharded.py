@@ -70,6 +70,7 @@ def main() -> int:
     )
     parser.add_argument("--idle-gpu-max-used-mib", type=int, default=2048)
     parser.add_argument("--idle-gpu-max-util", type=int, default=10)
+    parser.add_argument("--gpu-mib-per-process", type=int, default=4096)
     args = parser.parse_args()
 
     root = Path(args.root)
@@ -84,14 +85,17 @@ def main() -> int:
 
     all_processes: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
+    requested_jobs = build_job_plan(args)
+    seed_concurrency = max(1, int(args.seed_concurrency or 1))
     cuda_devices = select_cuda_devices(
         str(args.cuda_devices or ""),
         max_used_mib=int(args.idle_gpu_max_used_mib),
         max_util=int(args.idle_gpu_max_util),
+        mib_per_process=int(args.gpu_mib_per_process),
+        required_slots=min(seed_concurrency, len(requested_jobs)),
     )
     if cuda_devices:
         print("using CUDA devices for stage1 shards: " + ", ".join(cuda_devices), flush=True)
-    requested_jobs = build_job_plan(args)
     if args.skip_completed:
         skipped = [(variant, seed) for variant, seed in requested_jobs if shard_completed(seed, variant, root)]
         requested_jobs = [(variant, seed) for variant, seed in requested_jobs if not shard_completed(seed, variant, root)]
@@ -101,7 +105,6 @@ def main() -> int:
                 + ", ".join(f"{variant} seed {seed}" for variant, seed in skipped),
                 flush=True,
             )
-    seed_concurrency = max(1, int(args.seed_concurrency or 1))
     for pending_start in range(0, len(requested_jobs), seed_concurrency):
         pending_chunk = requested_jobs[pending_start : pending_start + seed_concurrency]
         if pending_chunk:
@@ -241,7 +244,14 @@ def start_shard(
     }
 
 
-def select_cuda_devices(spec: str, *, max_used_mib: int, max_util: int) -> list[str]:
+def select_cuda_devices(
+    spec: str,
+    *,
+    max_used_mib: int,
+    max_util: int,
+    mib_per_process: int,
+    required_slots: int,
+) -> list[str]:
     value = str(spec or "").strip()
     if not value:
         return []
@@ -251,7 +261,7 @@ def select_cuda_devices(spec: str, *, max_used_mib: int, max_util: int) -> list[
         result = subprocess.run(
             [
                 "nvidia-smi",
-                "--query-gpu=index,memory.used,utilization.gpu",
+                "--query-gpu=index,memory.total,memory.used,utilization.gpu",
                 "--format=csv,noheader,nounits",
             ],
             check=False,
@@ -260,19 +270,42 @@ def select_cuda_devices(spec: str, *, max_used_mib: int, max_util: int) -> list[
         )
     except OSError:
         return []
-    devices: list[str] = []
+    candidates: list[tuple[str, int]] = []
     for line in result.stdout.splitlines():
         parts = [item.strip() for item in line.split(",")]
-        if len(parts) < 3:
+        if len(parts) < 4:
             continue
         try:
             index = parts[0]
-            used_mib = int(float(parts[1]))
-            util = int(float(parts[2]))
+            total_mib = int(float(parts[1]))
+            used_mib = int(float(parts[2]))
+            util = int(float(parts[3]))
         except ValueError:
             continue
         if used_mib <= max(0, int(max_used_mib)) and util <= max(0, int(max_util)):
-            devices.append(index)
+            free_mib = max(0, total_mib - used_mib)
+            slots = max(0, free_mib // max(1, int(mib_per_process)))
+            if slots > 0:
+                candidates.append((index, slots))
+    if not candidates:
+        return []
+    needed = max(1, int(required_slots or 1))
+    selected: list[tuple[str, int]] = []
+    total_slots = 0
+    for item in sorted(candidates, key=lambda pair: pair[1], reverse=True):
+        selected.append(item)
+        total_slots += item[1]
+        if total_slots >= needed:
+            break
+    counts = {index: 0 for index, _slots in selected}
+    devices: list[str] = []
+    for _ in range(min(needed, total_slots)):
+        available = [(index, slots) for index, slots in selected if counts[index] < slots]
+        if not available:
+            break
+        index, _slots = min(available, key=lambda pair: (counts[pair[0]], -pair[1], pair[0]))
+        counts[index] += 1
+        devices.append(index)
     return devices
 
 
@@ -327,7 +360,12 @@ def print_progress(processes: list[dict[str, Any]], alive: list[dict[str, Any]])
             df = pd.read_csv(progress)
             episode = int(df["episode"].max()) if not df.empty and "episode" in df else -1
             recent = df.tail(10)
-            success = float(pd.to_numeric(recent.get("success_ratio", pd.Series(dtype=float)), errors="coerce").mean()) if not recent.empty else 0.0
+            success_column = "success_ratio" if "success_ratio" in recent else "succeeded"
+            success = (
+                float(pd.to_numeric(recent.get(success_column, pd.Series(dtype=float)), errors="coerce").fillna(0.0).mean())
+                if not recent.empty
+                else 0.0
+            )
             parts.append(f"{item['variant']} seed {item['seed']}: rows={len(df)} episode={episode} avg10_success={success:.3f}")
         except Exception as exc:
             parts.append(f"{item['variant']} seed {item['seed']}: read-error={exc}")
@@ -376,6 +414,20 @@ if variant in {"mappo_ctde", "iql_offline"}:
         observations = env.reset()
         marl_cfg = dict(cfg.get("marl", {}) or {})
         policy_kwargs = _actor_policy_kwargs(cfg, observations, env.config.semantic_scorer, seed)
+        def fresh_env(offset):
+            return build_offline_env(
+                cfg,
+                seed=seed * 100000 + int(offset),
+                max_steps=max_steps,
+                scenario=scenario,
+                service_role_sweep="full_hybrid",
+                attach_runtime=True,
+                baseline=variant,
+            )
+
+        def close_semantic_env(item):
+            _close_runtime_env(getattr(item, "env", None))
+
         if variant == "mappo_ctde":
             from airfogsim.lasdm.mappo_policy import MAPPOPolicy
             from airfogsim.lasdm.mappo_trainer import MAPPOTrainer
@@ -384,6 +436,8 @@ if variant in {"mappo_ctde", "iql_offline"}:
             trainer = MAPPOTrainer(
                 env,
                 policy,
+                env_factory=fresh_env,
+                close_env=close_semantic_env,
                 gamma=float(marl_cfg.get("mappo_gamma", marl_cfg.get("masac_gamma", 0.99)) or 0.99),
                 lam=float(marl_cfg.get("mappo_gae_lambda", 0.95) or 0.95),
                 clip_eps=float(marl_cfg.get("mappo_clip_eps", 0.2) or 0.2),
@@ -413,6 +467,9 @@ if variant in {"mappo_ctde", "iql_offline"}:
                 env,
                 policy,
                 behavior_policy=behavior_policy,
+                env_factory=fresh_env,
+                eval_env_factory=lambda: fresh_env(900000),
+                close_env=close_semantic_env,
                 gamma=float(marl_cfg.get("iql_gamma", marl_cfg.get("masac_gamma", 0.99)) or 0.99),
                 tau=float(marl_cfg.get("iql_tau", marl_cfg.get("masac_tau", 0.005)) or 0.005),
                 batch_size=int(marl_cfg.get("iql_batch_size", marl_cfg.get("masac_batch_size", 128)) or 128),
