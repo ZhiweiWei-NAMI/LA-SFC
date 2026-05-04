@@ -493,6 +493,8 @@ class IntraRegionOnlyPolicy(TopologyGreedyPolicy):
         candidate_set: Mapping[str, Any],
         source_node_id: str = "",
         planned_node_load: Optional[Mapping[str, int]] = None,
+        remaining_deadline_s: Optional[float] = None,
+        total_deadline_s: Optional[float] = None,
     ) -> Tuple[Optional[str], Optional[Mapping[str, Any]]]:
         local_candidates = [
             candidate
@@ -503,7 +505,13 @@ class IntraRegionOnlyPolicy(TopologyGreedyPolicy):
             return None, None
         scoped = dict(candidate_set)
         scoped["raw_candidates"] = local_candidates
-        return super()._best_candidate_with_context(scoped, source_node_id, planned_node_load)
+        return super()._best_candidate_with_context(
+            scoped,
+            source_node_id,
+            planned_node_load,
+            remaining_deadline_s=remaining_deadline_s,
+            total_deadline_s=total_deadline_s,
+        )
 
 
 class CrossRegionAuctionPolicy(UtilityPriorPolicy):
