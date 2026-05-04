@@ -133,13 +133,6 @@ IPPO_BASELINE_CONFIG_UPDATES: Dict[str, Dict[str, Any]] = {
     },
 }
 
-IPPO_BASELINE_EXPERT_POLICY: Dict[str, str] = {
-    "marl_no_semantic": "marl_topology_no_semantic",
-    "marl_topology_no_semantic": "marl_topology_no_semantic",
-    "marl_semantic_no_topology": "marl_semantic_no_topology",
-    "marl_no_topology": "marl_semantic_no_topology",
-}
-
 IPPO_BASELINE_ALIASES: Dict[str, str] = {
     "marl_topology_no_semantic": "marl_no_semantic",
     "marl_no_topology": "marl_semantic_no_topology",
@@ -263,10 +256,6 @@ def is_ippo_checkpoint_baseline(name: str) -> bool:
 def checkpoint_subdir_for_baseline(name: str) -> str:
     canonical = canonical_ippo_baseline(name)
     return "" if canonical == "proposed_semantic_topology_marl" else canonical
-
-
-def expert_policy_for_ippo_baseline(name: str) -> str:
-    return IPPO_BASELINE_EXPERT_POLICY.get(canonical_ippo_baseline(name), "topology_greedy")
 
 
 def canonical_ippo_baseline(name: str) -> str:

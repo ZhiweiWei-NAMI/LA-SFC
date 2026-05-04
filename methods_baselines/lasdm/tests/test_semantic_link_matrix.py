@@ -4,8 +4,6 @@ import tempfile
 import unittest
 from collections import Counter
 
-import torch
-
 
 TEST_DIR = os.path.dirname(__file__)
 METHOD_ROOT = os.path.abspath(os.path.join(TEST_DIR, ".."))
@@ -19,7 +17,6 @@ from airfogsim.lasdm.marl_policy import policy_from_name  # noqa: E402
 from airfogsim.lasdm.semantic_link_matrix import SemanticLinkMatrix  # noqa: E402
 from airfogsim.lasdm.semantic_link_predictor import SemanticLinkScorer  # noqa: E402
 from evaluate_semantic_topology_marl import IPPO_BASELINE_CONFIG_UPDATES, _baseline_settings  # noqa: E402
-from run_complete_runtime_experiment import _ippo_bc_quality_metrics  # noqa: E402
 from train_semantic_topology_marl import (  # noqa: E402
     _materialize_offline_config,
     _materialized_node_id,
@@ -147,81 +144,6 @@ class SemanticLinkMatrixTests(unittest.TestCase):
 
     def test_cloud_server_materialized_node_id_matches_physical_config(self):
         self.assertEqual(_materialized_node_id("cloud_server", 0), "cloudServer_0")
-
-    def test_bc_quality_metrics_unpack_resource_action_payload(self):
-        class FakeModel:
-            training = True
-
-            def eval(self):
-                self.training = False
-
-            def train(self):
-                self.training = True
-
-            def region_context_tensor(self, observation, device):
-                return torch.zeros((1, 1), dtype=torch.float32, device=device)
-
-        class FakePolicy:
-            torch = torch
-            use_region_encoder = True
-            model = FakeModel()
-            device = "cpu"
-            max_candidates = 4
-
-            def _contextual_candidate_set(self, candidate_set, current_source, planned_node_load):
-                return candidate_set
-
-            def _candidate_scores(self, obs_tensor, base_logits, candidate_set, mask_len):
-                return torch.tensor([0.1, 0.9], dtype=torch.float32)
-
-            def _apply_route_penalty(self, scores, candidate_set, mask_len):
-                return scores
-
-            def _candidate_by_id(self, candidate_set, instance_id):
-                for candidate in candidate_set.get("raw_candidates", []):
-                    if candidate.get("instance_id") == instance_id:
-                        return candidate
-                return None
-
-        observations = {
-            "agent_0": {
-                "candidate_sets": [
-                    {
-                        "sfc_id": "sfc_0",
-                        "sfc_node_id": "node_0",
-                        "sfc_node_index": 0,
-                        "source_node_id": "vehicle_0",
-                        "candidate_ids": ["bad_candidate", "good_candidate"],
-                        "raw_candidates": [
-                            {
-                                "instance_id": "bad_candidate",
-                                "metadata": {"utility_prior": 0.1, "route_available": 1.0, "deadline_slack_s": 1.0},
-                            },
-                            {
-                                "instance_id": "good_candidate",
-                                "metadata": {"utility_prior": 0.9, "route_available": 1.0, "deadline_slack_s": 2.0},
-                            },
-                        ],
-                    }
-                ]
-            }
-        }
-        expert_actions = {
-            "agent_0": {
-                "sfc_0": {
-                    "node_0": {"instance_id": "good_candidate", "compute_level": 1.0, "bandwidth_level": 1.0}
-                }
-            }
-        }
-
-        metrics = _ippo_bc_quality_metrics(FakePolicy(), observations, expert_actions)
-
-        self.assertEqual(metrics["candidate_choice_samples"], 1)
-        self.assertEqual(metrics["top1_accuracy"], 1.0)
-        self.assertEqual(metrics["top3_accuracy"], 1.0)
-        self.assertEqual(metrics["selected_route_available_ratio"], 1.0)
-        self.assertEqual(metrics["selected_deadline_feasible_ratio"], 1.0)
-
 
 class SemanticBaselinePolicyTests(unittest.TestCase):
     def test_removed_semantic_greedy_names_fail_fast(self):

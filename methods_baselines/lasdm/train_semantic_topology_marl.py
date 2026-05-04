@@ -361,10 +361,7 @@ def _actor_policy_kwargs(
         "critic_observation_dim": obs_dim * max(1, critic_agents),
         "max_critic_agents": max(1, critic_agents),
         "utility_prior_logit_weight": float(marl_cfg.get("ippo_utility_prior_logit_weight", 2.5) or 2.5),
-        "route_unavailable_penalty": float(
-            marl_cfg.get("ippo_route_unavailable_penalty", marl_cfg.get("ippo_expert_route_unavailable_penalty", 20.0))
-            or 20.0
-        ),
+        "route_unavailable_penalty": float(marl_cfg.get("ippo_route_unavailable_penalty", 20.0) or 20.0),
         "include_semantic_features": bool(marl_cfg.get("include_semantic_features", True)),
         "include_topology_features": bool(marl_cfg.get("include_topology_features", True)),
         "include_temporal_features": bool(marl_cfg.get("include_temporal_features", True)),

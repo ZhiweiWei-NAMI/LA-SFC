@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import contextlib
 import json
 import math
 import shutil
@@ -11,6 +12,11 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import yaml
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None
 
 
 V21_OUTPUT_ROOT = Path("experiment_artifacts/raw_data/stage1_v21_learned_semantic_matrix_resource_20260504")
@@ -275,20 +281,21 @@ class SemanticLinkMatrix:
     ) -> Dict[str, Any]:
         root = Path(output_root)
         root.mkdir(parents=True, exist_ok=True)
-        config_target = root / "configs" / "semantic"
-        if config_target.exists():
-            shutil.rmtree(config_target)
-        shutil.copytree(self.config_root, config_target)
-        self._write_truth_csv(root / "semantic_link_truth.csv")
-        self._write_io_csv(root / "io_compatibility_matrix.csv")
-        self._write_profile_pool(root / "semantic_profile_pool.jsonl")
-        if encoder_config is not None:
-            self._write_embedding_artifacts(root, encoder_config)
-        if materialized_instances is not None:
-            self._write_materialized_profiles(root / "materialized_instance_profiles.jsonl", materialized_instances)
-        audit = self.audit(materialized_instances=materialized_instances)
-        (root / "semantic_dataset_audit.json").write_text(json.dumps(audit, indent=2, sort_keys=True), encoding="utf-8")
-        return audit
+        with _file_lock(root / ".semantic_artifacts.lock"):
+            config_target = root / "configs" / "semantic"
+            if config_target.exists():
+                shutil.rmtree(config_target)
+            shutil.copytree(self.config_root, config_target)
+            self._write_truth_csv(root / "semantic_link_truth.csv")
+            self._write_io_csv(root / "io_compatibility_matrix.csv")
+            self._write_profile_pool(root / "semantic_profile_pool.jsonl")
+            if encoder_config is not None:
+                self._write_embedding_artifacts(root, encoder_config)
+            if materialized_instances is not None:
+                self._write_materialized_profiles(root / "materialized_instance_profiles.jsonl", materialized_instances)
+            audit = self.audit(materialized_instances=materialized_instances)
+            (root / "semantic_dataset_audit.json").write_text(json.dumps(audit, indent=2, sort_keys=True), encoding="utf-8")
+            return audit
 
     def audit(self, materialized_instances: Optional[Iterable[Mapping[str, Any]]] = None) -> Dict[str, Any]:
         per_service = {key: len(value) for key, value in sorted(self._by_service.items())}
@@ -694,3 +701,16 @@ def _lexical_shortcut_ceiling(records: Sequence[SemanticImplementation]) -> Dict
         "cross_service_p95_jaccard": float(np.quantile(np.asarray(cross_service, dtype=np.float32), 0.95)) if cross_service else 0.0,
         "max_cross_service_jaccard": float(max(cross_service)) if cross_service else 0.0,
     }
+
+
+@contextlib.contextmanager
+def _file_lock(path: Path) -> Iterable[None]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        if fcntl is not None:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(handle, fcntl.LOCK_UN)

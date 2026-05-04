@@ -325,11 +325,6 @@ marl:
   ippo_prior_logit_scale_init: 0.2
   ippo_critic_agent_count: 4
   ippo_device: cuda
-  ippo_expert_policy: topology_greedy
-  ippo_behavior_clone_pretrain_episodes: 10
-  ippo_behavior_clone_steps_per_observation: 4
-  ippo_behavior_clone_finetune_steps_per_observation: 0
-  ippo_reward_curve_policy_only: true
   ippo_lr: 0.0002
   masac_gamma: 0.99
   masac_alpha: 0.05
@@ -346,21 +341,15 @@ marl:
   masac_updates_per_env_step: 1
   masac_max_grad_norm: 1.0
   masac_reward_scale: 1.0
-  masac_replay_include_bc_expert: true
-  masac_actor_update_during_bc: false
   masac_replay_sample_strategy: scenario_balanced
   masac_training_scenario_sampling: balanced
   ippo_checkpoint_selection_interval: 100
   ippo_checkpoint_selection_max_steps: 120
   ippo_checkpoint_selection_seed_offsets: [1000]
   ippo_checkpoint_selection_metric: success_min_blend
-  masac_checkpoint_selection_require_sac_improves_bc: true
-  masac_checkpoint_selection_sac_min_score_ratio: 1.0
-  masac_checkpoint_selection_require_min_success_non_decrease: true
-  masac_checkpoint_selection_min_success_tolerance: 0.02
   ippo_eval_checkpoint_strategy: global_best_validation
   ippo_training_progress_guard_enabled: true
-  ippo_training_guard_min_episodes: 5
+  ippo_training_guard_min_episodes: 12
   ippo_training_guard_recent_window: 3
   ippo_training_guard_min_recent_max_success: 0.05
 

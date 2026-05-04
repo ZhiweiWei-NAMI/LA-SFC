@@ -16,7 +16,7 @@ import pandas as pd
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run Semantic-Topology stage1 MASAC training by seed shards.")
     parser.add_argument("--root", required=True)
-    parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2, 3, 4])
+    parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
     parser.add_argument(
         "--variants",
         nargs="+",
@@ -76,8 +76,8 @@ def main() -> int:
         variant_batch = list(args.variants[batch_start : batch_start + variant_concurrency])
         pending = []
         skipped = []
-        for variant in variant_batch:
-            for seed in args.seeds:
+        for seed in args.seeds:
+            for variant in variant_batch:
                 if args.skip_completed and shard_completed(seed, variant, root):
                     skipped.append((variant, seed))
                 else:
