@@ -757,6 +757,18 @@ class LASDMEnvAdapter:
             traffic["vehicle_speed_scale"] = float(scenario["vehicle_speed_scale"])
         if scenario.get("uav_speed_scale") is not None:
             traffic["uav_speed_scale"] = float(scenario["uav_speed_scale"])
+        segment_cfg = dict(scenario.get("trajectory_segment_sampling", {}) or {})
+        if segment_cfg.get("enabled"):
+            raw_range = segment_cfg.get("start_range_s", scenario.get("trajectory_start_range_s", [0.0, 0.0]))
+            if isinstance(raw_range, (list, tuple)) and len(raw_range) >= 2:
+                low, high = float(raw_range[0]), float(raw_range[1])
+            else:
+                low = high = float(segment_cfg.get("start_s", scenario.get("trajectory_start_s", 0.0)) or 0.0)
+            if high < low:
+                high = low
+            rng = random.Random(int(self.seed if self.seed is not None else 0) * 1000003 + 73037)
+            traffic["replay_start_time_s"] = low if high <= low else rng.uniform(low, high)
+            traffic["replay_hold_last"] = bool(segment_cfg.get("hold_last", True))
         if mobility.get("enabled"):
             if mobility.get("uav_speed_scale") is not None:
                 traffic["uav_speed_scale"] = float(mobility["uav_speed_scale"])

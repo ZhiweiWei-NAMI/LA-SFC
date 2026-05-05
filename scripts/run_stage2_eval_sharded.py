@@ -19,7 +19,6 @@ DEFAULT_BASELINES = [
     "pure_semantic_greedy_no_exchange",
     "local_semantic_runtime_greedy",
     "nsga2_semantic_qos",
-    "utility_prior_with_exchange",
     "topology_greedy",
     "marl_no_semantic",
     "marl_semantic_no_topology",
@@ -62,6 +61,11 @@ def main() -> int:
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--poll-s", type=float, default=60.0)
     parser.add_argument(
+        "--semantic-repair-config",
+        default="methods_baselines/lasdm/configs/semantic_topology_runtime_repair.yaml",
+        help="Runtime semantic-topology override config used by each eval shard.",
+    )
+    parser.add_argument(
         "--seed-concurrency",
         type=int,
         default=2,
@@ -99,7 +103,7 @@ def main() -> int:
         for seed_start in range(0, len(args.seeds), seed_concurrency):
             batch = list(args.seeds[seed_start : seed_start + seed_concurrency])
             batch_processes = [
-                start_shard(seed, shards, checkpoint_root, baselines, log_dir)
+                start_shard(seed, shards, checkpoint_root, baselines, log_dir, args.semantic_repair_config)
                 for seed in batch
             ]
             processes.extend(batch_processes)
@@ -139,6 +143,7 @@ def main() -> int:
         "seeds": list(args.seeds),
         "baselines": baselines,
         "checkpoint_root": str(checkpoint_root),
+        "semantic_repair_config": str(args.semantic_repair_config),
         "shard_root": str(shards),
         "output_dir": str(final),
     }
@@ -179,7 +184,14 @@ def trained_checkpoint_available(checkpoint_root: Path, baseline: str) -> bool:
     return any((checkpoint_root / str(baseline)).glob(f"**/{filename}"))
 
 
-def start_shard(seed: int, shards: Path, checkpoint_root: Path, baselines: list[str], log_dir: Path) -> dict[str, Any]:
+def start_shard(
+    seed: int,
+    shards: Path,
+    checkpoint_root: Path,
+    baselines: list[str],
+    log_dir: Path,
+    semantic_repair_config: str,
+) -> dict[str, Any]:
     shard_out = shards / f"seed_{seed}" / "semantic_runtime_eval"
     shard_out.mkdir(parents=True, exist_ok=True)
     log = (log_dir / f"seed_{seed}.log").open("w", encoding="utf-8")
@@ -199,6 +211,7 @@ def start_shard(seed: int, shards: Path, checkpoint_root: Path, baselines: list[
         str(shard_out),
         str(checkpoint_root),
         json.dumps(baselines),
+        str(semantic_repair_config),
     ]
     proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env)
     return {"seed": seed, "proc": proc, "log": log, "out": shard_out}
@@ -334,9 +347,10 @@ seed = int(sys.argv[1])
 out = Path(sys.argv[2])
 checkpoint_root = Path(sys.argv[3])
 baselines = json.loads(sys.argv[4])
+repair_config_path = sys.argv[5] if len(sys.argv) > 5 and sys.argv[5] else "methods_baselines/lasdm/configs/semantic_topology_runtime_repair.yaml"
 cfg = _load_semantic_config(
     "methods_baselines/lasdm/configs/semantic_topology_marl.yaml",
-    "methods_baselines/lasdm/configs/semantic_topology_runtime_repair.yaml",
+    repair_config_path,
 )
 cfg.setdefault("marl", {})["ippo_eval_checkpoint_strategy"] = "exact_seed"
 cfg.setdefault("runtime_repair", {}).setdefault("early_result_guard", {})["enabled"] = False

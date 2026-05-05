@@ -44,6 +44,11 @@ def main() -> int:
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--skip-completed", action="store_true")
     parser.add_argument("--poll-s", type=float, default=60.0)
+    parser.add_argument(
+        "--semantic-repair-config",
+        default="methods_baselines/lasdm/configs/semantic_topology_runtime_repair.yaml",
+        help="Runtime semantic-topology override config used by each shard.",
+    )
     parser.add_argument("--episodes", type=int, default=None, help="Override configured training episodes.")
     parser.add_argument("--max-steps", type=int, default=None, help="Override configured max steps per episode.")
     parser.add_argument(
@@ -84,6 +89,7 @@ def main() -> int:
     log_dir.mkdir(parents=True, exist_ok=True)
 
     all_processes: list[dict[str, Any]] = []
+    active_processes: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
     requested_jobs = build_job_plan(args)
     seed_concurrency = max(1, int(args.seed_concurrency or 1))
@@ -96,6 +102,8 @@ def main() -> int:
     )
     if cuda_devices:
         print("using CUDA devices for stage1 shards: " + ", ".join(cuda_devices), flush=True)
+    elif str(args.cuda_devices or "").strip().lower() == "auto":
+        raise SystemExit("no idle CUDA devices satisfy the configured memory/utilization thresholds")
     if args.skip_completed:
         skipped = [(variant, seed) for variant, seed in requested_jobs if shard_completed(seed, variant, root)]
         requested_jobs = [(variant, seed) for variant, seed in requested_jobs if not shard_completed(seed, variant, root)]
@@ -105,60 +113,82 @@ def main() -> int:
                 + ", ".join(f"{variant} seed {seed}" for variant, seed in skipped),
                 flush=True,
             )
-    for pending_start in range(0, len(requested_jobs), seed_concurrency):
-        pending_chunk = requested_jobs[pending_start : pending_start + seed_concurrency]
-        if pending_chunk:
-            processes = [
-                start_shard(
-                    seed,
-                    variant,
-                    root,
-                    log_dir,
-                    args.episodes,
-                    args.max_steps,
-                    cuda_devices[index % len(cuda_devices)] if cuda_devices else None,
-                )
-                for index, (variant, seed) in enumerate(pending_chunk)
-            ]
-            all_processes.extend(processes)
-            (root / "stage1_training_pids.json").write_text(
-                json.dumps(
-                    [
-                        {
-                            "seed": item["seed"],
-                            "variant": item["variant"],
-                            "pid": item["proc"].pid,
-                            "cuda_device": item.get("cuda_device", ""),
-                        }
-                        for item in all_processes
-                    ],
-                    indent=2,
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
+    next_job = 0
+    next_device = 0
+    poll_interval = max(1.0, min(float(args.poll_s), 30.0))
+    while next_job < len(requested_jobs) or active_processes:
+        launched: list[dict[str, Any]] = []
+        while next_job < len(requested_jobs) and len(active_processes) < seed_concurrency:
+            variant, seed = requested_jobs[next_job]
+            cuda_device = cuda_devices[next_device % len(cuda_devices)] if cuda_devices else None
+            next_job += 1
+            next_device += 1
+            item = start_shard(
+                seed,
+                variant,
+                root,
+                log_dir,
+                args.episodes,
+                args.max_steps,
+                args.semantic_repair_config,
+                cuda_device,
             )
+            all_processes.append(item)
+            active_processes.append(item)
+            launched.append(item)
+        if launched:
+            write_pid_manifest(root, all_processes)
             print(
                 "started stage1 training shards: "
-                + ", ".join(f"{item['variant']} seed {item['seed']} pid {item['proc'].pid}" for item in processes),
+                + ", ".join(
+                    f"{item['variant']} seed {item['seed']} pid {item['proc'].pid} gpu {item.get('cuda_device', '')}"
+                    for item in launched
+                ),
                 flush=True,
             )
-            batch_failed = monitor_shards(processes, args.poll_s)
-            failed.extend(batch_failed)
-            for item in processes:
-                code = item["proc"].wait()
-                item["log"].close()
-                failed_keys = {(entry.get("variant"), entry.get("seed")) for entry in failed}
-                if code != 0 and (item["variant"], item["seed"]) not in failed_keys:
-                    failed.append(
-                        {
-                            "seed": item["seed"],
-                            "variant": item["variant"],
-                            "returncode": code,
-                            "log": str(log_dir / f"stage1_{item['variant']}_seed_{item['seed']}.log"),
-                        }
-                    )
+
+        still_active: list[dict[str, Any]] = []
+        finished_any = False
+        for item in active_processes:
+            code = item["proc"].poll()
+            if code is None:
+                still_active.append(item)
+                continue
+            finished_any = True
+            item["returncode"] = code
+            item["completed_at"] = time.time()
+            item["log"].close()
+            if code != 0:
+                failed.append(
+                    {
+                        "seed": item["seed"],
+                        "variant": item["variant"],
+                        "returncode": code,
+                        "log": str(log_dir / f"stage1_{item['variant']}_seed_{item['seed']}.log"),
+                    }
+                )
+        active_processes = still_active
+        if finished_any:
+            write_pid_manifest(root, all_processes)
             if failed:
+                for item in active_processes:
+                    item["proc"].terminate()
                 break
+            continue
+        print_progress(active_processes, active_processes)
+        if active_processes:
+            time.sleep(poll_interval)
+    if failed and active_processes:
+        for item in active_processes:
+            try:
+                item["proc"].wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                item["proc"].kill()
+                item["proc"].wait()
+            item["returncode"] = item["proc"].returncode
+            if not item["log"].closed:
+                item["log"].close()
+        write_pid_manifest(root, all_processes)
 
     runs = []
     for variant, seed in build_job_plan(args):
@@ -180,6 +210,7 @@ def main() -> int:
         "requested_seeds": list(args.seeds),
         "requested_jobs": [{"variant": variant, "seed": seed} for variant, seed in build_job_plan(args)],
         "variants": list(args.variants),
+        "semantic_repair_config": str(args.semantic_repair_config),
         "output_dir": str(train_root),
         "runs": runs,
     }
@@ -209,6 +240,7 @@ def start_shard(
     log_dir: Path,
     episodes: int | None,
     max_steps: int | None,
+    semantic_repair_config: str,
     cuda_device: str | None = None,
 ) -> dict[str, Any]:
     log = (log_dir / f"stage1_{variant}_seed_{seed}.log").open("w", encoding="utf-8")
@@ -234,6 +266,7 @@ def start_shard(
         str(variant),
         "" if episodes is None else str(episodes),
         "" if max_steps is None else str(max_steps),
+        str(semantic_repair_config),
     ]
     proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env)
     variant_root = root / "semantic_runtime_train" if variant == "proposed_semantic_topology_marl" else root / "semantic_runtime_train" / variant
@@ -293,20 +326,22 @@ def select_cuda_devices(
     if not candidates:
         return []
     needed = max(1, int(required_slots or 1))
-    selected: list[tuple[str, int]] = []
-    total_slots = 0
-    for item in sorted(candidates, key=lambda pair: pair[1], reverse=True):
-        selected.append(item)
-        total_slots += item[1]
-        if total_slots >= needed:
-            break
+    selected = sorted(candidates, key=lambda pair: int(pair[0]))
+    total_slots = sum(slots for _index, slots in selected)
     counts = {index: 0 for index, _slots in selected}
     devices: list[str] = []
     for _ in range(min(needed, total_slots)):
         available = [(index, slots) for index, slots in selected if counts[index] < slots]
         if not available:
             break
-        index, _slots = min(available, key=lambda pair: (counts[pair[0]], -pair[1], pair[0]))
+        index, _slots = min(
+            available,
+            key=lambda pair: (
+                counts[pair[0]] / max(1, pair[1]),
+                counts[pair[0]],
+                int(pair[0]),
+            ),
+        )
         counts[index] += 1
         devices.append(index)
     return devices
@@ -323,22 +358,26 @@ def checkpoint_name_for_variant(variant: str) -> str:
     return TRAINED_CHECKPOINT_FILES.get(str(variant), "masac_policy.pt")
 
 
-def monitor_shards(processes: list[dict[str, Any]], poll_s: float) -> list[dict[str, Any]]:
-    failed: list[dict[str, Any]] = []
-    while True:
-        alive = []
-        for item in processes:
+def write_pid_manifest(root: Path, processes: list[dict[str, Any]]) -> None:
+    rows = []
+    for item in processes:
+        code = item.get("returncode")
+        if code is None:
             code = item["proc"].poll()
-            if code is None:
-                alive.append(item)
-            elif code != 0 and (item["variant"], item["seed"]) not in {
-                (entry.get("variant"), entry.get("seed")) for entry in failed
-            }:
-                failed.append({"seed": item["seed"], "variant": item["variant"], "returncode": code})
-        print_progress(processes, alive)
-        if not alive:
-            return failed
-        time.sleep(max(1.0, float(poll_s)))
+        rows.append(
+            {
+                "seed": item["seed"],
+                "variant": item["variant"],
+                "pid": item["proc"].pid,
+                "cuda_device": item.get("cuda_device", ""),
+                "state": "running" if code is None else "completed" if code == 0 else "failed",
+                "returncode": code,
+            }
+        )
+    (root / "stage1_training_pids.json").write_text(
+        json.dumps(rows, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
 
 
 def print_progress(processes: list[dict[str, Any]], alive: list[dict[str, Any]]) -> None:
@@ -384,7 +423,7 @@ method_root = Path("methods_baselines/lasdm").resolve()
 if str(method_root) not in sys.path:
     sys.path.insert(0, str(method_root))
 
-from run_complete_runtime_experiment import train_semantic_ippo_variants_runtime, _load_semantic_config, _select_scenarios
+from run_complete_runtime_experiment import train_semantic_ippo_variants_runtime, _ippo_training_scenario_for_episode, _load_semantic_config, _select_scenarios
 from train_semantic_topology_marl import build_offline_env, _actor_policy_kwargs, _close_runtime_env
 
 seed = int(sys.argv[1])
@@ -392,16 +431,21 @@ root = Path(sys.argv[2])
 variant = str(sys.argv[3])
 episodes_override = int(sys.argv[4]) if len(sys.argv) > 4 and sys.argv[4] else None
 max_steps_override = int(sys.argv[5]) if len(sys.argv) > 5 and sys.argv[5] else None
+repair_config_path = sys.argv[6] if len(sys.argv) > 6 and sys.argv[6] else "methods_baselines/lasdm/configs/semantic_topology_runtime_repair.yaml"
 cfg = _load_semantic_config(
     "methods_baselines/lasdm/configs/semantic_topology_marl.yaml",
-    "methods_baselines/lasdm/configs/semantic_topology_runtime_repair.yaml",
+    repair_config_path,
 )
 scenarios = _select_scenarios(cfg, None)
 episodes = int(episodes_override if episodes_override is not None else cfg.get("training", {}).get("episodes", 100))
 max_steps = int(max_steps_override if max_steps_override is not None else cfg.get("training", {}).get("max_steps", 100))
 
 if variant in {"mappo_ctde", "iql_offline"}:
-    scenario = dict(scenarios[0]) if scenarios else {"name": "default"}
+    marl_cfg = dict(cfg.get("marl", {}) or {})
+    def scenario_for_episode(episode):
+        return dict(_ippo_training_scenario_for_episode(scenarios, marl_cfg, int(episode), episodes))
+
+    scenario = scenario_for_episode(0)
     output_dir = root / "semantic_runtime_train" / variant / f"ippo_seed_{seed}"
     output_dir.mkdir(parents=True, exist_ok=True)
     env = build_offline_env(
@@ -415,14 +459,14 @@ if variant in {"mappo_ctde", "iql_offline"}:
     )
     try:
         observations = env.reset()
-        marl_cfg = dict(cfg.get("marl", {}) or {})
-        policy_kwargs = _actor_policy_kwargs(cfg, observations, env.config.semantic_scorer, seed)
+        policy_kwargs = _actor_policy_kwargs(cfg, observations, seed)
         def fresh_env(offset):
+            episode_scenario = scenario_for_episode(int(offset) % max(1, episodes))
             return build_offline_env(
                 cfg,
                 seed=seed * 100000 + int(offset),
                 max_steps=max_steps,
-                scenario=scenario,
+                scenario=episode_scenario,
                 service_role_sweep="full_hybrid",
                 attach_runtime=True,
                 baseline=variant,
@@ -481,6 +525,7 @@ if variant in {"mappo_ctde", "iql_offline"}:
                 updates_per_transition=float(marl_cfg.get("iql_updates_per_transition", 1.0) or 1.0),
                 max_grad_norm=float(marl_cfg.get("iql_max_grad_norm", marl_cfg.get("masac_max_grad_norm", 1.0)) or 1.0),
                 reward_scale=float(marl_cfg.get("iql_reward_scale", marl_cfg.get("masac_reward_scale", 1.0)) or 1.0),
+                diagnostics_interval=int(marl_cfg.get("iql_diagnostics_interval", 1) or 1),
                 seed=seed,
             )
             rows = trainer.train(episodes=episodes, max_steps=max_steps, output_dir=str(output_dir))
@@ -496,7 +541,8 @@ if variant in {"mappo_ctde", "iql_offline"}:
         "seed": seed,
         "episodes": episodes,
         "max_steps": max_steps,
-        "scenario": str(scenario.get("name", "default")),
+        "scenario": "mixed_training_scenarios",
+        "training_scenarios": [str(item.get("name", "default")) for item in scenarios],
         "service_role_sweep": "full_hybrid",
         "checkpoint_path": str(checkpoint),
         "output_dir": str(output_dir),

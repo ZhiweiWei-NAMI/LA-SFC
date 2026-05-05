@@ -16,6 +16,73 @@ import yaml
 
 LOGGER = logging.getLogger(__name__)
 _LOGGED_V21_CHAIN_OVERWRITES: set[tuple[str, int, str, str]] = set()
+_LOGGED_V21_MISSING_REQUEST_TYPES: set[str] = set()
+_LOGGED_V21_CHAIN_EXPANSIONS: set[tuple[str, int, int]] = set()
+_COMPRESSED_REQUEST_SERVICE_CHAINS: Dict[str, Dict[int, List[str]]] = {
+    "forest_fire_monitoring": {
+        2: ["aerial_video_preprocessing", "fire_candidate_detection"],
+        3: ["aerial_video_preprocessing", "fire_candidate_detection", "fire_event_verification"],
+        4: ["aerial_video_preprocessing", "fire_candidate_detection", "fire_event_verification", "emergency_alert_publish"],
+        5: [
+            "aerial_video_preprocessing",
+            "fire_candidate_detection",
+            "smoke_fire_fusion",
+            "fire_event_verification",
+            "emergency_alert_publish",
+        ],
+    },
+    "traffic_surveillance": {
+        2: ["aerial_video_preprocessing", "vehicle_detection_and_tracking"],
+        3: ["aerial_video_preprocessing", "vehicle_detection_and_tracking", "trajectory_risk_assessment"],
+        4: [
+            "aerial_video_preprocessing",
+            "vehicle_detection_and_tracking",
+            "trajectory_risk_assessment",
+            "emergency_alert_publish",
+        ],
+        5: [
+            "aerial_video_preprocessing",
+            "vehicle_detection_and_tracking",
+            "trajectory_risk_assessment",
+            "emergency_alert_publish",
+            "surveillance_event_archive",
+        ],
+    },
+    "urban_security": {
+        2: ["aerial_video_preprocessing", "person_detection_and_reid"],
+        3: ["aerial_video_preprocessing", "person_detection_and_reid", "identity_verification"],
+        4: [
+            "aerial_video_preprocessing",
+            "person_detection_and_reid",
+            "identity_verification",
+            "trajectory_risk_assessment",
+        ],
+        5: [
+            "aerial_video_preprocessing",
+            "person_detection_and_reid",
+            "identity_verification",
+            "trajectory_risk_assessment",
+            "emergency_alert_publish",
+        ],
+    },
+    "industrial_inspection": {
+        2: ["thermal_frame_preprocessing", "industrial_defect_detection"],
+        3: ["thermal_frame_preprocessing", "industrial_defect_detection", "defect_classification"],
+        4: [
+            "thermal_frame_preprocessing",
+            "industrial_defect_detection",
+            "defect_classification",
+            "inspection_report_generation",
+        ],
+        5: [
+            "thermal_frame_preprocessing",
+            "multi_spectral_fusion_preprocessing",
+            "industrial_defect_detection",
+            "defect_classification",
+            "inspection_report_generation",
+        ],
+    },
+}
 
 METHOD_ROOT = os.path.abspath(os.path.dirname(__file__))
 WORKSPACE_ROOT = os.path.abspath(os.path.join(METHOD_ROOT, "../.."))
@@ -35,9 +102,7 @@ from airfogsim.lasdm.marl_trainer import HeuristicEvaluator, MASACTrainer, write
 from airfogsim.lasdm.model import LASDMServiceChain
 from airfogsim.lasdm.orchestrator import LASDMOrchestrator
 from airfogsim.lasdm.runtime_bridge import LASDMRuntimeBridge
-from airfogsim.lasdm.semantic_encoder import SemanticEncoder
 from airfogsim.lasdm.semantic_link_matrix import SERVICE_IO_DEFAULTS, SemanticLinkMatrix, V21_OUTPUT_ROOT
-from airfogsim.lasdm.semantic_link_predictor import build_semantic_scorer
 from airfogsim.lasdm.topology_builder import TopologyBuilder
 
 DEFAULT_CONFIG = os.path.join(METHOD_ROOT, "configs", "semantic_topology_marl.yaml")
@@ -100,7 +165,7 @@ def main() -> None:
         output_dir.mkdir(parents=True, exist_ok=True)
 
         marl_cfg = dict(config.get("marl", {}) or {})
-        policy_kwargs = _actor_policy_kwargs(config, observations, env.config.semantic_scorer, args.seed)
+        policy_kwargs = _actor_policy_kwargs(config, observations, args.seed)
         def fresh_env(offset: int) -> SemanticTopologyMARLEnv:
             return build_offline_env(
                 config,
@@ -243,7 +308,6 @@ def build_offline_env(
     exchange_cfg = run_config.get("semantic_exchange", {})
     topology_cfg = run_config.get("topology", {})
     semantic_matrix = run_config.get("_semantic_matrix")
-    semantic_scorer = _build_semantic_scorer(run_config, semantic_matrix)
     env_cfg = MARLEnvConfig(
         semantic_top_k=int(marl_cfg.get("semantic_top_k", 8)),
         min_semantic_similarity=float(marl_cfg.get("min_semantic_similarity", -1.0)),
@@ -278,7 +342,6 @@ def build_offline_env(
         sequential_capacity_enabled=bool(marl_cfg.get("sequential_capacity_enabled", True)),
         sequential_deadline_pruning_enabled=bool(marl_cfg.get("sequential_deadline_pruning_enabled", True)),
         semantic_matrix=semantic_matrix,
-        semantic_scorer=semantic_scorer,
         enable_semantic_profiles=True,
     )
     semantic_env = SemanticTopologyMARLEnv(
@@ -290,28 +353,6 @@ def build_offline_env(
     if attach_runtime:
         _attach_runtime_env(semantic_env, config, scenario_cfg, seed, baseline)
     return semantic_env
-
-
-def _build_semantic_scorer(run_config: Mapping[str, Any], semantic_matrix: Optional[SemanticLinkMatrix]) -> Any:
-    if semantic_matrix is None:
-        return None
-    marl_cfg = dict(run_config.get("marl", {}) or {})
-    if not bool(marl_cfg.get("include_semantic_features", True)):
-        return None
-    exchange_cfg = dict(run_config.get("semantic_exchange", {}) or {})
-    encoder = SemanticEncoder(
-        backend=str(exchange_cfg.get("encoder_backend", "hash")),
-        model_name=str(exchange_cfg.get("sbert_model_name", "sentence-transformers/all-MiniLM-L6-v2")),
-        hash_dim=int(exchange_cfg.get("hash_dim", 384)),
-        batch_size=int(exchange_cfg.get("encoder_batch_size", 64)),
-        device=str(exchange_cfg.get("encoder_device", "")) or None,
-    )
-    return build_semantic_scorer(
-        service_type_to_idx=semantic_matrix.service_type_to_idx,
-        encoder=encoder,
-        embedding_dim=int(exchange_cfg.get("hash_dim", 384)),
-    )
-
 
 def _attach_runtime_env(
     env: SemanticTopologyMARLEnv,
@@ -362,7 +403,7 @@ def _build_reward_fn(marl_cfg: Mapping[str, Any]) -> SFCReward:
     values = {}
     for key, value in reward_cfg.items():
         if key in allowed:
-            values[key] = float(value)
+            values[key] = bool(value) if key == "scenario_normalized_dense" else float(value)
     return SFCReward(SFCRewardConfig(**values))
 
 
@@ -379,7 +420,6 @@ def _observation_candidate_feature_dim(observations: Mapping[str, Mapping[str, A
 def _actor_policy_kwargs(
     config: Mapping[str, Any],
     observations: Mapping[str, Mapping[str, Any]],
-    semantic_scorer: Any,
     seed: int,
 ) -> Dict[str, Any]:
     marl_cfg = dict(config.get("marl", {}) or {})
@@ -410,7 +450,6 @@ def _actor_policy_kwargs(
             marl_cfg.get("ippo_prior_logit_scale_init", marl_cfg.get("ippo_prior_logit_scale", 1.0)) or 1.0
         ),
         "learnable_logit_blend": bool(marl_cfg.get("ippo_learnable_logit_blend", False)),
-        "semantic_scorer": semantic_scorer,
         "device": str(marl_cfg.get("ippo_device", "") or "") or None,
     }
 
@@ -588,9 +627,16 @@ def _materialized_service_instances(
                 implementations = semantic_matrix.list_implementations_for(service_type, compatible_node_type=node_type)
                 if not implementations:
                     continue
-                rng.shuffle(implementations)
                 instance_count = _instance_count_per_node(node_type, len(implementations))
-                for replica_index, implementation in enumerate(implementations[:instance_count]):
+                deployed = _select_deployed_implementations(
+                    implementations,
+                    scenario,
+                    node_type,
+                    service_type,
+                    rng,
+                    instance_count,
+                )
+                for replica_index, implementation in enumerate(deployed):
                     metadata = semantic_matrix.candidate_metadata_from_implementation(implementation)
                     profile = dict(implementation.raw)
                     resource_profile = dict(profile.get("resource_profile", {}) or {})
@@ -631,13 +677,102 @@ def _materialized_service_instances(
                                 "scenario_materialized": True,
                                 "scenario": scenario.get("name", "default"),
                                 "role_control": "v21_semantic_profile",
-                                "load_ratio_override": 0.20 if node_type in {"vehicle", "uav"} else 0.05,
-                                "topology_risk": 0.30 if node_type in {"vehicle", "uav"} else 0.08,
-                                "mobility_risk": 0.35 if node_type in {"vehicle", "uav"} else 0.05,
+                                "load_ratio_override": _scenario_node_type_value(
+                                    scenario,
+                                    node_type,
+                                    "service_load_ratio",
+                                    0.20 if node_type in {"vehicle", "uav"} else 0.05,
+                                ),
+                                "topology_risk": _scenario_node_type_value(
+                                    scenario,
+                                    node_type,
+                                    "service_topology_risk",
+                                    0.30 if node_type in {"vehicle", "uav"} else 0.08,
+                                ),
+                                "mobility_risk": _scenario_node_type_value(
+                                    scenario,
+                                    node_type,
+                                    "service_mobility_risk",
+                                    0.35 if node_type in {"vehicle", "uav"} else 0.05,
+                                ),
+                                "deployment_variant_weight": _deployment_variant_weight(
+                                    scenario,
+                                    node_type,
+                                    implementation.variant_type,
+                                    service_type,
+                                ),
                             },
                         }
                     )
     return generated
+
+
+def _scenario_node_type_value(
+    scenario: Mapping[str, Any],
+    node_type: str,
+    suffix: str,
+    default: float,
+) -> float:
+    direct_key = f"{node_type}_{suffix}"
+    if direct_key in scenario:
+        return float(scenario[direct_key])
+    group = "mobile" if node_type in {"vehicle", "uav"} else "infrastructure"
+    group_key = f"{group}_{suffix}"
+    if group_key in scenario:
+        return float(scenario[group_key])
+    if group == "infrastructure":
+        infra_key = f"infra_{suffix}"
+        if infra_key in scenario:
+            return float(scenario[infra_key])
+    return float(default)
+
+
+def _select_deployed_implementations(
+    implementations: Sequence[Any],
+    scenario: Mapping[str, Any],
+    node_type: str,
+    service_type: str,
+    rng: random.Random,
+    count: int,
+) -> List[Any]:
+    remaining = list(implementations)
+    selected: List[Any] = []
+    for _ in range(min(max(0, int(count)), len(remaining))):
+        weights = [
+            _deployment_variant_weight(scenario, node_type, item.variant_type, service_type)
+            for item in remaining
+        ]
+        total = sum(max(0.0, weight) for weight in weights)
+        if total <= 0.0:
+            chosen_index = rng.randrange(len(remaining))
+        else:
+            threshold = rng.random() * total
+            cumulative = 0.0
+            chosen_index = len(remaining) - 1
+            for index, weight in enumerate(weights):
+                cumulative += max(0.0, weight)
+                if threshold <= cumulative:
+                    chosen_index = index
+                    break
+        selected.append(remaining.pop(chosen_index))
+    return selected
+
+
+def _deployment_variant_weight(
+    scenario: Mapping[str, Any],
+    node_type: str,
+    variant_type: str,
+    service_type: str,
+) -> float:
+    cfg = dict(scenario.get("semantic_deployment_distribution", {}) or {})
+    raw_weights = dict(cfg.get("variant_weights", {}) or {})
+    weights = dict(raw_weights.get("default", {}) or {})
+    weights.update(dict(raw_weights.get(str(node_type), {}) or {}))
+    value = float(weights.get(str(variant_type), 1.0) or 0.0)
+    service_exact_scale = dict(cfg.get("exact_service_scale", {}) or {})
+    if str(variant_type) == "exact" and str(service_type) in service_exact_scale:
+        value *= max(0.0, float(service_exact_scale[str(service_type)]))
+    return max(0.0, value)
 
 
 def _instance_count_per_node(node_type: str, available: int) -> int:
@@ -677,6 +812,7 @@ def _scenario_chains(
     vehicle_tasks = max(0, int(task_nodes.get("vehicle", 0) or 0))
     uav_tasks = max(0, int(task_nodes.get("uav", 0) or 0))
     load_multiplier = _load_multiplier(scenario_cfg)
+    arrival_offsets = _scenario_arrival_offsets(scenario_cfg, seed, target_count, arrival_rate)
     chains: List[Dict[str, Any]] = []
     for index in range(target_count):
         raw = copy.deepcopy(base[index % len(base)])
@@ -686,6 +822,12 @@ def _scenario_chains(
         raw["sink_node_id"] = source
         apply_semantic_scenario_overrides(raw, scenario_cfg, seed=seed, request_index=index)
         context = dict(raw.get("context", {}) or {})
+        request_type = _select_request_type(scenario_cfg, seed, index)
+        if request_type:
+            context["request_type"] = request_type
+        representative_length = _select_representative_service_chain_length(scenario_cfg, seed, index)
+        if representative_length is not None:
+            context["representative_service_chain_length"] = representative_length
         context.update(
             {
                 "scenario": scenario_cfg.get("name", "default"),
@@ -694,7 +836,17 @@ def _scenario_chains(
                 "preferred_region_id": _scenario_preferred_region(scenario_cfg, index, source),
                 "task_node_counts": task_nodes,
                 "service_node_counts": dict(scenario_cfg.get("service_nodes", {}) or {}),
+                "request_count": target_count,
                 "arrival_rate_sfc_per_s": arrival_rate,
+                "arrival_process": str(scenario_cfg.get("arrival_process", "deterministic")),
+                "arrival_horizon_s": _scenario_arrival_horizon_s(scenario_cfg, target_count, arrival_rate),
+                "arrival_time_s": float(arrival_offsets[index]),
+                "request_intensity_sfc_per_s": float(target_count)
+                / max(1e-6, _scenario_arrival_horizon_s(scenario_cfg, target_count, arrival_rate)),
+                "theoretical_success_target": scenario_cfg.get("theoretical_success_target"),
+                "max_concurrent_sfcs": int(
+                    scenario_cfg.get("max_concurrent_sfcs", target_count) or target_count
+                ),
                 "load_multiplier": load_multiplier,
                 "risk_level": float(scenario_cfg.get("risk_level", context.get("risk_level", 0.0)) or 0.0),
                 "mobility_multiplier": _mobility_multiplier(scenario_cfg),
@@ -720,6 +872,102 @@ def _scenario_chains(
     return chains
 
 
+def _scenario_arrival_horizon_s(scenario: Mapping[str, Any], request_count: int, arrival_rate: float) -> float:
+    raw = scenario.get("arrival_horizon_s", scenario.get("episode_duration_s"))
+    if raw is not None:
+        return max(0.1, float(raw))
+    return max(0.1, float(request_count) / max(1e-6, float(arrival_rate)))
+
+
+def _scenario_arrival_offsets(
+    scenario: Mapping[str, Any],
+    seed: int,
+    request_count: int,
+    arrival_rate: float,
+) -> List[float]:
+    count = max(0, int(request_count))
+    if count <= 0:
+        return []
+    process = str(scenario.get("arrival_process", "deterministic")).strip().lower()
+    horizon_s = _scenario_arrival_horizon_s(scenario, count, arrival_rate)
+    rng = random.Random(_stable_scenario_seed(scenario, seed, 41047))
+    if process in {"poisson", "conditional_poisson", "poisson_fixed_count"}:
+        return sorted(rng.uniform(0.0, horizon_s) for _ in range(count))
+    if process in {"poisson_interarrival", "exponential"}:
+        now = 0.0
+        offsets: List[float] = []
+        for _ in range(count):
+            now += rng.expovariate(max(1e-6, float(arrival_rate)))
+            offsets.append(now)
+        return offsets
+    return [float(index) / max(1e-6, float(arrival_rate)) for index in range(count)]
+
+
+def _select_representative_service_chain_length(
+    scenario: Mapping[str, Any],
+    seed: int,
+    request_index: int,
+) -> Optional[int]:
+    distribution = scenario.get("sfc_length_distribution", scenario.get("chain_length_distribution"))
+    if isinstance(distribution, Mapping):
+        weighted: List[tuple[int, float]] = []
+        for raw_length, raw_weight in distribution.items():
+            weight = max(0.0, float(raw_weight or 0.0))
+            if weight > 0.0:
+                weighted.append((max(1, int(raw_length)), weight))
+        if weighted:
+            total = sum(weight for _length, weight in weighted)
+            rng = random.Random(_stable_scenario_seed(scenario, seed, 52021) + int(request_index) * 17)
+            threshold = rng.random() * total
+            cumulative = 0.0
+            for length, weight in weighted:
+                cumulative += weight
+                if threshold <= cumulative:
+                    return length
+            return weighted[-1][0]
+    raw_range = scenario.get("sfc_length_range", scenario.get("chain_length_range"))
+    if isinstance(raw_range, (list, tuple)) and len(raw_range) >= 2:
+        low = max(1, int(raw_range[0]))
+        high = max(low, int(raw_range[1]))
+        rng = random.Random(_stable_scenario_seed(scenario, seed, 53047) + int(request_index) * 31)
+        return rng.randint(low, high)
+    raw_length = scenario.get("sfc_length", scenario.get("chain_length"))
+    if raw_length is not None:
+        return max(1, int(raw_length))
+    return None
+
+
+def _stable_scenario_seed(scenario: Mapping[str, Any], seed: int, salt: int) -> int:
+    name = str(scenario.get("name", "scenario"))
+    stable_name = sum((index + 1) * ord(char) for index, char in enumerate(name))
+    return int(seed) * 1000003 + stable_name + int(salt)
+
+
+def _select_request_type(
+    scenario: Mapping[str, Any],
+    seed: int,
+    request_index: int,
+) -> Optional[str]:
+    distribution = scenario.get("request_type_distribution")
+    if not isinstance(distribution, Mapping):
+        return None
+    weighted = [
+        (str(name), max(0.0, float(weight or 0.0)))
+        for name, weight in distribution.items()
+        if max(0.0, float(weight or 0.0)) > 0.0
+    ]
+    if not weighted:
+        return None
+    total = sum(weight for _name, weight in weighted)
+    threshold = random.Random(int(seed) * 1000003 + int(request_index) * 9176 + 71).random() * total
+    cumulative = 0.0
+    for name, weight in weighted:
+        cumulative += weight
+        if threshold <= cumulative:
+            return name
+    return weighted[-1][0]
+
+
 def _scenario_with_default_task_classes(config: Mapping[str, Any], scenario: Mapping[str, Any]) -> Dict[str, Any]:
     scenario_cfg = copy.deepcopy(dict(scenario))
     experiment_cfg = dict(config.get("semantic_topology_experiment", {}) or {})
@@ -739,25 +987,43 @@ def _assign_v21_request_types(chains: Sequence[Dict[str, Any]], semantic_matrix:
         chain_id = str(chain.get("sfc_id", f"chain_{index}"))
         if not context.get("request_type"):
             context["request_type"] = request_cycle[index % len(request_cycle)]
-            LOGGER.warning(
-                "V21 chain %s missing request_type; assigned %s from deterministic request cycle.",
-                chain_id,
-                context["request_type"],
-            )
+            if str(context["request_type"]) not in _LOGGED_V21_MISSING_REQUEST_TYPES:
+                _LOGGED_V21_MISSING_REQUEST_TYPES.add(str(context["request_type"]))
+                LOGGER.warning(
+                    "V21 chains missing request_type; assigning %s from deterministic request cycle.",
+                    context["request_type"],
+                )
         chain["context"] = context
         request_type = str(context["request_type"])
         sequence = _representative_service_sequence(request_type, semantic_matrix)
         if context.get("preprocess_only"):
             sequence = sequence[:1]
-        nodes = list(chain.get("nodes", []) or [])
-        if len(nodes) < len(sequence):
-            LOGGER.warning(
-                "V21 request_type %s expands chain %s from %d structural nodes to %d representative services.",
+        target_length_raw = context.get("representative_service_chain_length")
+        explicit_target_length = target_length_raw is not None
+        if explicit_target_length:
+            target_length = max(1, min(len(sequence), int(float(target_length_raw))))
+            sequence = _compressed_representative_service_sequence(
                 request_type,
-                chain_id,
-                len(nodes),
-                len(sequence),
+                sequence,
+                target_length,
+                semantic_matrix,
             )
+        nodes = list(chain.get("nodes", []) or [])
+        if explicit_target_length and len(nodes) > len(sequence):
+            nodes = [copy.deepcopy(node) for node in nodes[: len(sequence)]]
+            chain["nodes"] = nodes
+            node_ids = [str(node.get("node_id")) for node in nodes]
+            chain["edges"] = [{"from": node_ids[i], "to": node_ids[i + 1]} for i in range(len(node_ids) - 1)]
+        if len(nodes) < len(sequence):
+            expansion_key = (request_type, len(nodes), len(sequence))
+            if expansion_key not in _LOGGED_V21_CHAIN_EXPANSIONS:
+                _LOGGED_V21_CHAIN_EXPANSIONS.add(expansion_key)
+                LOGGER.warning(
+                    "V21 request_type %s expands matching chains from %d structural nodes to %d representative services.",
+                    request_type,
+                    len(nodes),
+                    len(sequence),
+                )
             template = copy.deepcopy(nodes[-1]) if nodes else {}
             for extra_index in range(len(nodes), len(sequence)):
                 service_type = sequence[extra_index]
@@ -804,6 +1070,7 @@ def _assign_v21_request_types(chains: Sequence[Dict[str, Any]], semantic_matrix:
             input_semantic, output_semantic = SERVICE_IO_DEFAULTS.get(service_type, ("any", "any"))
             node["input_semantic"] = input_semantic
             node["output_semantic"] = output_semantic
+            _apply_v21_runtime_cost_defaults(node, service_type, semantic_matrix, context)
 
 
 def _representative_service_sequence(request_type: str, semantic_matrix: SemanticLinkMatrix) -> list[str]:
@@ -813,6 +1080,82 @@ def _representative_service_sequence(request_type: str, semantic_matrix: Semanti
     if not sequence:
         raise ValueError(f"V21 request_type {request_type!r} has no valid representative_service_chain entries")
     return sequence
+
+
+def _compressed_representative_service_sequence(
+    request_type: str,
+    full_sequence: Sequence[str],
+    target_length: int,
+    semantic_matrix: SemanticLinkMatrix,
+) -> list[str]:
+    target = max(1, int(target_length))
+    full = [str(item) for item in full_sequence if str(item) in semantic_matrix.service_type_to_idx]
+    if target >= len(full):
+        return full
+    templates = _COMPRESSED_REQUEST_SERVICE_CHAINS.get(str(request_type), {})
+    exact = templates.get(target)
+    if exact:
+        sequence = [str(item) for item in exact if str(item) in semantic_matrix.service_type_to_idx]
+        if len(sequence) == target:
+            return sequence
+    return _semantic_milestone_sequence(full, target, semantic_matrix)
+
+
+def _semantic_milestone_sequence(
+    full_sequence: Sequence[str],
+    target_length: int,
+    semantic_matrix: SemanticLinkMatrix,
+) -> list[str]:
+    full = [str(item) for item in full_sequence if str(item) in semantic_matrix.service_type_to_idx]
+    if target_length >= len(full):
+        return full
+    by_domain: Dict[str, List[str]] = {}
+    for service_type in full:
+        raw = dict(semantic_matrix.service_types.get(str(service_type), {}) or {})
+        domain = str(raw.get("functional_domain", "") or "")
+        by_domain.setdefault(domain, []).append(str(service_type))
+    milestones: List[str] = []
+    for domain in ("preprocessing", "detection", "fusion", "verification", "alerting", "reporting", "archival"):
+        for service_type in by_domain.get(domain, []):
+            if service_type not in milestones:
+                milestones.append(service_type)
+                break
+        if len(milestones) >= target_length:
+            break
+    if full[-1] not in milestones and len(milestones) >= 3:
+        milestones[-1] = full[-1]
+    for service_type in full:
+        if len(milestones) >= target_length:
+            break
+        if service_type not in milestones:
+            milestones.append(service_type)
+    return milestones[:target_length]
+
+
+def _apply_v21_runtime_cost_defaults(
+    node: Dict[str, Any],
+    service_type: str,
+    semantic_matrix: SemanticLinkMatrix,
+    context: Mapping[str, Any],
+) -> None:
+    metadata = dict(node.get("metadata", {}) or {})
+    raw = dict(semantic_matrix.service_types.get(str(service_type), {}) or {})
+    domain = str(raw.get("functional_domain", "") or "")
+    base_cpu_by_domain = {
+        "preprocessing": 16.0,
+        "detection": 42.0,
+        "fusion": 34.0,
+        "verification": 38.0,
+        "alerting": 14.0,
+        "archival": 18.0,
+        "reporting": 24.0,
+    }
+    cpu_scale = max(0.0, float(context.get("service_cpu_scale", 1.0) or 1.0))
+    task_cpu = base_cpu_by_domain.get(domain, 24.0) * cpu_scale
+    metadata["task_cpu"] = task_cpu
+    metadata["cpu_mb"] = task_cpu
+    node["cpu_mb"] = task_cpu
+    node["metadata"] = metadata
 
 
 def _service_type_for_request_position(request_type: str, position: int, semantic_matrix: SemanticLinkMatrix) -> str:
@@ -874,12 +1217,22 @@ def apply_semantic_scenario_overrides(
             context["allowed_node_types"] = [str(item) for item in allowed_types]
         chain["context"] = context
     else:
-        deadline = scenario.get("qos_deadline_s", scenario.get("deadline_s"))
+        deadline = _sample_scenario_deadline_s(scenario, seed, request_index)
         if deadline is not None:
             qos["deadline_s"] = float(deadline)
         elif "high_contention" in str(scenario.get("name", "")):
             qos["deadline_s"] = min(float(qos.get("deadline_s", 6.0)), 5.0)
     chain["qos"] = qos
+    context = dict(chain.get("context", {}) or {})
+    for key in (
+        "per_function_task_deadline_enabled",
+        "per_function_task_deadline_multiplier",
+        "per_function_task_deadline_min_s",
+        "per_function_task_deadline_max_s",
+    ):
+        if key in scenario:
+            context[key] = scenario[key]
+    chain["context"] = context
 
     payload_range = scenario.get("payload_mb_range")
     if isinstance(payload_range, (list, tuple)) and len(payload_range) >= 2:
@@ -909,6 +1262,9 @@ def apply_semantic_scenario_overrides(
     cpu_scale = scenario.get("service_cpu_scale")
     if cpu_scale is not None:
         scale = max(0.0, float(cpu_scale))
+        context = dict(chain.get("context", {}) or {})
+        context["service_cpu_scale"] = scale
+        chain["context"] = context
         for node in chain.get("nodes", []) or []:
             if "cpu_mb" in node:
                 node["cpu_mb"] = float(node["cpu_mb"]) * scale
@@ -927,6 +1283,25 @@ def apply_semantic_scenario_overrides(
         chain["source_node_id"] = str(forced_source)
         chain["sink_node_id"] = str(scenario.get("forced_sink_node_id", scenario.get("sink_node_id", forced_source)))
     return chain
+
+
+def _sample_scenario_deadline_s(
+    scenario: Mapping[str, Any],
+    seed: int,
+    request_index: int,
+) -> Optional[float]:
+    raw_range = scenario.get("qos_deadline_range_s", scenario.get("deadline_range_s"))
+    if isinstance(raw_range, (list, tuple)) and len(raw_range) >= 2:
+        low = float(raw_range[0])
+        high = float(raw_range[1])
+        if high <= low:
+            return low
+        rng = random.Random(_stable_scenario_seed(scenario, seed, 61001) + int(request_index) * 43)
+        return rng.uniform(low, high)
+    deadline = scenario.get("qos_deadline_s", scenario.get("deadline_s"))
+    if deadline is None:
+        return None
+    return float(deadline)
 
 
 def _apply_sfc_length_override(chain: Dict[str, Any], target_length: int) -> None:

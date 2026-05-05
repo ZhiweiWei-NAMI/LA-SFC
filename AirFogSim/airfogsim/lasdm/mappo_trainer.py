@@ -87,6 +87,7 @@ class MAPPOTrainer:
         for episode in range(int(episodes)):
             env = self._episode_env(episode)
             try:
+                scenario_name = str(getattr(getattr(env, "config", None), "scenario_name", "") or "")
                 observations = env.reset()
                 total = 0.0
                 for step in range(int(max_steps)):
@@ -109,7 +110,15 @@ class MAPPOTrainer:
                         last_value = 0.0 if done else self._value_estimate(observations)
                         buffer.compute_gae(last_value, self.gamma, self.lam)
                         update_index += 1
-                        diagnostics.append({"update_index": update_index, **self._ppo_update(buffer)})
+                        diagnostics.append(
+                            {
+                                "update_index": update_index,
+                                "episode": int(episode),
+                                "step": int(step),
+                                "scenario": scenario_name,
+                                **self._ppo_update(buffer),
+                            }
+                        )
                         buffer.clear()
                     summary = info.get("summary", {})
                     rows.append(
@@ -122,6 +131,7 @@ class MAPPOTrainer:
                             failed=int(summary.get("failed", 0) or 0),
                             timed_out=int(summary.get("timed_out", 0) or 0),
                             active_graphs=int(summary.get("active_graphs", 0) or 0),
+                            scenario=scenario_name,
                         )
                     )
                     if done:
@@ -228,10 +238,7 @@ def _mean_value(values: Mapping[str, float]) -> float:
 
 
 def _actor_parameters(policy: MAPPOPolicy) -> List[Any]:
-    params = list(policy.model.parameters())
-    if policy.semantic_scorer is not None:
-        params.extend(list(policy.semantic_scorer.parameters()))
-    return params
+    return list(policy.model.parameters())
 
 
 def _write_diagnostics(path: Path, rows: List[Mapping[str, Any]]) -> None:

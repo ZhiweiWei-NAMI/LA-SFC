@@ -29,6 +29,7 @@ class IQLTrainer:
         updates_per_transition: float = 1.0,
         max_grad_norm: float = 1.0,
         reward_scale: float = 1.0,
+        diagnostics_interval: int = 1,
         seed: int = 0,
     ):
         self.env = env
@@ -44,6 +45,7 @@ class IQLTrainer:
         self.updates_per_transition = float(updates_per_transition)
         self.max_grad_norm = float(max_grad_norm)
         self.reward_scale = float(reward_scale)
+        self.diagnostics_interval = max(1, int(diagnostics_interval))
         self.replay = ReplayBuffer(replay_capacity, seed=seed)
 
     def train(self, episodes: int = 10, max_steps: int = 100, output_dir: Optional[str] = None) -> List[TrainingMetrics]:
@@ -52,6 +54,7 @@ class IQLTrainer:
         for episode in range(int(episodes)):
             env = self._behavior_env(episode)
             try:
+                scenario_name = str(getattr(getattr(env, "config", None), "scenario_name", "") or "")
                 observations = env.reset()
                 total = 0.0
                 for step in range(int(max_steps)):
@@ -82,12 +85,21 @@ class IQLTrainer:
                             failed=int(summary.get("failed", 0) or 0),
                             timed_out=int(summary.get("timed_out", 0) or 0),
                             active_graphs=int(summary.get("active_graphs", 0) or 0),
+                            scenario=scenario_name,
                         )
                     )
                     if done:
                         break
             finally:
                 self._close_episode_env(env)
+            diagnostics.append(
+                {
+                    "phase": "dataset",
+                    "episode": int(episode),
+                    "scenario": scenario_name,
+                    "replay_size": len(self.replay),
+                }
+            )
             if output_dir is not None:
                 target = Path(output_dir)
                 target.mkdir(parents=True, exist_ok=True)
@@ -95,6 +107,10 @@ class IQLTrainer:
         update_count = self.offline_updates
         if update_count <= 0:
             update_count = max(1, int(round(len(self.replay) * self.updates_per_transition)))
+        if output_dir is not None:
+            target = Path(output_dir)
+            target.mkdir(parents=True, exist_ok=True)
+            _write_diagnostics(target / "iql_diagnostics.csv", diagnostics)
         for update_index in range(update_count):
             metrics = iql_update_policy(
                 self.policy,
@@ -107,7 +123,11 @@ class IQLTrainer:
                 reward_scale=self.reward_scale,
             )
             if metrics:
-                diagnostics.append({"update_index": update_index + 1, "replay_size": len(self.replay), **metrics})
+                diagnostics.append({"phase": "offline_update", "update_index": update_index + 1, "replay_size": len(self.replay), **metrics})
+            if output_dir is not None and (
+                (update_index + 1) % self.diagnostics_interval == 0 or update_index + 1 == update_count
+            ):
+                _write_diagnostics(Path(output_dir) / "iql_diagnostics.csv", diagnostics)
         eval_env = self._eval_env()
         try:
             eval_rows = HeuristicEvaluator(eval_env, self.policy).run(episodes=1, max_steps=max_steps)
@@ -121,7 +141,7 @@ class IQLTrainer:
             target.mkdir(parents=True, exist_ok=True)
             write_reward_curve(target / "iql_behavior_reward_curve.csv", behavior_rows)
             write_reward_curve(target / "iql_eval_reward_curve.csv", eval_rows)
-            write_reward_curve(target / "reward_curve.csv", eval_rows)
+            write_reward_curve(target / "reward_curve.csv", behavior_rows)
             _write_diagnostics(target / "iql_diagnostics.csv", diagnostics)
             self.policy.torch.save(self.policy.iql_state_dict(), target / "iql_policy.pt")
         return eval_rows
@@ -266,10 +286,7 @@ def iql_update_policy(
 
 
 def _actor_parameters(policy: IQLPolicy) -> List[Any]:
-    params = list(policy.model.parameters())
-    if policy.semantic_scorer is not None:
-        params.extend(list(policy.semantic_scorer.parameters()))
-    return params
+    return list(policy.model.parameters())
 
 
 def _write_diagnostics(path: Path, rows: List[Mapping[str, Any]]) -> None:

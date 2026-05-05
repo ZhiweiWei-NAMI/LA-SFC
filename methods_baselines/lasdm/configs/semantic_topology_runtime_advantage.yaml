@@ -1,0 +1,289 @@
+schema_version: lasdm.semantic_topology.runtime_advantage.v1
+
+# V24 scenario suite.  These are real runtime scenarios, not result filters:
+# candidate pools remain hard-type feasible, semantic is a frozen SBERT cosine
+# scalar, and completion is still decided by the simulator.  The scenarios make
+# semantic-only selection insufficient by placing high-semantic candidates on
+# expensive routes or stale advertisements, while topology-only choices can pick
+# low-semantic but cheap mismatches that degrade runtime quality.
+
+runtime_repair:
+  centralized_planner_success_guard:
+    enabled: true
+    baseline: centralized_planner
+    min_success_ratio: 0.50
+    calibration_scenario: semantic_runtime_calibration_easy
+    seeds: [0, 1]
+  fail_fast_on_all_zero_success: true
+  export_raw_traces_required: true
+  early_result_guard:
+    enabled: false
+
+runtime:
+  warmup_steps: 5
+  max_steps: 1500
+  step_interval_s: 1.0
+  airfogsim_config_overrides:
+    task:
+      tti_threshold: 120.0
+      hard_ddl: 130.0
+
+training:
+  episodes: 100
+  max_steps: 100
+  train_seeds: [0, 1, 2, 3, 4]
+  eval_seeds: [0, 1, 2, 3, 4]
+
+marl:
+  runtime_ticks_per_marl_step: 1
+  runtime_max_ticks_after_action: 25
+  runtime_stop_when_progress: true
+  route_hop_floor_s: 0.10
+  sequential_capacity_enabled: true
+  sequential_deadline_pruning_enabled: true
+  semantic_top_k: 64
+  max_candidates: 64
+  min_semantic_similarity: -1.0
+  auto_exchange: true
+  include_remote_candidates: true
+  include_semantic_features: true
+  include_topology_features: true
+  include_temporal_features: true
+  ippo_centralized_critic: true
+  ippo_use_region_encoder: true
+  ippo_learnable_prior: true
+  ippo_prior_l2_coef: 0.001
+  ippo_learnable_logit_blend: true
+  ippo_learned_logit_scale_init: 2.0
+  ippo_prior_logit_scale_init: 0.25
+  ippo_critic_agent_count: 4
+  ippo_device: cuda
+  ippo_utility_prior_logit_weight: 3.0
+  ippo_route_unavailable_penalty: 20.0
+  ippo_behavior_clone_pretrain_episodes: 0
+  ippo_behavior_clone_finetune_steps_per_observation: 0
+  ippo_expert_policy: ""
+  masac_training_scenario_sampling: balanced
+  ippo_curriculum_enabled: true
+  ippo_curriculum:
+    - fraction: 0.15
+      scenarios: [semantic_runtime_calibration_easy]
+    - fraction: 0.25
+      scenarios: [semantic_runtime_route_deadline_tradeoff]
+    - fraction: 0.25
+      scenarios: [semantic_runtime_resource_semantic_tradeoff]
+    - fraction: 0.20
+      scenarios: [semantic_runtime_stale_exchange_tradeoff]
+    - fraction: 0.15
+      scenarios: [semantic_runtime_chain_context_tradeoff]
+  masac_gamma: 0.99
+  masac_alpha: 0.05
+  masac_auto_alpha: true
+  masac_alpha_lr: 0.0001
+  masac_target_entropy_scale: 0.90
+  masac_alpha_min: 0.005
+  masac_alpha_max: 0.25
+  masac_tau: 0.005
+  masac_q_lr: 0.0003
+  masac_batch_size: 32
+  masac_replay_capacity: 20000
+  masac_replay_warmup_steps: 128
+  masac_update_interval: 4
+  masac_updates_per_env_step: 1
+  masac_max_grad_norm: 1.0
+  masac_reward_scale: 1.0
+  masac_replay_sample_strategy: scenario_balanced
+  iql_batch_size: 8
+  iql_offline_updates: 80
+  iql_updates_per_transition: 0.0
+  iql_diagnostics_interval: 1
+  ippo_lr: 0.0002
+  topology_greedy_load_penalty: 0.50
+  topology_greedy_topology_risk_penalty: 1.40
+  topology_greedy_mobility_risk_penalty: 1.80
+  topology_greedy_route_hops_penalty: 0.80
+  topology_greedy_route_tx_penalty: 0.35
+  topology_greedy_route_unavailable_penalty: 2.50
+  topology_greedy_cold_start_penalty: 0.20
+  topology_greedy_deadline_violation_penalty: 1.50
+  topology_greedy_runtime_penalty: 0.25
+  topology_greedy_semantic_mismatch_penalty: 1.50
+  topology_greedy_utility_prior_weight: 0.00
+  topology_greedy_stale_penalty: 0.35
+  reward:
+    success: 10.0
+    timeout: -2.0
+    gs2l_stage_progress: 6.0
+    gs2l_stage_success: 0.8
+    gs2l_stage_failure_discount: 0.15
+    gs2l_bandwidth_price: 0.5
+    gs2l_resource_price: 1.0
+    gs2l_quality_weight: 0.5
+    gs2l_clip: 8.0
+    route_unavailable: -2.0
+    deadline_slack: 0.08
+    semantic_score: 0.60
+    semantic_cumulative: 0.60
+    utility_prior: 1.50
+    stale_remote: -1.00
+    topology_risk: -0.80
+    mobility_risk: -0.65
+    cold_start: -0.06
+    runtime_penalty: -0.15
+    load_imbalance: -0.30
+    route_hops: -0.18
+    route_tx_time: -0.10
+    rb_wait: -0.08
+    wireless_pressure: -0.08
+    resource_available: 0.35
+    remaining_deadline: 0.35
+    dense_clip: 3.0
+  ippo_checkpoint_selection_interval: 0
+  ippo_checkpoint_selection_early_interval: 0
+  ippo_checkpoint_selection_early_until_episode: 0
+  ippo_eval_checkpoint_strategy: exact_seed
+  masac_eval_prefer_sac_for_proposed: false
+  masac_eval_min_proposed_sac_selected_count: 0
+  ippo_training_progress_guard_enabled: true
+  ippo_training_guard_min_episodes: 12
+  ippo_training_guard_recent_window: 3
+  ippo_training_guard_min_recent_max_success: 0.05
+
+semantic_exchange:
+  encoder_backend: sbert
+  sbert_model_name: sentence-transformers/all-MiniLM-L6-v2
+  encoder_device: cuda
+  encoder_batch_size: 64
+  ttl_s: 8.0
+  fixed_delay_s: 0.05
+  per_hop_delay_s: 0.01
+  top_k_per_agent: 64
+  compressed_dim: 64
+  quantization_bits: 8
+
+semantic_topology_experiment:
+  task_classes: {}
+  scenarios:
+    - name: semantic_runtime_calibration_easy
+      objective: feasible warm-up chains with full hard-type candidate recall
+      task_nodes: {vehicle: 20, uav: 2}
+      service_nodes: {rsu: 4, vehicle: 16, uav: 2, cloud_server: 1}
+      task_classes: {}
+      arrival_rate_sfc_per_s: 0.20
+      max_concurrent_sfcs: 10
+      exchange_ttl_s: 8.0
+      qos_deadline_s: 55.0
+      payload_mb_range: [2.0, 4.0]
+      service_cpu_scale: 0.35
+      local_catalog_visibility: 1.0
+    - name: semantic_runtime_route_deadline_tradeoff
+      objective: high-semantic remote exact candidates compete with route-good compatible local candidates under tight DDL
+      task_nodes: {vehicle: 32, uav: 4}
+      service_nodes: {rsu: 4, vehicle: 20, uav: 4, cloud_server: 1}
+      source_node_types: [vehicle, uav]
+      task_classes: {}
+      arrival_rate_sfc_per_s: 0.42
+      max_concurrent_sfcs: 12
+      qos_deadline_s: 46.0
+      payload_mb_range: [5.0, 9.0]
+      service_cpu_scale: 0.60
+      output_ratio: 0.30
+      semantic_mismatch_penalty_s_per_unit: 1.0
+      local_catalog_visibility: 1.0
+      exchange_ttl_s: 6.0
+      exchange_radius_hops: 3
+      exchange_top_k: 96
+      wireless_rb_budget: 7
+      wireless_contention_factor: 1.25
+      network_latency_multiplier: 1.35
+      candidate_decoys:
+        enabled: true
+        remote_exact: 4
+        remote_compatible: 2
+        borderline_weak: 3
+        hard_negative_mismatch: 2
+        stale_clone_exact: 1
+    - name: semantic_runtime_resource_semantic_tradeoff
+      objective: topology-cheap mismatches and loaded exact services force semantic-resource joint selection
+      task_nodes: {vehicle: 38, uav: 4}
+      service_nodes: {rsu: 4, vehicle: 22, uav: 4, cloud_server: 1}
+      source_node_types: [vehicle, uav]
+      task_classes: {}
+      arrival_rate_sfc_per_s: 0.62
+      max_concurrent_sfcs: 18
+      qos_deadline_s: 58.0
+      payload_mb_range: [2.5, 6.5]
+      service_cpu_scale: 0.95
+      output_ratio: 0.25
+      semantic_mismatch_penalty_s_per_unit: 1.2
+      local_catalog_visibility: 1.0
+      exchange_ttl_s: 6.0
+      exchange_radius_hops: 2
+      exchange_top_k: 96
+      wireless_rb_budget: 8
+      wireless_contention_factor: 1.35
+      candidate_decoys:
+        enabled: true
+        remote_exact: 3
+        remote_compatible: 3
+        borderline_weak: 3
+        hard_negative_mismatch: 3
+        stale_clone_exact: 1
+    - name: semantic_runtime_stale_exchange_tradeoff
+      objective: stale exact advertisements are semantically attractive but carry runtime delay under live exchange
+      task_nodes: {vehicle: 30, uav: 4}
+      service_nodes: {rsu: 4, vehicle: 18, uav: 4, cloud_server: 1}
+      source_node_types: [vehicle, uav]
+      task_classes: {}
+      arrival_rate_sfc_per_s: 0.48
+      max_concurrent_sfcs: 14
+      qos_deadline_s: 50.0
+      payload_mb_range: [3.0, 7.0]
+      service_cpu_scale: 0.75
+      output_ratio: 0.25
+      semantic_mismatch_penalty_s_per_unit: 0.9
+      local_catalog_visibility: 1.0
+      exchange_ttl_s: 12.0
+      exchange_radius_hops: 3
+      exchange_top_k: 128
+      wireless_rb_budget: 8
+      wireless_contention_factor: 1.15
+      stale_candidate_injection:
+        enabled: true
+        stale_ratio: 0.35
+        stale_latency_penalty_s: 5.0
+      candidate_decoys:
+        enabled: true
+        remote_exact: 2
+        remote_compatible: 2
+        borderline_weak: 3
+        hard_negative_mismatch: 1
+        stale_clone_exact: 4
+    - name: semantic_runtime_chain_context_tradeoff
+      objective: sequential chains require balancing early semantic quality against remaining deadline and downstream route cost
+      task_nodes: {vehicle: 34, uav: 4}
+      service_nodes: {rsu: 4, vehicle: 20, uav: 4, cloud_server: 1}
+      source_node_types: [vehicle, uav]
+      task_classes: {}
+      arrival_rate_sfc_per_s: 0.52
+      max_concurrent_sfcs: 16
+      qos_deadline_s: 54.0
+      payload_mb_range: [3.5, 7.5]
+      service_cpu_scale: 0.85
+      output_ratio: 0.28
+      semantic_mismatch_penalty_s_per_unit: 1.0
+      local_catalog_visibility: 1.0
+      regional_skew_ratio: 3.0
+      exchange_ttl_s: 8.0
+      exchange_radius_hops: 3
+      exchange_top_k: 96
+      wireless_rb_budget: 8
+      wireless_contention_factor: 1.25
+      network_latency_multiplier: 1.20
+      candidate_decoys:
+        enabled: true
+        remote_exact: 3
+        remote_compatible: 3
+        borderline_weak: 3
+        hard_negative_mismatch: 2
+        stale_clone_exact: 2

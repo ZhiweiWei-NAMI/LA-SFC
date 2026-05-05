@@ -17,7 +17,11 @@ def main() -> int:
     parser.add_argument("--poll-s", type=float, default=600.0)
     parser.add_argument("--stage2-seeds", nargs="+", type=int, default=list(range(10)))
     parser.add_argument("--figure-seeds", nargs="+", type=int, default=[0, 1, 2, 3, 4])
-    parser.add_argument("--max-steps", type=int, default=80)
+    parser.add_argument("--max-steps", type=int, default=200)
+    parser.add_argument(
+        "--semantic-repair-config",
+        default="methods_baselines/lasdm/configs/semantic_topology_runtime_figures_aligned.yaml",
+    )
     args = parser.parse_args()
 
     root = Path(args.root)
@@ -56,6 +60,8 @@ def main() -> int:
                 "2",
                 "--force",
                 "--include-traces",
+                "--semantic-repair-config",
+                str(args.semantic_repair_config),
                 "--poll-s",
                 "300",
             ],
@@ -74,6 +80,8 @@ def main() -> int:
                 *[str(seed) for seed in args.figure_seeds],
                 "--max-steps",
                 str(int(args.max_steps)),
+                "--semantic-repair-config",
+                str(args.semantic_repair_config),
                 "--force",
             ],
         ),
@@ -93,6 +101,8 @@ def main() -> int:
                 str(root / "figures_req"),
                 "--format",
                 "both",
+                "--config",
+                str(args.semantic_repair_config),
             ],
         ),
     ]

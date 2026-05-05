@@ -18,7 +18,6 @@ import pandas as pd
 METHOD_LABELS = {
     "proposed_semantic_topology_marl": "LASDM-ST-MARL",
     "topology_greedy": "Topology Greedy + Exchange",
-    "utility_prior_with_exchange": "Utility Prior + Exchange",
     "pure_semantic_greedy_no_exchange": "Semantic-Only Greedy",
     "local_semantic_runtime_greedy": "Local Semantic Runtime",
     "nsga2_semantic_qos": "NSGA-II Semantic-QoS",
@@ -37,7 +36,6 @@ METHOD_LABELS = {
 COLORS = {
     "proposed_semantic_topology_marl": "#009E73",
     "topology_greedy": "#0072B2",
-    "utility_prior_with_exchange": "#CC79A7",
     "pure_semantic_greedy_no_exchange": "#E69F00",
     "local_semantic_runtime_greedy": "#56B4E9",
     "nsga2_semantic_qos": "#17becf",
@@ -56,7 +54,6 @@ COLORS = {
 MARKERS = {
     "proposed_semantic_topology_marl": "o",
     "topology_greedy": "^",
-    "utility_prior_with_exchange": "D",
     "pure_semantic_greedy_no_exchange": "v",
     "local_semantic_runtime_greedy": "P",
     "nsga2_semantic_qos": "D",
@@ -96,8 +93,8 @@ def main() -> int:
     specs: list[tuple[str, Callable[[FigureData], tuple[plt.Figure, dict[str, Any]]]]] = [
         ("fig1a_service_nodes_success", plot_fig1a_service_nodes_success),
         ("fig1b_service_nodes_deadline", plot_fig1b_service_nodes_deadline),
-        ("fig2a_task_nodes_success", plot_fig2a_task_nodes_success),
-        ("fig2b_task_nodes_finish_time", plot_fig2b_task_nodes_finish_time),
+        ("fig2a_request_count_success", plot_fig2a_request_count_success),
+        ("fig2b_request_count_finish_time", plot_fig2b_request_count_finish_time),
         ("fig3a_skew_success", plot_fig3a_skew_success),
         ("fig3b_skew_fairness", plot_fig3b_skew_fairness),
         ("fig4a_cross_region_flow", plot_fig4a_cross_region_flow),
@@ -200,7 +197,7 @@ def add_scenario_variables(df: pd.DataFrame) -> pd.DataFrame:
     names = df.get("scenario", pd.Series([""] * len(df))).astype(str)
     patterns = {
         "service_nodes": r"(?:service|svc)[_\-]?nodes[_\-]?(\d+)",
-        "task_nodes": r"(?:task|tasks)[_\-]?nodes?[_\-]?(\d+)",
+        "request_count": r"(?:request|requests|req|sfc[_\-]?load|sfc[_\-]?requests?)[_\-]?count?[_\-]?(\d+)|request[_\-]?(\d+)|req[_\-]?(\d+)",
         "skew_ratio": r"skew[_\-]?(\d+(?:p\d+)?|\d+(?:\.\d+)?)",
         "ttl_s": r"ttl[_\-]?(\d+(?:p\d+)?|\d+(?:\.\d+)?)",
         "uav_count": r"uav[_\-]?(\d+)",
@@ -223,8 +220,8 @@ def add_scenario_variables(df: pd.DataFrame) -> pd.DataFrame:
         df[col] = values
     if "service_node_counts" in df.columns and df["service_nodes"].isna().all():
         df["service_nodes"] = df["service_node_counts"].map(lambda item: _sum_json_counts(item))
-    if "task_node_counts" in df.columns and df["task_nodes"].isna().all():
-        df["task_nodes"] = df["task_node_counts"].map(lambda item: _sum_json_counts(item))
+    if "request_count" in df.columns:
+        df["request_count"] = pd.to_numeric(df["request_count"], errors="coerce")
     return df
 
 
@@ -233,7 +230,7 @@ def plot_fig1a_service_nodes_success(data: FigureData) -> tuple[plt.Figure, dict
         data.summary,
         "service_nodes",
         "success_ratio",
-        ["proposed_semantic_topology_marl", "topology_greedy", "utility_prior_with_exchange", "cross_region_auction", "intra_region_only"],
+        ["proposed_semantic_topology_marl", "topology_greedy", "nsga2_semantic_qos", "cross_region_auction", "intra_region_only"],
         "Number of service nodes",
         "SFC success ratio",
         "Fig-1a Service nodes vs success",
@@ -245,34 +242,34 @@ def plot_fig1b_service_nodes_deadline(data: FigureData) -> tuple[plt.Figure, dic
         data.summary,
         "service_nodes",
         "qos_hit_ratio",
-        ["proposed_semantic_topology_marl", "topology_greedy", "utility_prior_with_exchange", "cross_region_auction", "intra_region_only"],
+        ["proposed_semantic_topology_marl", "topology_greedy", "nsga2_semantic_qos", "cross_region_auction", "intra_region_only"],
         "Number of service nodes",
         "Deadline hit ratio",
         "Fig-1b Service nodes vs deadline hit",
     )
 
 
-def plot_fig2a_task_nodes_success(data: FigureData) -> tuple[plt.Figure, dict[str, Any]]:
+def plot_fig2a_request_count_success(data: FigureData) -> tuple[plt.Figure, dict[str, Any]]:
     return line_metric(
         data.summary,
-        "task_nodes",
+        "request_count",
         "success_ratio",
-        ["proposed_semantic_topology_marl", "topology_greedy", "utility_prior_with_exchange", "cross_region_auction", "intra_region_only"],
-        "Number of task vehicles",
+        ["proposed_semantic_topology_marl", "mappo_ctde", "iql_offline", "topology_greedy", "intra_region_only"],
+        "Number of SFC requests",
         "SFC success ratio",
-        "Fig-2a Task vehicles vs success",
+        "Fig-2a SFC request load vs success",
     )
 
 
-def plot_fig2b_task_nodes_finish_time(data: FigureData) -> tuple[plt.Figure, dict[str, Any]]:
+def plot_fig2b_request_count_finish_time(data: FigureData) -> tuple[plt.Figure, dict[str, Any]]:
     return line_metric(
         data.summary,
-        "task_nodes",
+        "request_count",
         "avg_graph_finish_time",
-        ["proposed_semantic_topology_marl", "topology_greedy", "utility_prior_with_exchange", "cross_region_auction", "intra_region_only"],
-        "Number of task vehicles",
+        ["proposed_semantic_topology_marl", "mappo_ctde", "iql_offline", "topology_greedy", "intra_region_only"],
+        "Number of SFC requests",
         "Average SFC finish time (s)",
-        "Fig-2b Task vehicles vs finish time",
+        "Fig-2b SFC request load vs finish time",
     )
 
 
@@ -354,7 +351,6 @@ def plot_fig5_overhead_pareto(data: FigureData) -> tuple[plt.Figure, dict[str, A
         "pure_semantic_greedy_no_exchange",
         "local_semantic_runtime_greedy",
         "nsga2_semantic_qos",
-        "utility_prior_with_exchange",
         "topology_greedy",
         "proposed_semantic_topology_marl",
     ]
@@ -564,7 +560,7 @@ def plot_fig11_uav_count(data: FigureData) -> tuple[plt.Figure, dict[str, Any]]:
         data.summary,
         "uav_count",
         "success_ratio",
-        ["proposed_semantic_topology_marl", "utility_prior_with_exchange", "cross_region_auction"],
+        ["proposed_semantic_topology_marl", "topology_greedy", "cross_region_auction"],
         "Number of service UAVs",
         "SFC success ratio",
         "Fig-11 UAV count sweep",
@@ -573,8 +569,8 @@ def plot_fig11_uav_count(data: FigureData) -> tuple[plt.Figure, dict[str, Any]]:
 
 def plot_fig12_sfc_length(data: FigureData) -> tuple[plt.Figure, dict[str, Any]]:
     df = data.summary
-    if df.empty or df["sfc_length"].dropna().nunique() < 2 or df["task_nodes"].dropna().nunique() < 2:
-        return notice("Fig-12 SFC length unavailable", ["Need scenarios containing sfc_length and task_nodes sweeps."])
+    if df.empty or df["sfc_length"].dropna().nunique() < 2 or df["request_count"].dropna().nunique() < 2:
+        return notice("Fig-12 SFC length unavailable", ["Need scenarios containing sfc_length and request_count sweeps."])
     methods = ["proposed_semantic_topology_marl", "topology_greedy"]
     fig, ax = plt.subplots(figsize=(4.8, 3.0))
     for method in methods:
@@ -582,16 +578,16 @@ def plot_fig12_sfc_length(data: FigureData) -> tuple[plt.Figure, dict[str, Any]]
             sub = df[(df["baseline"].eq(method)) & (df["sfc_length"].eq(length))]
             if sub.empty:
                 continue
-            grouped = sub.groupby("task_nodes", as_index=False)["success_ratio"].mean().sort_values("task_nodes")
+            grouped = sub.groupby("request_count", as_index=False)["success_ratio"].mean().sort_values("request_count")
             ax.plot(
-                grouped["task_nodes"],
+                grouped["request_count"],
                 grouped["success_ratio"],
                 label=f"{label(method)}-{length}stage",
                 color=color(method),
                 marker=marker(method),
                 linestyle=linestyle,
             )
-    ax.set_xlabel("Number of task vehicles")
+    ax.set_xlabel("Number of SFC requests")
     ax.set_ylabel("SFC success ratio")
     ax.set_ylim(0, 1.05)
     ax.set_title("Fig-12 SFC length impact")
@@ -604,7 +600,7 @@ def plot_fig13_speed(data: FigureData) -> tuple[plt.Figure, dict[str, Any]]:
         data.summary,
         "speed_kmh",
         "success_ratio",
-        ["proposed_semantic_topology_marl", "marl_no_temporal", "utility_prior_with_exchange"],
+        ["proposed_semantic_topology_marl", "marl_no_temporal", "topology_greedy"],
         "Average vehicle speed (km/h)",
         "SFC success ratio",
         "Fig-13 Vehicle speed sweep",

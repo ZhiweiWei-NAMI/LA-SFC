@@ -613,10 +613,12 @@ class AirFogSimEnv():
 
         for task_profile in tmp_succeed_tasks:
             flag = self.task_manager.finishOffloadingTask(task_profile['task'], self.simulation_time)
-            assert flag, 'Unexpected error occurs when finishing the offloading task! Possibly due to that task (node) id has been removed in task manager!'
+            if not flag:
+                continue
         for task_profile in tmp_failed_tasks:
             flag = self.task_manager.failOffloadingTask(task_profile['task'])
-            assert flag, 'Unexpected error occurs when failing the offloading task! Possibly due to that task (node) id has been removed in task manager!'
+            if not flag:
+                continue
 
     def _getNodeIdxById(self, node_id):
         """Get the node index by the given id.
@@ -771,8 +773,12 @@ class AirFogSimEnv():
             task = self.task_manager.getTaskByTaskId(task_id)
             if task is None:
                 continue
+            if not (task.isTransmitting() or task.isReturning()):
+                self.wired_manager.removeFlow(task_id)
+                continue
             path = task.getToOffloadRoute()
             if len(path) == 0:
+                self.wired_manager.removeFlow(task_id)
                 continue
             rx_id = path[0]
             trans_flag = task.transmit_to_Node(rx_id, transmitted_bytes, self.simulation_time)

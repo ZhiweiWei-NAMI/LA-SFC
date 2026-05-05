@@ -824,7 +824,6 @@ class IPPOPolicy(BaseMARLPolicy):
         learned_logit_scale: float = 1.0,
         prior_logit_scale: float = 1.0,
         learnable_logit_blend: bool = False,
-        semantic_scorer: Optional[Any] = None,
     ):
         try:
             import torch
@@ -855,7 +854,6 @@ class IPPOPolicy(BaseMARLPolicy):
         self.learned_logit_scale = float(learned_logit_scale)
         self.prior_logit_scale = float(prior_logit_scale)
         self.learnable_logit_blend = bool(learnable_logit_blend)
-        self.semantic_scorer = semantic_scorer
         self.rng = random.Random(seed)
         torch.manual_seed(seed)
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -1195,24 +1193,7 @@ class IPPOPolicy(BaseMARLPolicy):
             self.prior_logit_scale,
             self.learnable_logit_blend,
         ).to(self.device)
-        optimizer_params = list(self.model.parameters())
-        if self.semantic_scorer is not None:
-            self.semantic_scorer.to(self.device)
-            optimizer_params.extend(list(self.semantic_scorer.parameters()))
-        self.optimizer = optim.Adam(optimizer_params, lr=float(lr))
-
-    def set_semantic_scorer(self, semantic_scorer: Any, lr: Optional[float] = None) -> None:
-        if semantic_scorer is None:
-            self.semantic_scorer = None
-            return
-        self.semantic_scorer = semantic_scorer.to(self.device)
-        existing = {id(parameter) for group in self.optimizer.param_groups for parameter in group.get("params", [])}
-        params = [parameter for parameter in self.semantic_scorer.parameters() if id(parameter) not in existing]
-        if params:
-            group = {"params": params}
-            if lr is not None:
-                group["lr"] = float(lr)
-            self.optimizer.add_param_group(group)
+        self.optimizer = optim.Adam(list(self.model.parameters()), lr=float(lr))
 
     def act(self, observations: Mapping[str, Mapping[str, Any]], deterministic: bool = False) -> Dict[str, Dict[str, Dict[str, str]]]:
         return self.act_with_logprobs(observations, deterministic=deterministic).actions
@@ -1486,24 +1467,10 @@ class IPPOPolicy(BaseMARLPolicy):
             features = self.torch.cat([features, pad], dim=-1)
         elif features.shape[-1] > self.candidate_feature_dim:
             features = features[:, : self.candidate_feature_dim]
-        if self.include_semantic_features and self.semantic_scorer is not None and features.shape[0] > 0:
-            semantic_scores = self._semantic_score_tensor_for_candidates(candidate_set, mask_len, features)
-            if semantic_scores.numel() > 0:
-                features = features.clone()
-                features[: semantic_scores.shape[0], 0] = semantic_scores.to(dtype=features.dtype, device=features.device)
-        elif not self.include_semantic_features and features.shape[-1] > 0:
+        if not self.include_semantic_features and features.shape[-1] > 0:
             features = features.clone()
             features[:, 0] = 0.0
         return features
-
-    def _semantic_score_tensor_for_candidates(self, candidate_set: Mapping[str, Any], mask_len: int, reference: Any) -> Any:
-        raw_candidates = list(candidate_set.get("raw_candidates", []) or [])[:mask_len]
-        values = []
-        for candidate in raw_candidates:
-            values.append(self.semantic_scorer.score_candidate_tensor(candidate, candidate_set, reference))
-        if not values:
-            return self.torch.zeros((0,), dtype=reference.dtype, device=reference.device)
-        return self.torch.stack([value.reshape(()) for value in values])
 
     def _resource_logits(self, obs_tensor: Any, candidate_features: Any) -> Tuple[Any, Any]:
         if self.use_region_encoder:
@@ -1518,11 +1485,13 @@ class IPPOPolicy(BaseMARLPolicy):
             deadline_slack = float(metadata.get("deadline_slack_s", 0.0) or 0.0)
             deadline_violation = max(0.0, -deadline_slack) / budget
             semantic_score = float(candidate.get("semantic_score", metadata.get("semantic_score", 0.0)) or 0.0)
-            runtime_utility = float(metadata.get("utility_prior", 0.0) or 0.0) - semantic_score
+            runtime_utility = metadata.get("runtime_prior_no_semantic")
+            if runtime_utility is None:
+                runtime_utility = -float(metadata.get("expected_runtime_penalty_no_semantic_s", 0.0) or 0.0) / budget
             rows.append(
                 [
                     semantic_score if self.include_semantic_features else 0.0,
-                    runtime_utility if self.include_topology_features else 0.0,
+                    float(runtime_utility or 0.0) if self.include_topology_features else 0.0,
                     deadline_violation if self.include_topology_features else 0.0,
                     float(metadata.get("expected_runtime_penalty_s", 0.0) or 0.0) / budget
                     if self.include_topology_features
@@ -1595,7 +1564,17 @@ class IPPOPolicy(BaseMARLPolicy):
             route_available = float(_source_metric(metadata, "route_available", source, metadata.get("route_available", 0.0)) or 0.0)
             route_hops = float(_source_metric(metadata, "route_hops", source, metadata.get("route_hops", 4.0)) or 0.0)
             utility = float(_source_metric(metadata, "utility_prior", source, metadata.get("utility_prior", 0.0)) or 0.0)
+            runtime_utility = float(
+                _source_metric(
+                    metadata,
+                    "runtime_prior_no_semantic",
+                    source,
+                    metadata.get("runtime_prior_no_semantic", utility),
+                )
+                or 0.0
+            )
             deadline_slack = float(_source_metric(metadata, "deadline_slack_s", source, metadata.get("deadline_slack_s", 0.0)) or 0.0)
+            function_budget = max(1.0, float(metadata.get("function_budget_s", 20.0) or 20.0))
             expected_penalty = _source_metric(metadata, "expected_runtime_penalty_s", source, metadata.get("expected_runtime_penalty_s", None))
             if expected_penalty is not None:
                 metadata["expected_runtime_penalty_s"] = float(expected_penalty)
@@ -1660,14 +1639,12 @@ class IPPOPolicy(BaseMARLPolicy):
                 features[new_idx, :width] = original_features[idx, :width]
             if features.shape[1] >= self.candidate_feature_dim:
                 if self.include_topology_features:
-                    feature_utility = utility
-                    if not self.include_semantic_features:
-                        feature_utility -= float(candidate.get("semantic_score", metadata.get("semantic_score", 0.0)) or 0.0)
+                    feature_utility = utility if self.include_semantic_features else runtime_utility
                     features[new_idx, 5] = np.float32(load_ratio)
                     features[new_idx, 14] = np.float32(metadata["route_hops_norm"])
                     features[new_idx, 15] = np.float32(route_available)
                     features[new_idx, 18] = np.float32(max(-1.0, min(1.0, feature_utility)))
-                    features[new_idx, 19] = np.float32(max(-1.0, min(1.0, deadline_slack / 20.0)))
+                    features[new_idx, 19] = np.float32(max(-1.0, min(1.0, deadline_slack / function_budget)))
                     features[new_idx, 20] = np.float32(min(1.0, route_tx_time / 20.0))
                     features[new_idx, 21] = np.float32(
                         min(
@@ -1681,7 +1658,7 @@ class IPPOPolicy(BaseMARLPolicy):
                                 )
                                 or 0.0
                             )
-                            / 40.0,
+                            / function_budget,
                         )
                     )
                     features[new_idx, 22] = np.float32(min(1.0, float(metadata.get("estimated_compute_s", 0.0) or 0.0) / 20.0))
@@ -1822,19 +1799,18 @@ class MASACPolicy(IPPOPolicy):
         hidden_dim = int(getattr(self.model, "hidden_dim", 128))
         q_context_dim = hidden_dim * self.max_critic_agents + hidden_dim
         candidate_q_input_dim = q_context_dim + self.candidate_feature_dim
-        resource_q_input_dim = q_context_dim
         self.q1 = self.nn.ModuleDict(
             {
                 "candidate": self._build_q_network(candidate_q_input_dim, hidden_dim),
-                "compute": self._build_q_vector_network(resource_q_input_dim, hidden_dim, RESOURCE_ACTION_DIM),
-                "bandwidth": self._build_q_vector_network(resource_q_input_dim, hidden_dim, RESOURCE_ACTION_DIM),
+                "compute": self._build_q_vector_network(candidate_q_input_dim, hidden_dim, RESOURCE_ACTION_DIM),
+                "bandwidth": self._build_q_vector_network(candidate_q_input_dim, hidden_dim, RESOURCE_ACTION_DIM),
             }
         ).to(self.device)
         self.q2 = self.nn.ModuleDict(
             {
                 "candidate": self._build_q_network(candidate_q_input_dim, hidden_dim),
-                "compute": self._build_q_vector_network(resource_q_input_dim, hidden_dim, RESOURCE_ACTION_DIM),
-                "bandwidth": self._build_q_vector_network(resource_q_input_dim, hidden_dim, RESOURCE_ACTION_DIM),
+                "compute": self._build_q_vector_network(candidate_q_input_dim, hidden_dim, RESOURCE_ACTION_DIM),
+                "bandwidth": self._build_q_vector_network(candidate_q_input_dim, hidden_dim, RESOURCE_ACTION_DIM),
             }
         ).to(self.device)
         self.target_q1 = copy.deepcopy(self.q1).to(self.device)
@@ -1915,7 +1891,6 @@ class MASACPolicy(IPPOPolicy):
             "target_entropy": self.target_entropy,
             "target_entropy_scale": float(self.target_entropy_scale),
             "tau": float(self.tau),
-            "semantic_scorer": self.semantic_scorer.state_dict() if self.semantic_scorer is not None else None,
         }
 
     def load_sac_state_dict(self, state: Mapping[str, Any], strict: bool = True) -> None:
@@ -1948,8 +1923,6 @@ class MASACPolicy(IPPOPolicy):
             if self.auto_alpha and self.alpha_optimizer is None:
                 self.alpha_optimizer = self.torch.optim.Adam([self.log_alpha], lr=float(self.alpha_lr))
             self.tau = float(state.get("tau", self.tau) or self.tau)
-            if self.semantic_scorer is not None and state.get("semantic_scorer") is not None:
-                self.semantic_scorer.load_state_dict(state["semantic_scorer"], strict=strict)
 
     def soft_update_targets(self, tau: Optional[float] = None) -> None:
         value = self.tau if tau is None else float(tau)
@@ -2205,33 +2178,14 @@ class MASACPolicy(IPPOPolicy):
             candidate_input = candidate_input.detach()
         q1_net, q2_net = (self.target_q1, self.target_q2) if target else (self.q1, self.q2)
         q1_candidate = q1_net["candidate"](candidate_input).squeeze(-1)
-        q1_compute = q1_net["compute"](context).squeeze(0)
-        q1_bandwidth = q1_net["bandwidth"](context).squeeze(0)
+        q1_compute = q1_net["compute"](candidate_input)
+        q1_bandwidth = q1_net["bandwidth"](candidate_input)
         q2_candidate = q2_net["candidate"](candidate_input).squeeze(-1)
-        q2_compute = q2_net["compute"](context).squeeze(0)
-        q2_bandwidth = q2_net["bandwidth"](context).squeeze(0)
-        q1 = q1_candidate[:, None, None] + q1_compute[None, :, None] + q1_bandwidth[None, None, :]
-        q2 = q2_candidate[:, None, None] + q2_compute[None, :, None] + q2_bandwidth[None, None, :]
+        q2_compute = q2_net["compute"](candidate_input)
+        q2_bandwidth = q2_net["bandwidth"](candidate_input)
+        q1 = q1_candidate[:, None, None] + q1_compute[:, :, None] + q1_bandwidth[:, None, :]
+        q2 = q2_candidate[:, None, None] + q2_compute[:, :, None] + q2_bandwidth[:, None, :]
         return q1, q2
-
-    def _masac_q_values(
-        self,
-        global_context: Any,
-        local_context: Any,
-        candidate_set: Mapping[str, Any],
-        mask_len: int,
-        target: bool = False,
-        detach_encoder: bool = False,
-    ) -> Tuple[Any, Any]:
-        features = self._masac_candidate_features(candidate_set, mask_len, global_context)
-        q1, q2 = self._masac_joint_q_values(
-            global_context,
-            local_context,
-            features,
-            target=target,
-            detach_encoder=detach_encoder,
-        )
-        return q1[:, -1, -1], q2[:, -1, -1]
 
     def _masac_candidate_features(self, candidate_set: Mapping[str, Any], mask_len: int, reference: Any) -> Any:
         return self._candidate_feature_tensor(candidate_set, mask_len, reference)

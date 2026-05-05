@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import json
 import os
@@ -21,13 +22,14 @@ from airfogsim.lasdm.marl_policy import policy_from_name
 from airfogsim.lasdm.marl_trainer import HeuristicEvaluator, write_reward_curve
 
 
+DEFAULT_REPAIR_CONFIG = os.path.join(METHOD_ROOT, "configs", "semantic_topology_runtime_repair.yaml")
+
 DEFAULT_EVAL_BASELINES = [
     "intra_region_only",
     "cross_region_auction",
     "pure_semantic_greedy_no_exchange",
     "local_semantic_runtime_greedy",
     "nsga2_semantic_qos",
-    "utility_prior_with_exchange",
     "topology_greedy",
     "marl_no_semantic",
     "marl_semantic_no_topology",
@@ -41,6 +43,16 @@ DEFAULT_TRAINED_BASELINES = [
     "iql_offline",
 ]
 DEFAULT_BASELINES = list(DEFAULT_EVAL_BASELINES)
+LEARNED_IPPO_BASELINES = {
+    "proposed_semantic_topology_marl",
+    "marl_no_semantic",
+    "marl_topology_no_semantic",
+    "marl_semantic_no_topology",
+    "marl_no_topology",
+    "marl_no_exchange",
+    "marl_no_temporal",
+    "marl_no_cross_region",
+}
 
 IPPO_BASELINE_CONFIG_UPDATES: Dict[str, Dict[str, Any]] = {
     "proposed_semantic_topology_marl": {
@@ -56,7 +68,6 @@ IPPO_BASELINE_CONFIG_UPDATES: Dict[str, Dict[str, Any]] = {
         "include_semantic_features": False,
         "include_topology_features": True,
         "include_temporal_features": True,
-        "semantic_scorer": None,
     },
     "marl_topology_no_semantic": {
         "auto_exchange": True,
@@ -64,7 +75,6 @@ IPPO_BASELINE_CONFIG_UPDATES: Dict[str, Dict[str, Any]] = {
         "include_semantic_features": False,
         "include_topology_features": True,
         "include_temporal_features": True,
-        "semantic_scorer": None,
     },
     "marl_semantic_no_topology": {
         "auto_exchange": True,
@@ -147,6 +157,7 @@ IPPO_BASELINE_ALIASES: Dict[str, str] = {
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate semantic-topology LASDM baselines/ablations.")
     parser.add_argument("--config", default=DEFAULT_CONFIG)
+    parser.add_argument("--repair-config", default=DEFAULT_REPAIR_CONFIG)
     parser.add_argument("--baselines", nargs="+", default=DEFAULT_EVAL_BASELINES)
     parser.add_argument("--scenarios", nargs="+", default=None)
     parser.add_argument("--service-role-sweeps", nargs="+", default=["full_hybrid"])
@@ -155,7 +166,7 @@ def main() -> None:
     parser.add_argument("--output-dir", default="experiment_artifacts/raw_data/lasdm_semantic_topology_marl/eval")
     args = parser.parse_args()
 
-    config = _load_yaml(args.config)
+    config = _load_config(args.config, args.repair_config)
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
     summary_rows: List[Dict[str, Any]] = []
@@ -194,6 +205,7 @@ def main() -> None:
                                 "service_role_sweep": role,
                                 "seed": seed,
                                 "task_node_counts": json.dumps(scenario.get("task_nodes", {}), sort_keys=True),
+                                "request_count": scenario.get("request_count", ""),
                                 "service_node_counts": json.dumps(scenario.get("service_nodes", {}), sort_keys=True),
                                 "arrival_rate_sfc_per_s": scenario.get("arrival_rate_sfc_per_s", ""),
                                 "exchange_ttl_s": scenario.get("exchange_ttl_s", ""),
@@ -255,7 +267,7 @@ def is_ippo_checkpoint_baseline(name: str) -> bool:
     canonical = canonical_ippo_baseline(name)
     if canonical in {"mappo_ctde", "iql_offline"}:
         return False
-    return canonical in IPPO_BASELINE_CONFIG_UPDATES
+    return canonical in LEARNED_IPPO_BASELINES
 
 
 def checkpoint_subdir_for_baseline(name: str) -> str:
@@ -284,6 +296,23 @@ def _select_scenarios(config: Mapping[str, Any], names: List[str] | None) -> Lis
     if missing:
         raise ValueError(f"Unknown semantic-topology scenario(s): {', '.join(missing)}")
     return selected
+
+
+def _load_config(config_path: str, repair_config_path: str | None) -> Dict[str, Any]:
+    config = _load_yaml(config_path)
+    if repair_config_path and os.path.exists(repair_config_path):
+        config = _deep_merge(config, _load_yaml(repair_config_path))
+    return config
+
+
+def _deep_merge(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> Dict[str, Any]:
+    merged = copy.deepcopy(dict(base))
+    for key, value in dict(overlay).items():
+        if isinstance(value, Mapping) and isinstance(merged.get(key), Mapping):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
 
 
 def _flat_metrics(metrics: Mapping[str, Any]) -> Dict[str, Any]:

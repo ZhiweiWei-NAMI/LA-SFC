@@ -106,6 +106,7 @@ class LASDMTaskAdapter:
         task_size = float(chain.payload_mb if input_payload_mb is None else input_payload_mb)
         output_payload_mb = self._output_payload_mb(sfc_node, task_size)
         qos = sfc_node.effective_qos(chain.qos)
+        task_deadline = self._task_deadline(chain, sfc_node_id, current_time, qos)
         task_node_id = origin_node_id or chain.source_node_id
         required_returned_size = self._required_returned_size(sfc_node, output_payload_mb) if is_sink else 0.0
 
@@ -117,7 +118,7 @@ class LASDMTaskAdapter:
             task_node_id=task_node_id,
             task_cpu=self._task_cpu(sfc_node, task_size),
             task_size=task_size,
-            task_deadline=float(qos.deadline_s),
+            task_deadline=task_deadline,
             task_priority=float(qos.priority),
             required_returned_size=required_returned_size,
             to_return_node_id=chain.sink_node_id if is_sink else None,
@@ -221,6 +222,31 @@ class LASDMTaskAdapter:
         if "return_size_mb" in sfc_node.metadata:
             return float(sfc_node.metadata["return_size_mb"])
         return output_payload_mb
+
+    def _task_deadline(
+        self,
+        chain: LASDMServiceChain,
+        sfc_node_id: str,
+        current_time: float,
+        qos: Any,
+    ) -> float:
+        graph_deadline = max(0.1, float(qos.deadline_s))
+        context = dict(chain.context or {})
+        if not bool(context.get("per_function_task_deadline_enabled", False)):
+            return graph_deadline
+
+        submit_time = float(chain.submit_time) if chain.submit_time is not None else float(current_time)
+        elapsed_s = max(0.0, float(current_time) - submit_time)
+        remaining_deadline_s = max(0.0, graph_deadline - elapsed_s)
+        order = list(chain.topological_order())
+        remaining_count = max(1, len(order))
+        if sfc_node_id in order:
+            remaining_count = max(1, len(order) - order.index(sfc_node_id))
+        base_budget_s = remaining_deadline_s / remaining_count if remaining_deadline_s > 0.0 else graph_deadline / remaining_count
+        multiplier = max(0.1, float(context.get("per_function_task_deadline_multiplier", 1.0) or 1.0))
+        min_deadline_s = max(0.1, float(context.get("per_function_task_deadline_min_s", 1.0) or 1.0))
+        max_deadline_s = max(min_deadline_s, float(context.get("per_function_task_deadline_max_s", graph_deadline) or graph_deadline))
+        return max(min_deadline_s, min(graph_deadline, max_deadline_s, base_budget_s * multiplier))
 
 
 def build_lasdm_task(

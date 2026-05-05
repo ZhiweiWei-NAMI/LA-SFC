@@ -33,6 +33,10 @@ class SFCRewardConfig:
     resource_available: float = 0.25
     remaining_deadline: float = 0.25
     dense_clip: float = 3.0
+    scenario_normalized_dense: bool = True
+    default_time_scale_s: float = 20.0
+    default_route_hop_scale: float = 4.0
+    default_wireless_pressure_scale: float = 8.0
 
 
 class SFCReward:
@@ -114,9 +118,20 @@ def _gs2l_stage_reward(aux: Mapping[str, Any], config: SFCRewardConfig) -> float
 def _selected_candidate_dense_reward(aux: Mapping[str, Any], config: SFCRewardConfig) -> float:
     if float(aux.get("selected_semantic_group_count", 0.0) or 0.0) <= 0.0:
         return 0.0
+    if bool(config.scenario_normalized_dense):
+        time_scale_s = max(1.0, float(aux.get("reward_time_scale_s", config.default_time_scale_s) or config.default_time_scale_s))
+        route_hop_scale = max(1.0, float(aux.get("reward_route_hop_scale", config.default_route_hop_scale) or config.default_route_hop_scale))
+        wireless_pressure_scale = max(
+            1.0,
+            float(aux.get("reward_wireless_pressure_scale", config.default_wireless_pressure_scale) or config.default_wireless_pressure_scale),
+        )
+    else:
+        time_scale_s = max(1.0, float(config.default_time_scale_s))
+        route_hop_scale = max(1.0, float(config.default_route_hop_scale))
+        wireless_pressure_scale = max(1.0, float(config.default_wireless_pressure_scale))
     reward = 0.0
     reward += float(config.route_unavailable) * float(aux.get("route_unavailable_ratio", 0.0) or 0.0)
-    reward += float(config.deadline_slack) * _positive_clip(float(aux.get("selected_deadline_slack_mean", 0.0) or 0.0), 20.0)
+    reward += float(config.deadline_slack) * _positive_clip(float(aux.get("selected_deadline_slack_mean", 0.0) or 0.0), time_scale_s)
     reward += float(config.semantic_score) * float(aux.get("mean_semantic_top_score", 0.0) or 0.0)
     reward += float(config.semantic_cumulative) * float(aux.get("selected_semantic_cumulative_quality_mean", 0.0) or 0.0)
     reward += float(config.utility_prior) * float(aux.get("utility_prior", 0.0) or 0.0)
@@ -126,13 +141,13 @@ def _selected_candidate_dense_reward(aux: Mapping[str, Any], config: SFCRewardCo
     reward += float(config.cold_start) * _positive_clip(float(aux.get("cold_start_s", 0.0) or 0.0), 20.0)
     reward += float(config.runtime_penalty) * _positive_clip(
         float(aux.get("selected_expected_runtime_penalty_mean", 0.0) or 0.0),
-        20.0,
+        time_scale_s,
     )
     reward += float(config.load_imbalance) * float(aux.get("load_imbalance", 0.0) or 0.0)
-    reward += float(config.route_hops) * _positive_clip(float(aux.get("route_hops", 0.0) or 0.0), 4.0)
-    reward += float(config.route_tx_time) * _positive_clip(float(aux.get("route_tx_time_s", 0.0) or 0.0), 20.0)
-    reward += float(config.rb_wait) * _positive_clip(float(aux.get("expected_rb_wait_s", 0.0) or 0.0), 20.0)
-    reward += float(config.wireless_pressure) * _positive_clip(float(aux.get("wireless_pressure", 0.0) or 0.0), 8.0)
+    reward += float(config.route_hops) * _positive_clip(float(aux.get("route_hops", 0.0) or 0.0), route_hop_scale)
+    reward += float(config.route_tx_time) * _positive_clip(float(aux.get("route_tx_time_s", 0.0) or 0.0), time_scale_s)
+    reward += float(config.rb_wait) * _positive_clip(float(aux.get("expected_rb_wait_s", 0.0) or 0.0), time_scale_s)
+    reward += float(config.wireless_pressure) * _positive_clip(float(aux.get("wireless_pressure", 0.0) or 0.0), wireless_pressure_scale)
     reward += float(config.resource_available) * float(aux.get("selected_resource_available_ratio_mean", 0.0) or 0.0)
     reward += float(config.remaining_deadline) * float(aux.get("selected_remaining_deadline_ratio_mean", 0.0) or 0.0)
     clip = max(0.0, float(config.dense_clip))

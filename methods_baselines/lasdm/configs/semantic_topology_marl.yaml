@@ -310,10 +310,10 @@ runtime:
 # all baselines share identical SFC demand and candidate service pool.
 marl:
   agent_type: region
-  semantic_top_k: 8
+  semantic_top_k: 64
   min_semantic_similarity: -1.0
   temporal_window: 4
-  max_candidates: 16
+  max_candidates: 64
   auto_exchange: true
   include_remote_candidates: true
   ippo_centralized_critic: true
@@ -346,6 +346,9 @@ marl:
   masac_training_scenario_sampling: balanced
   ippo_checkpoint_selection_interval: 0
   ippo_eval_checkpoint_strategy: exact_seed
+  ippo_behavior_clone_pretrain_episodes: 0
+  ippo_behavior_clone_finetune_steps_per_observation: 0
+  ippo_expert_policy: ""
   ippo_training_progress_guard_enabled: true
   ippo_training_guard_min_episodes: 12
   ippo_training_guard_recent_window: 3
@@ -392,7 +395,6 @@ semantic_topology_experiment:
     - nsga2_semantic_qos
     - mappo_ctde
     - iql_offline
-    - utility_prior_with_exchange
     - topology_greedy
     - marl_no_semantic
     - marl_semantic_no_topology

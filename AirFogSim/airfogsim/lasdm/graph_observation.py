@@ -148,11 +148,15 @@ class GraphObservationBuilder:
         mobility_risk = min(1.0, float(metadata.get("mobility_risk", 0.0) or 0.0)) if temporal_enabled else 0.0
         cold_start_s = min(1.0, float(metadata.get("cold_start_s", 0.0) or 0.0) / 5.0) if topology_enabled else 0.0
         semantic_mismatch = max(0.0, 1.0 - semantic_score) if self.config.include_semantic_features else 0.0
-        utility_value = float(metadata.get("utility_prior", 0.0) or 0.0)
-        if topology_enabled and not self.config.include_semantic_features:
-            utility_value -= raw_semantic_score
+        utility_key = "utility_prior" if self.config.include_semantic_features else "runtime_prior_no_semantic"
+        utility_value = float(metadata.get(utility_key, 0.0) or 0.0)
         utility_prior = max(-1.0, min(1.0, utility_value)) if topology_enabled else 0.0
-        deadline_slack = max(-1.0, min(1.0, float(metadata.get("deadline_slack_s", 0.0) or 0.0) / 20.0)) if topology_enabled else 0.0
+        deadline_scale_s = max(1.0, float(metadata.get("function_budget_s", 20.0) or 20.0))
+        deadline_slack = (
+            max(-1.0, min(1.0, float(metadata.get("deadline_slack_s", 0.0) or 0.0) / deadline_scale_s))
+            if topology_enabled
+            else 0.0
+        )
         route_tx_time = (
             min(1.0, float(metadata.get("route_tx_time_s", 0.0) or 0.0) / max(1e-9, self.config.route_tx_scale_s))
             if topology_enabled

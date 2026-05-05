@@ -452,23 +452,6 @@ def train_semantic_ippo_runtime(
                 service_chains=len(getattr(env, "chains", []) or []),
             )
             try:
-                if policy is not None and getattr(policy, "semantic_scorer", None) is not None:
-                    _append_runtime_debug_event(
-                        debug_path,
-                        "semantic_scorer_rebind_start",
-                        baseline=baseline,
-                        seed=int(seed),
-                        episode=int(episode),
-                    )
-                    env.config = replace(env.config, semantic_scorer=policy.semantic_scorer)
-                    env.rebuild_config_dependent_components()
-                    _append_runtime_debug_event(
-                        debug_path,
-                        "semantic_scorer_rebind_end",
-                        baseline=baseline,
-                        seed=int(seed),
-                        episode=int(episode),
-                    )
                 _append_runtime_debug_event(
                     debug_path,
                     "env_reset_start",
@@ -510,7 +493,6 @@ def train_semantic_ippo_runtime(
                         alpha_min=sac_alpha_min,
                         alpha_max=sac_alpha_max,
                         tau=sac_tau,
-                        semantic_scorer=env.config.semantic_scorer,
                     )
                     _append_runtime_debug_event(
                         debug_path,
@@ -609,7 +591,8 @@ def train_semantic_ippo_runtime(
                                 }
                             )
                             _write_csv_dynamic(seed_dir / "sac_diagnostics.csv", sac_diagnostic_rows)
-                    summary_dict = info.get("summary", {})
+                    summary_dict = dict(info.get("summary", {}) or {})
+                    summary_dict.update(_runtime_task_summary_from_env(env))
                     episode_summary = dict(summary_dict)
                     episode_step_count = step + 1
                     _append_runtime_debug_event(
@@ -626,6 +609,9 @@ def train_semantic_ippo_runtime(
                         failed=int(summary_dict.get("failed", 0) or 0),
                         timed_out=int(summary_dict.get("timed_out", 0) or 0),
                         active_graphs=int(summary_dict.get("active_graphs", 0) or 0),
+                        task_done_num=int(summary_dict.get("task_done_num", 0) or 0),
+                        task_fail_num=int(summary_dict.get("task_fail_num", 0) or 0),
+                        task_success_ratio=float(summary_dict.get("task_success_ratio", 0.0) or 0.0),
                         next_candidate_set_count=sum(len(obs.get("candidate_sets", []) or []) for obs in observations.values()),
                     )
                     reward_rows.append(
@@ -638,6 +624,10 @@ def train_semantic_ippo_runtime(
                             failed=int(summary_dict.get("failed", 0) or 0),
                             timed_out=int(summary_dict.get("timed_out", 0) or 0),
                             active_graphs=int(summary_dict.get("active_graphs", 0) or 0),
+                            task_done_num=int(summary_dict.get("task_done_num", 0) or 0),
+                            task_fail_num=int(summary_dict.get("task_fail_num", 0) or 0),
+                            task_success_ratio=float(summary_dict.get("task_success_ratio", 0.0) or 0.0),
+                            scenario=str(scenario.get("name", "default")),
                         )
                     )
                     if done:
@@ -778,6 +768,9 @@ def train_semantic_ippo_runtime(
                     succeeded=int(episode_summary.get("succeeded", 0) or 0),
                     failed=int(episode_summary.get("failed", 0) or 0),
                     timed_out=int(episode_summary.get("timed_out", 0) or 0),
+                    task_done_num=int(episode_summary.get("task_done_num", 0) or 0),
+                    task_fail_num=int(episode_summary.get("task_fail_num", 0) or 0),
+                    task_success_ratio=float(episode_summary.get("task_success_ratio", 0.0) or 0.0),
                     active_graphs=int(episode_summary.get("active_graphs", 0) or 0),
                 )
             finally:
@@ -1048,7 +1041,6 @@ def _run_semantic_runtime_single(
             seed,
             observations,
             checkpoint_root,
-            semantic_scorer=env.config.semantic_scorer,
         )
         policy_metadata = {
             "policy_name": type(policy).__name__,
@@ -1063,7 +1055,8 @@ def _run_semantic_runtime_single(
             actions = policy.act(observations, deterministic=True)
             observations, rewards, done, info = env.step(actions)
             mean_reward = sum(rewards.values()) / max(1, len(rewards))
-            summary = info.get("summary", {})
+            summary = dict(info.get("summary", {}) or {})
+            summary.update(_runtime_task_summary_from_env(env))
             reward_rows.append(
                 TrainingMetrics(
                     episode=0,
@@ -1074,6 +1067,10 @@ def _run_semantic_runtime_single(
                     failed=int(summary.get("failed", 0) or 0),
                     timed_out=int(summary.get("timed_out", 0) or 0),
                     active_graphs=int(summary.get("active_graphs", 0) or 0),
+                    task_done_num=int(summary.get("task_done_num", 0) or 0),
+                    task_fail_num=int(summary.get("task_fail_num", 0) or 0),
+                    task_success_ratio=float(summary.get("task_success_ratio", 0.0) or 0.0),
+                    scenario=str(scenario.get("name", "default")),
                 )
             )
             if done:
@@ -1142,11 +1139,10 @@ def _semantic_policy_for_eval(
     seed: int,
     observations: Mapping[str, Mapping[str, Any]],
     checkpoint_root: Path,
-    semantic_scorer: Any = None,
 ) -> Any:
     canonical = canonical_ippo_baseline(baseline)
     if canonical in TRAINED_CHECKPOINT_FILES:
-        return _trained_policy_for_eval(config, canonical, seed, observations, checkpoint_root, semantic_scorer)
+        return _trained_policy_for_eval(config, canonical, seed, observations, checkpoint_root)
     if is_ippo_checkpoint_baseline(baseline):
         policy_config = _config_with_baseline_updates(config, baseline)
         baseline_checkpoint_root = _checkpoint_root_for_baseline(checkpoint_root, baseline)
@@ -1213,7 +1209,6 @@ def _semantic_policy_for_eval(
             alpha_min=float(marl_cfg.get("masac_alpha_min", 0.005) or 0.005),
             alpha_max=float(marl_cfg.get("masac_alpha_max", 0.25) or 0.25),
             tau=float(marl_cfg.get("masac_tau", 0.005) or 0.005),
-            semantic_scorer=semantic_scorer,
         )
         strict = _checkpoint_has_critic_body(actor_state)
         policy.load_sac_state_dict(state, strict=strict)
@@ -1239,7 +1234,6 @@ def _trained_policy_for_eval(
     seed: int,
     observations: Mapping[str, Mapping[str, Any]],
     checkpoint_root: Path,
-    semantic_scorer: Any = None,
 ) -> Any:
     policy_config = _config_with_baseline_updates(config, baseline)
     marl_cfg = dict(config.get("marl", {}) or {})
@@ -1262,7 +1256,6 @@ def _trained_policy_for_eval(
         action_dim = _checkpoint_action_dim(actor_state) or int(policy_config.get("marl", {}).get("max_candidates", 16))
         policy = MAPPOPolicy(
             **_ippo_policy_kwargs(policy_config, obs_dim, action_dim, seed, observations=observations, state=actor_state),
-            semantic_scorer=semantic_scorer,
         )
         policy.load_mappo_state_dict(state, strict=True)
         policy.policy_source = "mappo_checkpoint"
@@ -1288,7 +1281,6 @@ def _trained_policy_for_eval(
             expectile=float(marl_cfg.get("iql_expectile", 0.7) or 0.7),
             beta=float(marl_cfg.get("iql_beta", 3.0) or 3.0),
             v_lr=float(marl_cfg.get("iql_v_lr", marl_cfg.get("masac_q_lr", marl_cfg.get("ippo_lr", 3e-4))) or 3e-4),
-            semantic_scorer=semantic_scorer,
         )
         policy.load_iql_state_dict(state, strict=True)
         policy.policy_source = "iql_checkpoint"
@@ -1376,7 +1368,7 @@ def _semantic_eval_policy_kwargs(config: Mapping[str, Any]) -> Dict[str, float]:
         "deadline_violation_penalty": float(marl_cfg.get("topology_greedy_deadline_violation_penalty", 0.0) or 0.0),
         "runtime_penalty": float(marl_cfg.get("topology_greedy_runtime_penalty", 0.0) or 0.0),
         "semantic_mismatch_penalty": float(marl_cfg.get("topology_greedy_semantic_mismatch_penalty", 0.0) or 0.0),
-        "utility_prior_weight": float(marl_cfg.get("topology_greedy_utility_prior_weight", 2.0) or 0.0),
+        "utility_prior_weight": float(marl_cfg.get("topology_greedy_utility_prior_weight", 0.0) or 0.0),
         "remote_penalty": float(marl_cfg.get("topology_greedy_remote_penalty", 0.0) or 0.0),
         "stale_penalty": float(marl_cfg.get("topology_greedy_stale_penalty", 0.05) or 0.0),
     }
@@ -1395,6 +1387,8 @@ def _runtime_training_progress_row(
     succeeded = int(summary.get("succeeded", 0) or 0)
     failed = int(summary.get("failed", 0) or 0)
     timed_out = int(summary.get("timed_out", 0) or 0)
+    task_done_num = int(summary.get("task_done_num", 0) or 0)
+    task_fail_num = int(summary.get("task_fail_num", 0) or 0)
     return {
         "seed": int(seed),
         "episode": int(episode),
@@ -1408,6 +1402,22 @@ def _runtime_training_progress_row(
         "timed_out": timed_out,
         "active_graphs": int(summary.get("active_graphs", 0) or 0),
         "success_ratio": succeeded / max(1, submitted),
+        "task_done_num": task_done_num,
+        "task_fail_num": task_fail_num,
+        "task_success_ratio": task_done_num / max(1, task_done_num + task_fail_num),
+    }
+
+
+def _runtime_task_summary_from_env(env: Any) -> Dict[str, Any]:
+    bridge = getattr(env, "runtime_bridge", None)
+    if bridge is None:
+        return {"task_done_num": 0, "task_fail_num": 0, "task_success_ratio": 0.0}
+    done_tasks = len(getattr(bridge, "processed_done_tasks", set()) or set())
+    failed_tasks = len(getattr(bridge, "processed_failed_tasks", set()) or set())
+    return {
+        "task_done_num": int(done_tasks),
+        "task_fail_num": int(failed_tasks),
+        "task_success_ratio": done_tasks / max(1, done_tasks + failed_tasks),
     }
 
 

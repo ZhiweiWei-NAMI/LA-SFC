@@ -27,8 +27,14 @@ class EnergyManager:
         
     def _initUAVsEnergy(self,UAVs_keys):
         for UAV_id in UAVs_keys :
-            self._UAVs_energy_info[UAV_id]={}
-            self._UAVs_energy_info[UAV_id]['energy']=random.randint(self._initial_energy_range[0],self._initial_energy_range[1])
+            self._UAVs_energy_info[UAV_id]={
+                'energy': random.randint(self._initial_energy_range[0],self._initial_energy_range[1]),
+                'is_flying': False,
+                'is_hovering': True,
+                'using_sensor_num': 0,
+                'receiving_data_size': 0,
+                'sending_data_size': 0,
+            }
 
     def updateEnergyPattern(self,node_id,is_flying,using_sensor_num,sending_data_size,receiving_data_size):
         UAV_energy_info=self._UAVs_energy_info[node_id]
@@ -61,5 +67,4 @@ class EnergyManager:
 
     def getConfig(self,name):
         return self._config_energy.get(name,None)
-
 

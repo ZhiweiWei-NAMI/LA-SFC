@@ -85,6 +85,13 @@ class WiredNetworkManager:
             return self._flows[task_id]['remaining_bytes']
         return 0
 
+    def removeFlow(self, task_id):
+        """Remove a stale wired flow whose task has left transmission state."""
+        flow = self._flows.pop(task_id, None)
+        if flow is not None:
+            link = (flow['src'], flow['dst'])
+            self._queues[link] = max(0, self._queues.get(link, 0) - flow.get('remaining_bytes', 0))
+
     def getLinkUtilization(self):
         """获取各链路利用率"""
         return {link: q for link, q in self._queues.items()}

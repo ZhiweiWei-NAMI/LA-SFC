@@ -61,7 +61,6 @@ class MARLEnvConfig:
     region_agents: Tuple[str, ...] = ()
     sequential_capacity_enabled: bool = True
     sequential_deadline_pruning_enabled: bool = True
-    semantic_scorer: Optional[Any] = None
     semantic_matrix: Optional[Any] = None
     enable_semantic_profiles: bool = True
 
@@ -148,6 +147,10 @@ class SemanticTopologyMARLEnv:
         self._route_tree_cache: Dict[Tuple[str, float], Dict[str, Tuple[bool, int, float, float, float, int, float]]] = {}
         self._wireless_capacity_cache_time: Optional[float] = None
         self._wireless_capacity_cache: Optional[Dict[str, float]] = None
+        self._episode_start_time: float = 0.0
+        self._pending_chain_ids: List[str] = []
+        self._arrival_times: Dict[str, float] = {}
+        self._chain_by_id: Dict[str, LASDMServiceChain] = {}
 
     def rebuild_config_dependent_components(self) -> None:
         """Recreate observation/discovery objects after MARLEnvConfig changes."""
@@ -189,9 +192,8 @@ class SemanticTopologyMARLEnv:
         self.topology_trace.clear()
         self._clear_runtime_metric_caches()
         now = self._time()
-        for chain in self.chains:
-            if chain.sfc_id not in self.manager.chains:
-                self.manager.submit(chain, current_time=now)
+        self._initialize_arrivals(now)
+        self._submit_due_chains(now)
         topology = self._update_topology(now)
         if self.config.auto_exchange:
             self._semantic_exchange_tick(now, topology)
@@ -218,6 +220,7 @@ class SemanticTopologyMARLEnv:
         previous_gs2l_progress = _gs2l_chain_progress_snapshot(self.runtime_bridge, self.manager.chains)
         previous_done_tasks = len(getattr(self.runtime_bridge, "processed_done_tasks", set()) or set())
         previous_failed_tasks = len(getattr(self.runtime_bridge, "processed_failed_tasks", set()) or set())
+        submitted_before_action = self._submit_due_chains(now)
         topology = self._update_topology(now)
         if self.config.auto_exchange:
             self._semantic_exchange_tick(now, topology)
@@ -242,7 +245,11 @@ class SemanticTopologyMARLEnv:
                     )
         runtime_report: Dict[str, Any] = {}
         if self.env is not None:
-            bridge_prepare = self.runtime_bridge.prepare_airfogsim_step(self.env, chains=self.chains, current_time=now)
+            bridge_prepare = self.runtime_bridge.prepare_airfogsim_step(
+                self.env,
+                chains=self._submitted_runtime_chains(),
+                current_time=now,
+            )
             progress = advance_runtime(
                 self.env,
                 RuntimeProgressConfig(
@@ -263,6 +270,10 @@ class SemanticTopologyMARLEnv:
             if replanned:
                 runtime_report["sequential_replanning"] = replanned
             self._expire_deadlines(self._time())
+            submitted_after_runtime = self._submit_due_chains(self._time())
+            submitted_during_step = submitted_before_action + submitted_after_runtime
+            if submitted_during_step:
+                runtime_report["arrival_submitted_sfc_ids"] = submitted_during_step
         else:
             raise RuntimeError("SemanticTopologyMARLEnv requires a live AirFogSim env")
 
@@ -295,6 +306,10 @@ class SemanticTopologyMARLEnv:
             "runtime_report": runtime_report,
             "reward_aux": aux,
             "message_overhead": self.discovery_protocol.exchange.overhead_summary(),
+            "arrival_queue": {
+                "pending": len(self._pending_chain_ids),
+                "submitted_this_step": submitted_during_step if self.env is not None else [],
+            },
         }
         self.transition_trace.append(
             {
@@ -303,7 +318,7 @@ class SemanticTopologyMARLEnv:
                 "actions": _jsonable(actions or {}),
                 "rewards": rewards,
                 "done": done,
-                "info": _jsonable(info),
+                "info": _transition_info_summary(info),
             }
         )
         self.last_observations = observations
@@ -366,8 +381,73 @@ class SemanticTopologyMARLEnv:
     def done(self) -> bool:
         if self.step_count >= self.config.max_steps:
             return True
+        if self._pending_chain_ids:
+            return False
         summary = self.manager.summary()
         return bool(summary.get("submitted", 0)) and int(summary.get("active_graphs", 0) or 0) == 0
+
+    def _initialize_arrivals(self, current_time: float) -> None:
+        self._episode_start_time = float(current_time)
+        self._chain_by_id = {}
+        self._arrival_times = {}
+        for chain in self.chains:
+            chain.status = GraphStatus.PENDING
+            chain.submit_time = None
+            chain.finish_time = None
+            chain.failure_reason = None
+            self._chain_by_id[chain.sfc_id] = chain
+            self._arrival_times[chain.sfc_id] = self._arrival_time_for_chain(chain)
+        self._pending_chain_ids = sorted(
+            self._chain_by_id,
+            key=lambda sfc_id: (self._arrival_times.get(sfc_id, self._episode_start_time), sfc_id),
+        )
+
+    def _arrival_time_for_chain(self, chain: LASDMServiceChain) -> float:
+        context = dict(getattr(chain, "context", {}) or {})
+        raw = context.get("arrival_time_s", context.get("arrival_offset_s", 0.0))
+        try:
+            offset = max(0.0, float(raw))
+        except (TypeError, ValueError):
+            offset = 0.0
+        return self._episode_start_time + offset
+
+    def _max_active_sfcs(self) -> int:
+        values: List[int] = []
+        for chain in self.chains:
+            context = dict(getattr(chain, "context", {}) or {})
+            raw = context.get("max_concurrent_sfcs")
+            if raw is None:
+                continue
+            try:
+                value = int(float(raw))
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                values.append(value)
+        return min(values) if values else 0
+
+    def _submit_due_chains(self, current_time: float) -> List[str]:
+        submitted: List[str] = []
+        max_active = self._max_active_sfcs()
+        while self._pending_chain_ids:
+            if max_active > 0 and self._active_chain_count() >= max_active:
+                break
+            sfc_id = self._pending_chain_ids[0]
+            if self._arrival_times.get(sfc_id, self._episode_start_time) > float(current_time) + 1e-9:
+                break
+            self._pending_chain_ids.pop(0)
+            if sfc_id in self.manager.chains:
+                continue
+            chain = self._chain_by_id[sfc_id]
+            self.manager.submit(chain, current_time=current_time)
+            submitted.append(sfc_id)
+        return submitted
+
+    def _active_chain_count(self) -> int:
+        return sum(1 for chain in self.manager.chains.values() if chain.status == GraphStatus.RUNNING)
+
+    def _submitted_runtime_chains(self) -> List[LASDMServiceChain]:
+        return list(self.manager.chains.values())
 
     def write_traces(self, output_dir: str) -> None:
         target = Path(output_dir)
@@ -432,7 +512,6 @@ class SemanticTopologyMARLEnv:
                 encoder=encoder,
                 compressor=compressor,
                 respect_local_visibility=not self.config.global_candidate_catalog,
-                semantic_scorer=self.config.semantic_scorer,
                 semantic_matrix=self.config.semantic_matrix,
             )
             for region_id, directory in per_region.items()
@@ -781,6 +860,7 @@ class SemanticTopologyMARLEnv:
             + 4.0 * topology_risk
             + 4.0 * mobility_risk
         )
+        runtime_penalty_no_semantic_s = max(0.0, expected_penalty_s - mismatch_cost_s)
         fields["semantic_score"] = semantic_score
         fields["link_similarity"] = semantic_score
         fields["node_template_similarity"] = max(0.0, min(1.0, float(metadata.get("node_template_similarity", semantic_score) or 0.0)))
@@ -796,10 +876,20 @@ class SemanticTopologyMARLEnv:
         fields["effective_cpu"] = effective_cpu
         fields["estimated_compute_s"] = estimated_compute_s
         fields["expected_runtime_penalty_s"] = expected_penalty_s
+        fields["expected_runtime_penalty_no_semantic_s"] = runtime_penalty_no_semantic_s
         fields["function_budget_s"] = function_budget_s
         fields["chain_deadline_s"] = deadline_s
         fields["chain_elapsed_s"] = elapsed_s
         fields["chain_remaining_deadline_s"] = remaining_deadline_s
+        fields["scenario_request_count"] = max(1.0, float(chain_context.get("request_count", 1.0) or 1.0))
+        fields["scenario_max_concurrent_sfcs"] = max(
+            1.0,
+            float(chain_context.get("max_concurrent_sfcs", 1.0) or 1.0),
+        )
+        fields["scenario_arrival_rate_sfc_per_s"] = max(
+            1e-6,
+            float(chain_context.get("arrival_rate_sfc_per_s", 1.0) or 1.0),
+        )
         fields["remaining_function_count"] = remaining_function_count
         fields["remaining_deadline_ratio"] = (
             max(0.0, min(1.0, remaining_deadline_s / deadline_s)) if deadline_s > 0.0 else 1.0
@@ -820,6 +910,7 @@ class SemanticTopologyMARLEnv:
             else 0.0
         )
         fields["utility_prior"] = semantic_cumulative_quality - (expected_penalty_s / max(1.0, function_budget_s or 1.0))
+        fields["runtime_prior_no_semantic"] = -(runtime_penalty_no_semantic_s / max(1.0, function_budget_s or 1.0))
         return fields
 
     def _semantic_input_for_sfc_node(self, chain: LASDMServiceChain, sfc_node_id: str) -> str:
@@ -1235,7 +1326,7 @@ class SemanticTopologyMARLEnv:
         self.last_topology = topology
         self._clear_runtime_metric_caches()
         self.temporal_buffer.append(topology)
-        self.topology_trace.append(topology.to_dict())
+        self.topology_trace.append(_topology_trace_summary(topology))
         return topology
 
     def _time(self) -> float:
@@ -1282,6 +1373,83 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
+def _transition_info_summary(info: Mapping[str, Any]) -> Dict[str, Any]:
+    runtime_report = dict(info.get("runtime_report", {}) or {})
+    runtime_progress = dict(runtime_report.get("runtime_progress", {}) or {})
+    bridge_prepare = dict(runtime_report.get("bridge_prepare", {}) or {})
+    reward_aux = {
+        str(key): value
+        for key, value in dict(info.get("reward_aux", {}) or {}).items()
+        if isinstance(value, (int, float, str, bool)) or value is None
+    }
+    summary = dict(info.get("summary", {}) or {})
+    summary.pop("decisions", None)
+    payload = {
+        "time_s": info.get("time_s"),
+        "step_count": info.get("step_count"),
+        "runtime_step_count": info.get("runtime_step_count"),
+        "decision_count": len(info.get("decisions", []) or []),
+        "summary": summary,
+        "runtime_report": {
+            "runtime_progress": {
+                key: runtime_progress.get(key)
+                for key in (
+                    "ticks",
+                    "progress",
+                    "done_tasks",
+                    "failed_tasks",
+                    "active_tasks",
+                    "created_tasks",
+                    "elapsed_s",
+                )
+                if key in runtime_progress
+            },
+            "bridge_prepare": {
+                key: bridge_prepare.get(key)
+                for key in (
+                    "submitted_tasks",
+                    "pending_tasks",
+                    "active_tasks",
+                    "completed_tasks",
+                    "failed_tasks",
+                )
+                if key in bridge_prepare
+            },
+            "sequential_replanning_count": len(runtime_report.get("sequential_replanning", []) or []),
+        },
+        "reward_aux": reward_aux,
+        "message_overhead": info.get("message_overhead", {}),
+    }
+    return _jsonable(payload)
+
+
+def _topology_trace_summary(topology: DynamicTopology) -> Dict[str, Any]:
+    node_types: Dict[str, int] = {}
+    regions: Dict[str, int] = {}
+    edge_types: Dict[str, int] = {}
+    service_nodes = 0
+    avg_load = 0.0
+    for node in topology.nodes.values():
+        node_types[str(node.node_type)] = node_types.get(str(node.node_type), 0) + 1
+        regions[str(node.region_id)] = regions.get(str(node.region_id), 0) + 1
+        service_nodes += 1 if int(node.service_count or 0) > 0 else 0
+        avg_load += float(node.load_ratio or 0.0)
+    for edge in topology.edges:
+        edge_types[str(edge.link_type)] = edge_types.get(str(edge.link_type), 0) + 1
+    node_count = len(topology.nodes)
+    return {
+        "time_s": float(topology.time_s),
+        "node_count": node_count,
+        "edge_count": len(topology.edges),
+        "service_node_count": service_nodes,
+        "avg_node_load_ratio": avg_load / max(1, node_count),
+        "node_types": node_types,
+        "regions": regions,
+        "edge_types": edge_types,
+        "metadata": dict(topology.metadata),
+    }
+
+
 def _reward_aux_from_decisions(decisions: Sequence[LASDMDecision]) -> Dict[str, float]:
     selected: List[Mapping[str, Any]] = []
     for decision in decisions:
@@ -1309,6 +1477,8 @@ def _reward_aux_from_decisions(decisions: Sequence[LASDMDecision]) -> Dict[str, 
     route_available_values = []
     resource_available_ratios = []
     remaining_deadline_ratios = []
+    function_budgets = []
+    scenario_concurrency_values = []
     semantic_group_counts: Dict[str, int] = {}
     route_unavailable = 0
     for item in selected:
@@ -1330,6 +1500,8 @@ def _reward_aux_from_decisions(decisions: Sequence[LASDMDecision]) -> Dict[str, 
         expected_penalties.append(_to_float(metadata.get("expected_runtime_penalty_s"), 0.0))
         deadline_slacks.append(_to_float(metadata.get("deadline_slack_s"), 0.0))
         utility_priors.append(_to_float(metadata.get("utility_prior"), 0.0))
+        function_budgets.append(_to_float(metadata.get("function_budget_s"), 0.0))
+        scenario_concurrency_values.append(_to_float(metadata.get("scenario_max_concurrent_sfcs"), 0.0))
         route_tx_times.append(_to_float(metadata.get("route_tx_time_s"), 0.0))
         rb_waits.append(_to_float(metadata.get("expected_rb_wait_s"), 0.0))
         wireless_pressures.append(_to_float(metadata.get("wireless_pressure"), 0.0))
@@ -1370,6 +1542,9 @@ def _reward_aux_from_decisions(decisions: Sequence[LASDMDecision]) -> Dict[str, 
         "selected_stale_remote_ratio": _mean(stale_values),
         "selected_semantic_group_count": float(len(selected)),
         "selected_semantic_cumulative_quality_mean": _mean(semantic_cumulative_qualities),
+        "reward_time_scale_s": max(1.0, _mean(function_budgets)),
+        "reward_route_hop_scale": 4.0,
+        "reward_wireless_pressure_scale": max(1.0, _mean(scenario_concurrency_values) / 8.0),
     }
     for group, count in semantic_group_counts.items():
         key = "".join(char if char.isalnum() else "_" for char in group.lower()).strip("_") or "unknown"

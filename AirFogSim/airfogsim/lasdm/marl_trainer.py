@@ -22,6 +22,10 @@ class TrainingMetrics:
     failed: int
     timed_out: int
     active_graphs: int
+    task_done_num: int = 0
+    task_fail_num: int = 0
+    task_success_ratio: float = 0.0
+    scenario: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return self.__dict__.copy()
@@ -83,6 +87,7 @@ class HeuristicEvaluator:
 
     def run(self, episodes: int = 1, max_steps: int = 100) -> List[TrainingMetrics]:
         rows: List[TrainingMetrics] = []
+        scenario_name = str(getattr(getattr(self.env, "config", None), "scenario_name", "") or "")
         for episode in range(int(episodes)):
             observations = self.env.reset()
             total = 0.0
@@ -102,6 +107,7 @@ class HeuristicEvaluator:
                         failed=int(summary.get("failed", 0) or 0),
                         timed_out=int(summary.get("timed_out", 0) or 0),
                         active_graphs=int(summary.get("active_graphs", 0) or 0),
+                        scenario=scenario_name,
                     )
                 )
                 if done:
@@ -145,6 +151,7 @@ class MASACTrainer:
         rows: List[TrainingMetrics] = []
         diagnostics: List[Dict[str, Any]] = []
         update_index = 0
+        scenario_name = str(getattr(getattr(self.env, "config", None), "scenario_name", "") or "")
         for episode in range(int(episodes)):
             observations = self.env.reset()
             total = 0.0
@@ -198,6 +205,7 @@ class MASACTrainer:
                         failed=int(summary.get("failed", 0) or 0),
                         timed_out=int(summary.get("timed_out", 0) or 0),
                         active_graphs=int(summary.get("active_graphs", 0) or 0),
+                        scenario=scenario_name,
                     )
                 )
                 if done:

@@ -139,7 +139,7 @@ class SemanticLinkMatrixTests(unittest.TestCase):
             self.assertNotEqual(chain["nodes"][0]["service_type"], "legacy_preprocess")
             self.assertFalse(any("semantic_score_bias" in str(item) for item in materialized["service_instances"]))
 
-    def test_semantic_scorer_exposes_policy_candidate_tensor_api(self):
+    def test_link_predictor_exposes_candidate_tensor_api(self):
         self.assertTrue(callable(getattr(SemanticLinkScorer, "score_candidate_tensor", None)))
 
     def test_cloud_server_materialized_node_id_matches_physical_config(self):

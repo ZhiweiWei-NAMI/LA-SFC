@@ -16,13 +16,12 @@ from typing import Any, Iterable, Mapping, Sequence
 
 DEFAULT_RAW_ROOT = Path("experiment_artifacts/raw_data")
 DEFAULT_CONFIG = Path("methods_baselines/lasdm/configs/semantic_topology_marl.yaml")
-DEFAULT_REPAIR_CONFIG = Path("methods_baselines/lasdm/configs/semantic_topology_runtime_repair.yaml")
+DEFAULT_REPAIR_CONFIG = Path("methods_baselines/lasdm/configs/semantic_topology_runtime_figures_aligned.yaml")
 DEFAULT_EPISODES = 100
 DEFAULT_SCENARIOS = (
     "semantic_runtime_probe_preprocess_only",
     "semantic_runtime_calibration_easy",
     "semantic_runtime_contention_stress",
-    "semantic_runtime_mobility_staleness_stress",
     "distributed_service_discovery_calibrated",
     "semantic_ambiguity_calibrated",
 )
@@ -41,7 +40,6 @@ DEFAULT_NONLEARNING_BASELINES = (
     "pure_semantic_greedy_no_exchange",
     "local_semantic_runtime_greedy",
     "nsga2_semantic_qos",
-    "utility_prior_with_exchange",
     "topology_greedy",
     "centralized_planner",
 )
@@ -191,12 +189,13 @@ def render_training(root: Path, expected_episodes: int, process_rows: Sequence[M
         "progress",
         "last_update",
         "ep",
-        "last_succ",
+        "last_sfc",
+        "last_task",
         "last_reward",
         "best",
-        "w10(s/r)",
+        "w10(sfc/task/r)",
+        "avg(sfc/task/r)",
         "diag",
-        "phase",
         "dataset",
         "offline",
         "eval",
@@ -227,7 +226,7 @@ def training_row(
     summary = read_json(summary_path)
     seed_dir = progress_path.parent
     diag_text, diag_paths = diagnostic_progress(seed_dir, variant)
-    phase_text, phase_paths = runtime_phase_progress(seed_dir, now)
+    _phase_text, phase_paths = runtime_phase_progress(seed_dir, now)
     filtered = filter_expected_rows(rows, expected_episodes)
     latest = filtered[-1] if filtered else (rows[-1] if rows else {})
     latest_ep = safe_int(latest.get("episode")) if latest else None
@@ -259,11 +258,12 @@ def training_row(
         last_update,
         str(latest_ep if latest_ep is not None else "-"),
         fmt_float(row_success(latest)),
+        fmt_float(row_task_success(latest)),
         fmt_float(row_reward(latest)),
         best,
-        window_pair(filtered or rows, 10),
+        metric_triplet(filtered or rows, tail_count=10),
+        metric_triplet(filtered or rows, tail_count=None),
         diag_text,
-        phase_text,
         dataset_progress,
         offline_progress,
         eval_progress,
@@ -354,6 +354,20 @@ def filter_expected_rows(rows: Sequence[Mapping[str, str]], expected_episodes: i
     return filtered
 
 
+def terminal_episode_rows(rows: Sequence[Mapping[str, str]]) -> list[Mapping[str, str]]:
+    latest_by_episode: dict[int, Mapping[str, str]] = {}
+    passthrough: list[Mapping[str, str]] = []
+    for row in rows:
+        episode = safe_int(row.get("episode"))
+        if episode is None:
+            passthrough.append(row)
+            continue
+        latest_by_episode[int(episode)] = row
+    if latest_by_episode:
+        return [latest_by_episode[key] for key in sorted(latest_by_episode)]
+    return passthrough
+
+
 def best_selection(path: Path, summary: Any, seed_dir: Path) -> str:
     rows = read_csv_rows(path)
     if not rows:
@@ -373,15 +387,17 @@ def best_selection(path: Path, summary: Any, seed_dir: Path) -> str:
     return f"{source}@{episode}:{score}/{min_success}"
 
 
-def window_pair(rows: Sequence[Mapping[str, str]], count: int) -> str:
+def metric_triplet(rows: Sequence[Mapping[str, str]], tail_count: int | None) -> str:
     if not rows:
         return "-"
-    tail = list(rows[-count:])
+    episode_rows = terminal_episode_rows(rows)
+    tail = list(episode_rows[-tail_count:]) if tail_count is not None else list(episode_rows)
     success_values = [value for row in tail if (value := row_success(row)) is not None]
+    task_values = [value for row in tail if (value := row_task_success(row)) is not None]
     reward_values = [value for row in tail if (value := row_reward(row)) is not None]
-    if not success_values and not reward_values:
+    if not success_values and not task_values and not reward_values:
         return "-"
-    return f"{fmt_mean(success_values)}/{fmt_mean(reward_values)}"
+    return f"{fmt_mean(success_values)}/{fmt_mean(task_values)}/{fmt_mean(reward_values)}"
 
 
 def render_eval_suite(
@@ -392,8 +408,14 @@ def render_eval_suite(
     process_rows: Sequence[Mapping[str, str]],
     now: float,
 ) -> list[str]:
-    run_paths = sorted(suite_root.glob("*/run.json"))
-    runs = [item for path in run_paths if isinstance((item := read_json(path)), Mapping)]
+    run_paths = eval_run_paths(suite_root)
+    runs = []
+    for path in run_paths:
+        item = read_json(path)
+        if isinstance(item, Mapping):
+            payload = dict(item)
+            payload["_run_dir"] = str(path.parent)
+            runs.append(payload)
     if not runs:
         runs = read_csv_rows(suite_root / "summary.csv")
     status = "PENDING"
@@ -415,6 +437,14 @@ def render_eval_suite(
     return lines
 
 
+def eval_run_paths(suite_root: Path) -> list[Path]:
+    paths = sorted(suite_root.glob("*/run.json"))
+    if paths:
+        return paths
+    shard_root = suite_root.parent / "stage2_eval_shards"
+    return sorted(shard_root.glob("seed_*/semantic_runtime_eval/*/run.json"))
+
+
 def eval_rows_by_baseline(
     runs: Sequence[Mapping[str, Any]],
     suite_root: Path,
@@ -429,10 +459,14 @@ def eval_rows_by_baseline(
         items = grouped.get(baseline, [])
         rewards = []
         for item in items:
-            scenario = str(item.get("scenario", ""))
-            role = str(item.get("service_role_sweep", "full_hybrid") or "full_hybrid")
-            seed = str(item.get("seed", "0"))
-            run_dir = suite_root / f"{baseline}__{scenario}__{role}__seed_{seed}"
+            run_dir_text = str(item.get("_run_dir", "") or "")
+            if run_dir_text:
+                run_dir = Path(run_dir_text)
+            else:
+                scenario = str(item.get("scenario", ""))
+                role = str(item.get("service_role_sweep", "full_hybrid") or "full_hybrid")
+                seed = str(item.get("seed", "0"))
+                run_dir = suite_root / f"{baseline}__{scenario}__{role}__seed_{seed}"
             reward = last_reward(run_dir / "reward_curve.csv")
             if reward is not None:
                 rewards.append(reward)
@@ -555,6 +589,18 @@ def row_success(row: Mapping[str, Any]) -> float | None:
     return float(succeeded) / total if total > 0.0 else None
 
 
+def row_task_success(row: Mapping[str, Any]) -> float | None:
+    value = safe_float(row.get("task_success_ratio"))
+    if value is not None:
+        return value
+    done = safe_float(row.get("task_done_num"))
+    failed = safe_float(row.get("task_fail_num"))
+    if done is None:
+        return None
+    total = float(done) + float(failed or 0.0)
+    return float(done) / total if total > 0.0 else None
+
+
 def row_reward(row: Mapping[str, Any]) -> float | None:
     value = safe_float(row.get("total_reward"))
     if value is not None:
@@ -622,6 +668,8 @@ def scenario_names(config: Mapping[str, Any]) -> list[str]:
     names = []
     for scenario in scenarios or []:
         if isinstance(scenario, Mapping) and scenario.get("name"):
+            if not bool(scenario.get("include_in_default", scenario.get("enabled", True))):
+                continue
             names.append(str(scenario["name"]))
     return names
 

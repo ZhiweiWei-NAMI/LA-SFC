@@ -18,7 +18,6 @@ BASELINES = [
     "nsga2_semantic_qos",
     "mappo_ctde",
     "iql_offline",
-    "utility_prior_with_exchange",
     "topology_greedy",
     "marl_no_semantic",
     "marl_semantic_no_topology",
@@ -33,7 +32,6 @@ ABLATIONS = [
     "pure_semantic_greedy_no_exchange",
     "local_semantic_runtime_greedy",
     "nsga2_semantic_qos",
-    "utility_prior_with_exchange",
     "topology_greedy",
     "marl_no_semantic",
     "marl_semantic_no_topology",
@@ -270,7 +268,6 @@ def proposed_better_two_metrics(grouped: Mapping[Tuple[str, str], Sequence[Mappi
     for metric in metrics:
         direction = metric_direction(metric)
         for baseline in [
-            "utility_prior_with_exchange",
             "topology_greedy",
             "nsga2_semantic_qos",
             "mappo_ctde",
@@ -346,9 +343,9 @@ def semantic_exchange_improves(
     candidate_rows: Sequence[Mapping[str, Any]],
 ) -> bool:
     no_exchange_quality = selected_quality(candidate_rows, "pure_semantic_greedy_no_exchange")
-    with_exchange_quality = selected_quality(candidate_rows, "utility_prior_with_exchange")
+    with_exchange_quality = selected_quality(candidate_rows, "cross_region_auction")
     no_exchange_remote = mean_across(grouped, "pure_semantic_greedy_no_exchange", "remote_candidate_ratio")
-    with_exchange_remote = mean_across(grouped, "utility_prior_with_exchange", "remote_candidate_ratio")
+    with_exchange_remote = mean_across(grouped, "cross_region_auction", "remote_candidate_ratio")
     return (with_exchange_remote or 0.0) > (no_exchange_remote or 0.0) or (
         with_exchange_quality is not None
         and no_exchange_quality is not None

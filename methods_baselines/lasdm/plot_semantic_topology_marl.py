@@ -22,7 +22,6 @@ METHOD_LABELS = {
     "nsga2_semantic_qos": "NSGA-II\nSemantic-QoS",
     "mappo_ctde": "MAPPO-CTDE",
     "iql_offline": "IQL\n(Offline)",
-    "utility_prior_with_exchange": "Utility Prior\n+ Exchange",
     "topology_greedy": "Topology Greedy\n+ Exchange",
     "marl_no_semantic": "MARL-noSem",
     "marl_semantic_no_topology": "MARL-sem",
@@ -39,7 +38,6 @@ METHOD_ORDER = [
     "nsga2_semantic_qos",
     "mappo_ctde",
     "iql_offline",
-    "utility_prior_with_exchange",
     "topology_greedy",
     "marl_no_semantic",
     "marl_semantic_no_topology",
@@ -71,7 +69,6 @@ OKABE_ITO = {
     "nsga2_semantic_qos": "#17becf",
     "mappo_ctde": "#e41a1c",
     "iql_offline": "#4daf4a",
-    "utility_prior_with_exchange": "#CC79A7",
     "topology_greedy": "#0072B2",
     "marl_no_semantic": "#999999",
     "marl_semantic_no_topology": "#CC79A7",
@@ -88,7 +85,6 @@ METHOD_MARKERS = {
     "nsga2_semantic_qos": "D",
     "mappo_ctde": "x",
     "iql_offline": "+",
-    "utility_prior_with_exchange": "D",
     "topology_greedy": "^",
     "marl_no_semantic": "v",
     "marl_semantic_no_topology": "D",
@@ -113,7 +109,6 @@ PAPER_METHOD_ORDER = [
     "nsga2_semantic_qos",
     "mappo_ctde",
     "iql_offline",
-    "utility_prior_with_exchange",
     "topology_greedy",
     "marl_semantic_no_topology",
     "marl_topology_no_semantic",
@@ -508,7 +503,7 @@ def plot_semantic_similarity_distribution(raw_root: Optional[Path]) -> plt.Figur
         return notice_figure("Semantic similarity distribution unavailable", ["Top semantic scores are empty or non-numeric."])
     df["method"] = df["__path"].map(method_from_path)
     fig, ax = plt.subplots(figsize=(6.8, 4.2))
-    selected = ["pure_semantic_greedy_no_exchange", "local_semantic_runtime_greedy", "utility_prior_with_exchange", "proposed_semantic_topology_marl", "centralized_planner"]
+    selected = ["pure_semantic_greedy_no_exchange", "local_semantic_runtime_greedy", "topology_greedy", "proposed_semantic_topology_marl", "centralized_planner"]
     for method in selected:
         values = df.loc[df["method"].eq(method), score_col].dropna().to_numpy()
         if len(values):
@@ -1029,7 +1024,7 @@ def method_linestyle(method: str) -> str:
         return "--"
     if method == "nsga2_semantic_qos":
         return "-."
-    if method in {"mappo_ctde", "iql_offline", "utility_prior_with_exchange", "marl_semantic_no_topology"}:
+    if method in {"mappo_ctde", "iql_offline", "marl_semantic_no_topology"}:
         return ":"
     return "-"
 

@@ -31,6 +31,9 @@ TRACE_FILES = [
     "runtime_overhead.csv",
 ]
 
+FIGURE_EPISODE_DURATION_S = 20.0
+SERVICE_PRESSURE_COMMON_REQUESTS = 30
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run real evaluation sweeps required by plans/figures_req.md.")
@@ -39,11 +42,11 @@ def main() -> int:
     parser.add_argument("--semantic-config", default="methods_baselines/lasdm/configs/semantic_topology_marl.yaml")
     parser.add_argument("--semantic-repair-config", default="methods_baselines/lasdm/configs/semantic_topology_runtime_repair.yaml")
     parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2, 3, 4])
-    parser.add_argument("--max-steps", type=int, default=80)
+    parser.add_argument("--max-steps", type=int, default=200)
     parser.add_argument(
         "--suites",
         nargs="+",
-        default=["service_nodes", "task_nodes", "skew", "ttl", "ablation", "uav", "sfc_length", "speed", "centralized"],
+        default=["service_nodes", "request_count", "skew", "ttl", "ablation", "uav", "sfc_length", "speed", "centralized"],
     )
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
@@ -102,7 +105,13 @@ def main() -> int:
 def build_suite(cfg: Mapping[str, Any], name: str) -> tuple[list[dict[str, Any]], list[str]]:
     suite = str(name)
     if suite == "service_nodes":
-        methods = ["proposed_semantic_topology_marl", "topology_greedy", "utility_prior_with_exchange", "cross_region_auction", "intra_region_only"]
+        methods = [
+            "proposed_semantic_topology_marl",
+            "topology_greedy",
+            "nsga2_semantic_qos",
+            "cross_region_auction",
+            "intra_region_only",
+        ]
         scenarios = [
             scenario_variant(
                 cfg,
@@ -110,25 +119,26 @@ def build_suite(cfg: Mapping[str, Any], name: str) -> tuple[list[dict[str, Any]]
                 f"fig1_service_nodes_{count}",
                 service_nodes=service_node_counts(count),
                 task_nodes={"vehicle": 100, "uav": 0},
-                request_count=100,
-                max_concurrent_sfcs=100,
+                request_count=SERVICE_PRESSURE_COMMON_REQUESTS,
+                expected_trend_rank={20: 1, 40: 2, 60: 3, 80: 4}[count],
+                max_concurrent_sfcs={20: 10, 40: 12, 60: 14, 80: 16}[count],
             )
             for count in [20, 40, 60, 80]
         ]
         return scenarios, methods
-    if suite == "task_nodes":
-        methods = ["proposed_semantic_topology_marl", "topology_greedy", "utility_prior_with_exchange", "cross_region_auction", "intra_region_only"]
+    if suite == "request_count":
+        methods = ["proposed_semantic_topology_marl", "mappo_ctde", "iql_offline", "topology_greedy", "intra_region_only"]
         scenarios = [
             scenario_variant(
                 cfg,
                 "semantic_runtime_contention_stress",
-                f"fig2_task_nodes_{count}",
+                f"fig2_request_count_{count}",
                 service_nodes=service_node_counts(60),
-                task_nodes={"vehicle": count, "uav": 0},
+                task_nodes={"vehicle": 100, "uav": 0},
                 request_count=count,
-                max_concurrent_sfcs=count,
+                max_concurrent_sfcs=max_concurrent_for_request_count(count),
             )
-            for count in [20, 50, 100, 150, 200]
+            for count in [15, 30, 45, 60, 75]
         ]
         return scenarios, methods
     if suite == "skew":
@@ -140,8 +150,8 @@ def build_suite(cfg: Mapping[str, Any], name: str) -> tuple[list[dict[str, Any]]
                 f"fig3_skew_{str(ratio).replace('.', 'p')}",
                 service_nodes=service_node_counts(60),
                 task_nodes={"vehicle": 100, "uav": 0},
-                request_count=100,
-                max_concurrent_sfcs=100,
+                request_count=SERVICE_PRESSURE_COMMON_REQUESTS,
+                max_concurrent_sfcs=max_concurrent_for_request_count(SERVICE_PRESSURE_COMMON_REQUESTS),
                 regional_skew_ratio=float(ratio),
             )
             for ratio in [1, 2, 4, 6, 8, 10]
@@ -172,15 +182,16 @@ def build_suite(cfg: Mapping[str, Any], name: str) -> tuple[list[dict[str, Any]]
         scenarios = [scenario_variant(cfg, "semantic_runtime_contention_stress", "fig9_ablation_contention")]
         return scenarios, methods
     if suite == "uav":
-        methods = ["proposed_semantic_topology_marl", "utility_prior_with_exchange", "cross_region_auction"]
+        methods = ["proposed_semantic_topology_marl", "topology_greedy", "cross_region_auction"]
         scenarios = [
             scenario_variant(
                 cfg,
-                "semantic_runtime_mobility_staleness_stress",
+                "semantic_runtime_contention_stress",
                 f"fig11_uav_{count}",
                 service_nodes={"rsu": 4, "vehicle": 10, "uav": count, "cloud_server": 1},
-                active_uav_count=count,
-                uav_count=count,
+                task_nodes={"vehicle": 100, "uav": 0},
+                request_count=SERVICE_PRESSURE_COMMON_REQUESTS,
+                max_concurrent_sfcs=max_concurrent_for_request_count(SERVICE_PRESSURE_COMMON_REQUESTS),
             )
             for count in [2, 4, 6, 8, 10, 12]
         ]
@@ -189,39 +200,35 @@ def build_suite(cfg: Mapping[str, Any], name: str) -> tuple[list[dict[str, Any]]
         methods = ["proposed_semantic_topology_marl", "topology_greedy"]
         scenarios = []
         for length in [3, 4]:
-            for count in [20, 50, 100, 150]:
+            for count in [15, 30, 60]:
                 scenarios.append(
                     scenario_variant(
                         cfg,
                         "semantic_runtime_contention_stress",
-                        f"fig12_sfc_length_{length}_task_nodes_{count}",
+                        f"fig12_sfc_length_{length}_request_count_{count}",
                         service_nodes=service_node_counts(60),
-                        task_nodes={"vehicle": count, "uav": 0},
+                        task_nodes={"vehicle": 100, "uav": 0},
                         request_count=count,
-                        max_concurrent_sfcs=count,
+                        max_concurrent_sfcs=max_concurrent_for_request_count(count),
                         sfc_length=length,
                     )
                 )
         return scenarios, methods
+    if suite == "centralized":
+        methods = ["centralized_planner", "proposed_semantic_topology_marl", "topology_greedy"]
+        scenarios = [scenario_variant(cfg, "semantic_runtime_contention_stress", "fig14_contention")]
+        return scenarios, methods
     if suite == "speed":
-        methods = ["proposed_semantic_topology_marl", "marl_no_temporal", "utility_prior_with_exchange"]
+        methods = ["proposed_semantic_topology_marl", "marl_no_temporal", "topology_greedy"]
         scenarios = [
             scenario_variant(
                 cfg,
-                "semantic_runtime_mobility_staleness_stress",
+                "semantic_runtime_contention_stress",
                 f"fig13_speed_{speed}",
                 speed_scale=float(speed) / 50.0,
-                vehicle_speed_scale=float(speed) / 50.0,
-                uav_speed_scale=max(1.0, float(speed) / 50.0),
+                vehicle_speed_kmh=float(speed),
             )
             for speed in [30, 50, 70, 90]
-        ]
-        return scenarios, methods
-    if suite == "centralized":
-        methods = ["centralized_planner", "proposed_semantic_topology_marl", "topology_greedy"]
-        scenarios = [
-            scenario_variant(cfg, "semantic_runtime_contention_stress", "fig14_contention"),
-            scenario_variant(cfg, "semantic_runtime_mobility_staleness_stress", "fig14_mobility"),
         ]
         return scenarios, methods
     raise ValueError(f"Unknown suite: {name}")
@@ -230,6 +237,10 @@ def build_suite(cfg: Mapping[str, Any], name: str) -> tuple[list[dict[str, Any]]
 def scenario_variant(cfg: Mapping[str, Any], base_name: str, name: str, **updates: Any) -> dict[str, Any]:
     scenario = copy.deepcopy(_scenario_by_name(cfg, base_name))
     scenario["name"] = name
+    if "request_count" in updates and updates["request_count"] is not None:
+        request_count = int(updates["request_count"])
+        updates.setdefault("arrival_horizon_s", FIGURE_EPISODE_DURATION_S)
+        updates.setdefault("arrival_rate_sfc_per_s", request_count / FIGURE_EPISODE_DURATION_S)
     scenario.update({key: value for key, value in updates.items() if value is not None})
     return scenario
 
@@ -240,6 +251,10 @@ def service_node_counts(total: int) -> dict[str, int]:
     uav = min(20, max(2, int(round(mobile * 0.25))))
     vehicle = max(0, min(100, mobile - uav))
     return {"rsu": 4, "vehicle": vehicle, "uav": uav, "cloud_server": 1}
+
+
+def max_concurrent_for_request_count(request_count: int) -> int:
+    return max(16, int(round(float(request_count) * 0.38)))
 
 
 def combine_suite_outputs(suite_root: Path, combined_root: Path) -> None:

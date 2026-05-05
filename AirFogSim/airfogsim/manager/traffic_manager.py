@@ -31,6 +31,8 @@ class TrafficManager():
         speed_scale = float(config_traffic.get("speed_scale", 1.0) or 1.0)
         self._vehicle_speed_scale = float(config_traffic.get("vehicle_speed_scale", speed_scale) or speed_scale)
         self._uav_speed_scale = float(config_traffic.get("uav_speed_scale", speed_scale) or speed_scale)
+        self._replay_start_time_s = max(0.0, float(config_traffic.get("replay_start_time_s", 0.0) or 0.0))
+        self._replay_hold_last = bool(config_traffic.get("replay_hold_last", False))
         self._RSU_positions = config_traffic.get("RSU_positions", [[0,0,0]])
         self._max_n_cloudServers = config_traffic.get("max_n_cloudServers", 1)
         self._cloud_server_ids = [str(item) for item in config_traffic.get("cloud_server_ids", []) or []]
@@ -103,7 +105,13 @@ class TrafficManager():
         return (node_id.rstrip("0123456789"), int(digits) if digits else -1, node_id)
 
     def _rows_at_current_time(self, df):
-        current_time = self._current_time
+        current_time = self._current_time + self._replay_start_time_s
+        if self._replay_hold_last:
+            available = df[df['data_timestep'] <= current_time]
+            if available.empty:
+                available = df[df['data_timestep'] == df['data_timestep'].min()]
+            id_column = 'vehicle_id' if 'vehicle_id' in df.columns else 'uav_id'
+            return available.sort_values(["data_timestep", id_column]).groupby(id_column, as_index=False).tail(1)
         return df[(df['data_timestep'] > current_time - self._traffic_interval) & (df['data_timestep'] <= current_time)]
 
     def _first_replay_ids(self, df, id_column, count):

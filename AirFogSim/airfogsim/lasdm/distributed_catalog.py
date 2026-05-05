@@ -7,7 +7,6 @@ import numpy as np
 
 from .instance_directory import ServiceInstance, ServiceInstanceDirectory
 from .semantic_link_matrix import SemanticLinkMatrix
-from .semantic_link_predictor import SemanticLinkScorer
 from .semantic_cache import SemanticAdvertisement, SemanticAdvertisementCache
 from .semantic_encoder import SemanticEncoder, service_instance_text, sfc_node_text
 from .semantic_exchange import SemanticCompressor
@@ -59,7 +58,6 @@ class DistributedServiceCatalog:
         encoder: Optional[SemanticEncoder] = None,
         compressor: Optional[SemanticCompressor] = None,
         respect_local_visibility: bool = True,
-        semantic_scorer: Optional[SemanticLinkScorer] = None,
         semantic_matrix: Optional[SemanticLinkMatrix] = None,
     ):
         self.agent_id = str(agent_id)
@@ -67,7 +65,6 @@ class DistributedServiceCatalog:
         self.encoder = encoder or SemanticEncoder(backend="hash")
         self.compressor = compressor or SemanticCompressor(input_dim=self.encoder.embedding_dim)
         self.respect_local_visibility = bool(respect_local_visibility)
-        self.semantic_scorer = semantic_scorer
         self.semantic_matrix = semantic_matrix
         self.remote_cache = SemanticAdvertisementCache(owner_agent_id=self.agent_id)
         self._local_embedding_by_instance: Dict[str, np.ndarray] = {}
@@ -109,6 +106,8 @@ class DistributedServiceCatalog:
         required = set(required_capabilities or [])
         allowed_types = {str(item) for item in allowed_node_types or ()}
         candidates: List[CatalogCandidate] = []
+        self.refresh_local_embeddings()
+        query_vec = np.asarray(self.encoder.encode(str(query_text)), dtype=np.float32)
 
         for instance in self.local_directory.all():
             if not _instance_matches(instance, service_id, required):
@@ -119,7 +118,14 @@ class DistributedServiceCatalog:
                 continue
             metadata = _candidate_metadata(instance)
             truth = self._truth_metadata(request_type, instance.service_id, metadata, link_input_semantic)
-            score = _semantic_fidelity(float(truth.get("semantic_link_truth_score", 1.0) or 1.0))
+            vector = self._local_embedding_by_instance.get(instance.instance_id)
+            if vector is None:
+                instance_text = service_instance_text(instance)
+                vector = self.encoder.encode(instance_text)
+                self._local_embedding_by_instance[instance.instance_id] = vector
+                self._local_embedding_key_by_instance[instance.instance_id] = (str(instance.version), str(instance_text))
+            similarity = float(self.encoder.similarity(query_vec, np.asarray(vector, dtype=np.float32).reshape(1, -1))[0])
+            score = _semantic_fidelity(similarity)
             metadata.update(
                 {
                     "node_template_similarity": score,
@@ -129,7 +135,7 @@ class DistributedServiceCatalog:
                     "candidate_output_semantic": str(instance.output_semantic),
                     "request_context_text": str(query_text),
                     "chain_position": int(chain_position),
-                    "semantic_discovery": "hard_type",
+                    "semantic_discovery": "encoder_similarity",
                 }
             )
             metadata.update(truth)
@@ -161,7 +167,8 @@ class DistributedServiceCatalog:
                     continue
                 metadata = _remote_candidate_metadata(ad, now_s)
                 truth = self._truth_metadata(request_type, ad.service_id, metadata, link_input_semantic)
-                score = _semantic_fidelity(float(truth.get("semantic_link_truth_score", 1.0) or 1.0))
+                similarity = float(self.compressor.compressed_similarity(query_vec, ad.compressed_embedding))
+                score = _semantic_fidelity(similarity)
                 metadata.update(
                     {
                         "node_template_similarity": score,
@@ -171,7 +178,7 @@ class DistributedServiceCatalog:
                         "candidate_output_semantic": str(ad.output_semantic),
                         "request_context_text": str(query_text),
                         "chain_position": int(chain_position),
-                        "semantic_discovery": "hard_type",
+                        "semantic_discovery": "encoder_similarity",
                     }
                 )
                 metadata.update(truth)
@@ -194,7 +201,7 @@ class DistributedServiceCatalog:
                     )
                 )
 
-        candidates.sort(key=lambda item: (item.is_remote, item.staleness_s, item.node_type, item.node_id, item.instance_id))
+        candidates.sort(key=lambda item: (-(item.semantic_score), item.is_remote, item.staleness_s, item.node_type, item.node_id, item.instance_id))
         result = _diverse_top_k(candidates, max(0, int(top_k)))
         self.query_trace.append(
             {
@@ -207,7 +214,8 @@ class DistributedServiceCatalog:
                 "remote_count": sum(1 for item in result if item.is_remote),
                 "stale_ratio": self.remote_cache.stale_ratio(now_s),
                 "top_score": result[0].semantic_score if result else None,
-                "semantic_discovery": "hard_type",
+                "min_similarity_ignored_for_recall": float(min_similarity),
+                "semantic_discovery": "encoder_similarity",
             }
         )
         return result
