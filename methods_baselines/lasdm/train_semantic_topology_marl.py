@@ -102,11 +102,11 @@ from airfogsim.lasdm.marl_trainer import HeuristicEvaluator, MASACTrainer, write
 from airfogsim.lasdm.model import LASDMServiceChain
 from airfogsim.lasdm.orchestrator import LASDMOrchestrator
 from airfogsim.lasdm.runtime_bridge import LASDMRuntimeBridge
-from airfogsim.lasdm.semantic_link_matrix import SERVICE_IO_DEFAULTS, SemanticLinkMatrix, V21_OUTPUT_ROOT
+from airfogsim.lasdm.semantic_link_matrix import SERVICE_IO_DEFAULTS, DEFAULT_SEMANTIC_OUTPUT_ROOT, SemanticLinkMatrix
 from airfogsim.lasdm.topology_builder import TopologyBuilder
 
 DEFAULT_CONFIG = os.path.join(METHOD_ROOT, "configs", "semantic_topology_marl.yaml")
-DEFAULT_V21_OUTPUT_ROOT = os.path.join(WORKSPACE_ROOT, str(V21_OUTPUT_ROOT))
+DEFAULT_SEMANTIC_OUTPUT_ROOT_ABS = os.path.join(WORKSPACE_ROOT, str(DEFAULT_SEMANTIC_OUTPUT_ROOT))
 PHYSICAL_VEHICLE_COUNT = 100
 PHYSICAL_UAV_COUNT = 20
 PHYSICAL_RSU_COUNT = 4
@@ -139,7 +139,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--scenario", default=None)
     parser.add_argument("--service-role-sweep", default="full_hybrid")
-    parser.add_argument("--output-dir", default=os.path.join(DEFAULT_V21_OUTPUT_ROOT, "semantic_runtime_train", "default"))
+    parser.add_argument("--output-dir", default=os.path.join(DEFAULT_SEMANTIC_OUTPUT_ROOT_ABS, "semantic_runtime_train", "default"))
     args = parser.parse_args()
 
     config = _load_yaml(args.config)
@@ -193,19 +193,24 @@ def main() -> None:
                 alpha_min=float(marl_cfg.get("masac_alpha_min", 0.005) or 0.005),
                 alpha_max=float(marl_cfg.get("masac_alpha_max", 0.25) or 0.25),
                 tau=float(marl_cfg.get("masac_tau", 0.005) or 0.005),
+                q_mlp_depth=int(marl_cfg.get("masac_q_mlp_depth", 3) or 3),
             )
             trainer = MASACTrainer(
                 env,
                 policy,
+                env_factory=fresh_env,
+                close_env=close_semantic_env,
                 gamma=float(marl_cfg.get("masac_gamma", 0.99) or 0.99),
                 tau=float(marl_cfg.get("masac_tau", 0.005) or 0.005),
                 batch_size=int(marl_cfg.get("masac_batch_size", 128) or 128),
                 replay_capacity=int(marl_cfg.get("masac_replay_capacity", 20000) or 20000),
                 replay_warmup_steps=int(marl_cfg.get("masac_replay_warmup_steps", 128) or 128),
                 update_interval=int(marl_cfg.get("masac_update_interval", 1) or 1),
+                actor_update_interval=int(marl_cfg.get("masac_actor_update_interval", 2) or 2),
                 updates_per_env_step=int(marl_cfg.get("masac_updates_per_env_step", 1) or 1),
                 max_grad_norm=float(marl_cfg.get("masac_max_grad_norm", 1.0) or 1.0),
                 reward_scale=float(marl_cfg.get("masac_reward_scale", 1.0) or 1.0),
+                replay_sample_strategy=str(marl_cfg.get("masac_replay_sample_strategy", "uniform") or "uniform"),
                 seed=args.seed,
             )
             rows = trainer.train(episodes=episodes, max_steps=max_steps, output_dir=str(output_dir))
@@ -240,6 +245,7 @@ def main() -> None:
                 beta=float(marl_cfg.get("iql_beta", 3.0) or 3.0),
                 v_lr=float(marl_cfg.get("iql_v_lr", marl_cfg.get("masac_q_lr", marl_cfg.get("ippo_lr", 3e-4))) or 3e-4),
                 tau=float(marl_cfg.get("masac_tau", 0.005) or 0.005),
+                q_mlp_depth=int(marl_cfg.get("iql_q_mlp_depth", 3) or 3),
             )
             behavior_policy = policy_from_name(str(marl_cfg.get("iql_behavior_policy", "utility_prior_with_exchange")), seed=args.seed)
             trainer = IQLTrainer(
@@ -262,10 +268,9 @@ def main() -> None:
             rows = trainer.train(episodes=episodes, max_steps=max_steps, output_dir=str(output_dir))
         else:
             policy = policy_from_name(args.policy, seed=args.seed)
-            evaluator = HeuristicEvaluator(env, policy)
-            rows = evaluator.run(episodes=episodes, max_steps=max_steps)
+            evaluator = HeuristicEvaluator(env, policy, env_factory=fresh_env, close_env=close_semantic_env)
+            rows = evaluator.run(episodes=episodes, max_steps=max_steps, output_dir=str(output_dir))
             write_reward_curve(output_dir / "reward_curve.csv", rows)
-            env.write_traces(str(output_dir))
 
         payload = {
             "completed": True,
@@ -429,13 +434,15 @@ def _actor_policy_kwargs(
         "observation_dim": obs_dim,
         "max_candidates": int(marl_cfg.get("max_candidates", 16) or 16),
         "candidate_feature_dim": _observation_candidate_feature_dim(observations) or 31,
-        "hidden_dim": int(marl_cfg.get("ippo_hidden_dim", marl_cfg.get("hidden_dim", 128)) or 128),
+        "hidden_dim": int(marl_cfg.get("ippo_hidden_dim", 256) or 256),
+        "mlp_depth": int(marl_cfg.get("ippo_mlp_depth", 3) or 3),
+        "gnn_layers": int(marl_cfg.get("ippo_gnn_layers", 3) or 3),
         "lr": float(marl_cfg.get("ippo_lr", 3e-4) or 3e-4),
         "seed": int(seed),
         "centralized_critic": bool(marl_cfg.get("ippo_centralized_critic", True)),
         "critic_observation_dim": obs_dim * max(1, critic_agents),
         "max_critic_agents": max(1, critic_agents),
-        "utility_prior_logit_weight": float(marl_cfg.get("ippo_utility_prior_logit_weight", 2.5) or 2.5),
+        "utility_prior_logit_weight": _config_float(marl_cfg, "ippo_utility_prior_logit_weight", 2.5),
         "route_unavailable_penalty": float(marl_cfg.get("ippo_route_unavailable_penalty", 20.0) or 20.0),
         "include_semantic_features": bool(marl_cfg.get("include_semantic_features", True)),
         "include_topology_features": bool(marl_cfg.get("include_topology_features", True)),
@@ -446,12 +453,22 @@ def _actor_policy_kwargs(
         "learned_logit_scale": float(
             marl_cfg.get("ippo_learned_logit_scale_init", marl_cfg.get("ippo_learned_logit_scale", 1.0)) or 1.0
         ),
-        "prior_logit_scale": float(
-            marl_cfg.get("ippo_prior_logit_scale_init", marl_cfg.get("ippo_prior_logit_scale", 1.0)) or 1.0
+        "prior_logit_scale": _config_float(
+            marl_cfg,
+            "ippo_prior_logit_scale_init",
+            _config_float(marl_cfg, "ippo_prior_logit_scale", 1.0),
         ),
         "learnable_logit_blend": bool(marl_cfg.get("ippo_learnable_logit_blend", False)),
+        "action_prior_enabled": bool(marl_cfg.get("ippo_action_prior_enabled", True)),
         "device": str(marl_cfg.get("ippo_device", "") or "") or None,
     }
+
+
+def _config_float(config: Mapping[str, Any], key: str, default: float) -> float:
+    value = config.get(key, default)
+    if value is None or value == "":
+        return float(default)
+    return float(value)
 
 
 def _algorithm_name(policy_name: str) -> str:
@@ -520,7 +537,7 @@ def _materialize_offline_config(
     run_config["service_chains"] = _scenario_chains(run_config, scenario, role_name, seed)
     _assign_v21_request_types(run_config["service_chains"], semantic_matrix)
     semantic_output_root = Path(
-        str(dict(run_config.get("semantic_profiles", {}) or {}).get("output_root", DEFAULT_V21_OUTPUT_ROOT))
+        str(dict(run_config.get("semantic_profiles", {}) or {}).get("output_root", DEFAULT_SEMANTIC_OUTPUT_ROOT_ABS))
     )
     _export_semantic_artifacts(semantic_matrix, semantic_output_root, instances, exchange_cfg, run_config)
     run_config["_semantic_matrix"] = semantic_matrix
@@ -801,31 +818,27 @@ def _scenario_chains(
     if not base:
         return []
     scenario_cfg = _scenario_with_default_task_classes(config, scenario)
-    arrival_rate = float(scenario_cfg.get("arrival_rate_sfc_per_s", 0.4) or 0.4)
-    if scenario_cfg.get("request_count") is not None:
-        target_count = max(len(base), int(scenario_cfg.get("request_count") or len(base)))
-    elif scenario_cfg.get("max_concurrent_sfcs") is not None:
-        target_count = max(len(base), int(scenario_cfg.get("max_concurrent_sfcs") or len(base)))
-    else:
-        target_count = max(len(base), min(24, int(math.ceil(arrival_rate * 10.0))))
     task_nodes = dict(scenario_cfg.get("task_nodes", {}) or {})
-    vehicle_tasks = max(0, int(task_nodes.get("vehicle", 0) or 0))
-    uav_tasks = max(0, int(task_nodes.get("uav", 0) or 0))
     load_multiplier = _load_multiplier(scenario_cfg)
-    arrival_offsets = _scenario_arrival_offsets(scenario_cfg, seed, target_count, arrival_rate)
+    arrival_plan = _per_task_node_poisson_arrival_plan(scenario_cfg, seed)
+    target_count = len(arrival_plan)
+    sampling_scenario = dict(scenario_cfg)
+    sampling_scenario["generated_sfc_count"] = target_count
+    horizon_s = _scenario_arrival_horizon_s(scenario_cfg)
+    expected_arrival_rate = _scenario_expected_arrival_rate_sfc_per_s(scenario_cfg)
     chains: List[Dict[str, Any]] = []
-    for index in range(target_count):
+    for index, arrival in enumerate(arrival_plan):
         raw = copy.deepcopy(base[index % len(base)])
         raw["sfc_id"] = f"{raw['sfc_id']}__{scenario_cfg.get('name', 'default')}__{service_role_sweep}__seed_{seed}__req_{index}"
-        source = _task_source_node(index, vehicle_tasks, uav_tasks)
+        source = str(arrival["source_node_id"])
         raw["source_node_id"] = source
         raw["sink_node_id"] = source
-        apply_semantic_scenario_overrides(raw, scenario_cfg, seed=seed, request_index=index)
+        apply_semantic_scenario_overrides(raw, sampling_scenario, seed=seed, request_index=index)
         context = dict(raw.get("context", {}) or {})
-        request_type = _select_request_type(scenario_cfg, seed, index)
+        request_type = _select_request_type(sampling_scenario, seed, index)
         if request_type:
             context["request_type"] = request_type
-        representative_length = _select_representative_service_chain_length(scenario_cfg, seed, index)
+        representative_length = _select_representative_service_chain_length(sampling_scenario, seed, index)
         if representative_length is not None:
             context["representative_service_chain_length"] = representative_length
         context.update(
@@ -836,17 +849,22 @@ def _scenario_chains(
                 "preferred_region_id": _scenario_preferred_region(scenario_cfg, index, source),
                 "task_node_counts": task_nodes,
                 "service_node_counts": dict(scenario_cfg.get("service_nodes", {}) or {}),
-                "request_count": target_count,
-                "arrival_rate_sfc_per_s": arrival_rate,
-                "arrival_process": str(scenario_cfg.get("arrival_process", "deterministic")),
-                "arrival_horizon_s": _scenario_arrival_horizon_s(scenario_cfg, target_count, arrival_rate),
-                "arrival_time_s": float(arrival_offsets[index]),
-                "request_intensity_sfc_per_s": float(target_count)
-                / max(1e-6, _scenario_arrival_horizon_s(scenario_cfg, target_count, arrival_rate)),
-                "theoretical_success_target": scenario_cfg.get("theoretical_success_target"),
-                "max_concurrent_sfcs": int(
-                    scenario_cfg.get("max_concurrent_sfcs", target_count) or target_count
+                "generated_sfc_count": target_count,
+                "arrival_rate_sfc_per_s": expected_arrival_rate,
+                "arrival_process": "per_task_node_poisson",
+                "arrival_horizon_s": horizon_s,
+                "arrival_time_s": float(arrival.get("arrival_time_s", 0.0) or 0.0),
+                "request_intensity_sfc_per_s": float(target_count) / max(1e-6, horizon_s),
+                "logical_task_node_id": str(arrival["logical_task_node_id"]),
+                "physical_task_node_id": source,
+                "task_node_type": str(arrival["task_node_type"]),
+                "per_task_node_arrival_rate_sfc_per_s": float(
+                    arrival.get("per_task_node_arrival_rate_sfc_per_s", 0.0) or 0.0
                 ),
+                "per_task_node_arrival_interval_s": float(
+                    arrival.get("per_task_node_arrival_interval_s", 0.0) or 0.0
+                ),
+                "theoretical_success_target": scenario_cfg.get("theoretical_success_target"),
                 "load_multiplier": load_multiplier,
                 "risk_level": float(scenario_cfg.get("risk_level", context.get("risk_level", 0.0)) or 0.0),
                 "mobility_multiplier": _mobility_multiplier(scenario_cfg),
@@ -872,35 +890,79 @@ def _scenario_chains(
     return chains
 
 
-def _scenario_arrival_horizon_s(scenario: Mapping[str, Any], request_count: int, arrival_rate: float) -> float:
+def _scenario_arrival_horizon_s(scenario: Mapping[str, Any]) -> float:
     raw = scenario.get("arrival_horizon_s", scenario.get("episode_duration_s"))
-    if raw is not None:
-        return max(0.1, float(raw))
-    return max(0.1, float(request_count) / max(1e-6, float(arrival_rate)))
+    if raw is None:
+        raise ValueError("per-task-node Poisson scenarios must set arrival_horizon_s")
+    return max(0.1, float(raw))
 
 
-def _scenario_arrival_offsets(
+def _per_task_node_poisson_arrival_plan(
     scenario: Mapping[str, Any],
     seed: int,
-    request_count: int,
-    arrival_rate: float,
-) -> List[float]:
-    count = max(0, int(request_count))
-    if count <= 0:
-        return []
-    process = str(scenario.get("arrival_process", "deterministic")).strip().lower()
-    horizon_s = _scenario_arrival_horizon_s(scenario, count, arrival_rate)
-    rng = random.Random(_stable_scenario_seed(scenario, seed, 41047))
-    if process in {"poisson", "conditional_poisson", "poisson_fixed_count"}:
-        return sorted(rng.uniform(0.0, horizon_s) for _ in range(count))
-    if process in {"poisson_interarrival", "exponential"}:
-        now = 0.0
-        offsets: List[float] = []
-        for _ in range(count):
-            now += rng.expovariate(max(1e-6, float(arrival_rate)))
-            offsets.append(now)
-        return offsets
-    return [float(index) / max(1e-6, float(arrival_rate)) for index in range(count)]
+) -> List[Dict[str, Any]]:
+    task_sources = _scenario_task_sources(scenario)
+    horizon_s = _scenario_arrival_horizon_s(scenario)
+    per_node_rate = _per_task_node_arrival_rate_sfc_per_s(scenario)
+    if per_node_rate <= 0.0:
+        raise ValueError("per-task-node Poisson arrival rate must be positive")
+    arrivals: List[Dict[str, Any]] = []
+    for source_index, source in enumerate(task_sources):
+        rng = random.Random(_stable_scenario_seed(scenario, seed, 41047) + source_index * 7919)
+        current_time = 0.0
+        while True:
+            current_time += rng.expovariate(per_node_rate)
+            if current_time > horizon_s + 1e-9:
+                break
+            item = dict(source)
+            item["arrival_time_s"] = float(current_time)
+            item["per_task_node_arrival_rate_sfc_per_s"] = float(per_node_rate)
+            item["per_task_node_arrival_interval_s"] = float(1.0 / per_node_rate)
+            arrivals.append(item)
+    arrivals.sort(key=lambda item: (float(item["arrival_time_s"]), str(item["logical_task_node_id"])))
+    return arrivals
+
+
+def _scenario_task_sources(scenario: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    task_nodes = dict(scenario.get("task_nodes", {}) or {})
+    sources: List[Dict[str, Any]] = []
+    for node_type, physical_count, prefix in (
+        ("vehicle", PHYSICAL_VEHICLE_COUNT, "vehicle"),
+        ("uav", PHYSICAL_UAV_COUNT, "UAV"),
+    ):
+        logical_count = max(0, int(task_nodes.get(node_type, 0) or 0))
+        for logical_index in range(logical_count):
+            physical_index = logical_index % max(1, physical_count)
+            physical_node_id = f"{prefix}_{physical_index}" if node_type == "uav" else f"vehicle_{physical_index}"
+            sources.append(
+                {
+                    "logical_task_node_id": f"{node_type}_task_{logical_index}",
+                    "source_node_id": physical_node_id,
+                    "task_node_type": node_type,
+                    "logical_task_node_index": logical_index,
+                    "physical_task_node_index": physical_index,
+                }
+            )
+    if not sources:
+        raise ValueError("per-task-node Poisson scenarios must set positive task_nodes")
+    return sources
+
+
+def _per_task_node_arrival_rate_sfc_per_s(
+    scenario: Mapping[str, Any],
+) -> float:
+    interval = scenario.get("per_task_node_arrival_interval_s")
+    if interval is not None:
+        return 1.0 / max(1e-6, float(interval))
+    rate = scenario.get("per_task_node_arrival_rate_sfc_per_s")
+    if rate is not None:
+        return max(0.0, float(rate))
+    raise ValueError("per-task-node Poisson scenarios must set per_task_node_arrival_interval_s or per_task_node_arrival_rate_sfc_per_s")
+
+
+def _scenario_expected_arrival_rate_sfc_per_s(scenario: Mapping[str, Any]) -> float:
+    sources = _scenario_task_sources(scenario)
+    return max(1e-6, _per_task_node_arrival_rate_sfc_per_s(scenario) * len(sources))
 
 
 def _select_representative_service_chain_length(
@@ -916,6 +978,17 @@ def _select_representative_service_chain_length(
             if weight > 0.0:
                 weighted.append((max(1, int(raw_length)), weight))
         if weighted:
+            if bool(scenario.get("stratified_sfc_lengths", False)):
+                return int(
+                    _stratified_weighted_choice(
+                        weighted,
+                        scenario,
+                        seed,
+                        request_index,
+                        int(scenario.get("generated_sfc_count", request_index + 1) or request_index + 1),
+                        salt=52021,
+                    )
+                )
             total = sum(weight for _length, weight in weighted)
             rng = random.Random(_stable_scenario_seed(scenario, seed, 52021) + int(request_index) * 17)
             threshold = rng.random() * total
@@ -958,6 +1031,17 @@ def _select_request_type(
     ]
     if not weighted:
         return None
+    if bool(scenario.get("stratified_request_types", False)):
+        return str(
+            _stratified_weighted_choice(
+                weighted,
+                scenario,
+                seed,
+                request_index,
+                int(scenario.get("generated_sfc_count", request_index + 1) or request_index + 1),
+                salt=71,
+            )
+        )
     total = sum(weight for _name, weight in weighted)
     threshold = random.Random(int(seed) * 1000003 + int(request_index) * 9176 + 71).random() * total
     cumulative = 0.0
@@ -965,6 +1049,29 @@ def _select_request_type(
         cumulative += weight
         if threshold <= cumulative:
             return name
+    return weighted[-1][0]
+
+
+def _stratified_weighted_choice(
+    weighted: Sequence[tuple[Any, float]],
+    scenario: Mapping[str, Any],
+    seed: int,
+    request_index: int,
+    sample_count: int,
+    salt: int,
+) -> Any:
+    total = sum(max(0.0, float(weight)) for _item, weight in weighted)
+    if total <= 0.0:
+        return weighted[-1][0]
+    count = max(1, int(sample_count))
+    phase = random.Random(_stable_scenario_seed(scenario, seed, salt)).random() / float(count)
+    point = (((int(request_index) + 0.5) / float(count)) + phase) % 1.0
+    threshold = point * total
+    cumulative = 0.0
+    for item, weight in weighted:
+        cumulative += max(0.0, float(weight))
+        if threshold <= cumulative:
+            return item
     return weighted[-1][0]
 
 
@@ -1223,17 +1330,6 @@ def apply_semantic_scenario_overrides(
         elif "high_contention" in str(scenario.get("name", "")):
             qos["deadline_s"] = min(float(qos.get("deadline_s", 6.0)), 5.0)
     chain["qos"] = qos
-    context = dict(chain.get("context", {}) or {})
-    for key in (
-        "per_function_task_deadline_enabled",
-        "per_function_task_deadline_multiplier",
-        "per_function_task_deadline_min_s",
-        "per_function_task_deadline_max_s",
-    ):
-        if key in scenario:
-            context[key] = scenario[key]
-    chain["context"] = context
-
     payload_range = scenario.get("payload_mb_range")
     if isinstance(payload_range, (list, tuple)) and len(payload_range) >= 2:
         low, high = float(payload_range[0]), float(payload_range[1])
@@ -1604,7 +1700,7 @@ def _decoy_description(service_id: str, decoy_kind: str) -> str:
 def _load_multiplier(scenario: Mapping[str, Any]) -> float:
     if scenario.get("load_multiplier") is not None:
         return max(0.1, float(scenario["load_multiplier"]))
-    arrival = float(scenario.get("arrival_rate_sfc_per_s", 0.6) or 0.6)
+    arrival = _scenario_expected_arrival_rate_sfc_per_s(scenario)
     return max(0.6, arrival / 0.6)
 
 
@@ -1634,14 +1730,6 @@ def _materialized_node_id(node_type: str, index: int) -> str:
     if node_type == "cloud_server":
         return "cloudServer_0"
     return f"vehicle_{index % PHYSICAL_VEHICLE_COUNT}"
-
-
-def _task_source_node(index: int, vehicle_tasks: int, uav_tasks: int) -> str:
-    if uav_tasks and (index % 4 == 0 or not vehicle_tasks):
-        return f"UAV_{index % min(PHYSICAL_UAV_COUNT, max(1, uav_tasks))}"
-    if vehicle_tasks:
-        return f"vehicle_{index % min(PHYSICAL_VEHICLE_COUNT, vehicle_tasks)}"
-    return f"UAV_{index % min(PHYSICAL_UAV_COUNT, max(1, uav_tasks))}"
 
 
 def _materialized_capacity(node_type: str) -> Dict[str, float]:

@@ -83,6 +83,7 @@ class LASDMTaskAdapterTests(unittest.TestCase):
     def test_child_and_sink_tasks_keep_lineage_and_return_metadata(self):
         adapter = LASDMTaskAdapter()
         chain = make_chain()
+        chain.submit_time = 10.0
         child = adapter.build_task(
             chain,
             "det",
@@ -101,6 +102,8 @@ class LASDMTaskAdapterTests(unittest.TestCase):
         )
 
         self.assertEqual(child.getTaskNodeId(), "RSU_0")
+        self.assertAlmostEqual(child.getTaskDeadline(), 4.0)
+        self.assertAlmostEqual(sink.getTaskDeadline(), 3.0)
         self.assertEqual(child._lasdm["lifecycle"]["role"], "child")
         self.assertEqual(child._lasdm["data_flow"]["predecessors"], ["pre"])
         self.assertEqual(child._lasdm["data_flow"]["parent_task_ids"], ["sfc_adapter::pre"])

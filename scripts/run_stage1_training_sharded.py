@@ -10,8 +10,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-import pandas as pd
-
 
 TRAINED_CHECKPOINT_FILES = {
     "mappo_ctde": "mappo_policy.pt",
@@ -175,7 +173,6 @@ def main() -> int:
                     item["proc"].terminate()
                 break
             continue
-        print_progress(active_processes, active_processes)
         if active_processes:
             time.sleep(poll_interval)
     if failed and active_processes:
@@ -378,40 +375,6 @@ def write_pid_manifest(root: Path, processes: list[dict[str, Any]]) -> None:
         json.dumps(rows, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
-
-
-def print_progress(processes: list[dict[str, Any]], alive: list[dict[str, Any]]) -> None:
-    parts = []
-    for item in processes:
-        progress = next(
-            (
-                path
-                for path in (
-                    item["out"] / "train_progress.csv",
-                    item["out"] / "reward_curve.csv",
-                    item["out"] / "iql_eval_reward_curve.csv",
-                )
-                if path.exists()
-            ),
-            None,
-        )
-        if progress is None:
-            parts.append(f"{item['variant']} seed {item['seed']}: no-progress")
-            continue
-        try:
-            df = pd.read_csv(progress)
-            episode = int(df["episode"].max()) if not df.empty and "episode" in df else -1
-            recent = df.tail(10)
-            success_column = "success_ratio" if "success_ratio" in recent else "succeeded"
-            success = (
-                float(pd.to_numeric(recent.get(success_column, pd.Series(dtype=float)), errors="coerce").fillna(0.0).mean())
-                if not recent.empty
-                else 0.0
-            )
-            parts.append(f"{item['variant']} seed {item['seed']}: rows={len(df)} episode={episode} avg10_success={success:.3f}")
-        except Exception as exc:
-            parts.append(f"{item['variant']} seed {item['seed']}: read-error={exc}")
-    print(time.strftime("%F %T"), "alive=", [(item["variant"], item["seed"]) for item in alive], "; ".join(parts), flush=True)
 
 
 SHARD_CODE = r"""

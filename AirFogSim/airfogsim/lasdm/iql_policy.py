@@ -17,15 +17,9 @@ class IQLPolicy(MASACPolicy):
         **kwargs: Any,
     ):
         super().__init__(*args, **kwargs)
-        hidden_dim = int(getattr(self.model, "hidden_dim", 128))
+        hidden_dim = int(getattr(self.model, "hidden_dim"))
         v_input_dim = hidden_dim * self.max_critic_agents + hidden_dim + self.candidate_feature_dim
-        self.v_net = self.nn.Sequential(
-            self.nn.Linear(v_input_dim, hidden_dim),
-            self.nn.ReLU(),
-            self.nn.Linear(hidden_dim, hidden_dim),
-            self.nn.ReLU(),
-            self.nn.Linear(hidden_dim, 1),
-        ).to(self.device)
+        self.v_net = self._build_q_network(v_input_dim, hidden_dim).to(self.device)
         self.v_optimizer = self.torch.optim.Adam(
             self.v_net.parameters(),
             lr=float(v_lr if v_lr is not None else kwargs.get("q_lr", kwargs.get("lr", 3e-4))),

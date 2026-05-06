@@ -790,19 +790,14 @@ class PolicyEvaluation:
     action_count: int
 
 
-class IPPOPolicy(BaseMARLPolicy):
-    """Candidate-choice actor with optional centralized context support.
-
-    Execution remains decentralized: candidate actions are sampled from each
-    agent's local observation.  MASAC reuses this actor surface and trains
-    centralized Q critics around it.
-    """
+class CandidateActorPolicy(BaseMARLPolicy):
+    """Algorithm-neutral candidate actor with optional centralized context."""
 
     def __init__(
         self,
         observation_dim: int,
         max_candidates: int = 16,
-        hidden_dim: int = 128,
+        hidden_dim: int = 256,
         lr: float = 3e-4,
         seed: int = 0,
         candidate_feature_dim: int = 31,
@@ -815,6 +810,8 @@ class IPPOPolicy(BaseMARLPolicy):
         centralized_critic: bool = False,
         critic_observation_dim: Optional[int] = None,
         max_critic_agents: int = 4,
+        mlp_depth: int = 3,
+        gnn_layers: int = 3,
         use_region_encoder: bool = True,
         node_feature_dim: int = 16,
         edge_feature_dim: int = 17,
@@ -824,6 +821,7 @@ class IPPOPolicy(BaseMARLPolicy):
         learned_logit_scale: float = 1.0,
         prior_logit_scale: float = 1.0,
         learnable_logit_blend: bool = False,
+        action_prior_enabled: bool = True,
     ):
         try:
             import torch
@@ -845,6 +843,8 @@ class IPPOPolicy(BaseMARLPolicy):
         self.centralized_critic = bool(centralized_critic)
         self.max_critic_agents = max(1, int(max_critic_agents))
         self.critic_observation_dim = int(critic_observation_dim or self.observation_dim)
+        self.mlp_depth = max(1, int(mlp_depth))
+        self.gnn_layers = max(1, int(gnn_layers))
         self.use_region_encoder = bool(use_region_encoder)
         self.node_feature_dim = int(node_feature_dim)
         self.edge_feature_dim = int(edge_feature_dim)
@@ -854,6 +854,7 @@ class IPPOPolicy(BaseMARLPolicy):
         self.learned_logit_scale = float(learned_logit_scale)
         self.prior_logit_scale = float(prior_logit_scale)
         self.learnable_logit_blend = bool(learnable_logit_blend)
+        self.action_prior_enabled = bool(action_prior_enabled)
         self.rng = random.Random(seed)
         torch.manual_seed(seed)
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -894,6 +895,8 @@ class IPPOPolicy(BaseMARLPolicy):
                 temporal_dim: int,
                 max_agents: int,
                 resource_action_dim: int,
+                mlp_depth_value: int,
+                gnn_layer_count: int,
                 prior_init_values: Sequence[float],
                 learnable_prior_value: bool,
                 learned_logit_scale_value: float,
@@ -901,20 +904,32 @@ class IPPOPolicy(BaseMARLPolicy):
                 learnable_logit_blend_value: bool,
             ):
                 super().__init__()
-                self.body = nn.Sequential(nn.Linear(obs_dim, hid), nn.Tanh(), nn.Linear(hid, hid), nn.Tanh())
+                depth = max(1, int(mlp_depth_value))
+                gnn_depth = max(1, int(gnn_layer_count))
+
+                def mlp_body(input_dim: int) -> nn.Sequential:
+                    layers = []
+                    last_dim = int(input_dim)
+                    for _ in range(depth):
+                        layers.extend([nn.Linear(last_dim, hid), nn.Tanh()])
+                        last_dim = hid
+                    return nn.Sequential(*layers)
+
+                def mlp_head(input_dim: int, output_dim: int) -> nn.Sequential:
+                    layers = []
+                    last_dim = int(input_dim)
+                    for _ in range(max(1, depth - 1)):
+                        layers.extend([nn.Linear(last_dim, hid), nn.Tanh()])
+                        last_dim = hid
+                    layers.append(nn.Linear(last_dim, int(output_dim)))
+                    return nn.Sequential(*layers)
+
+                self.body = mlp_body(obs_dim)
                 self.actor = nn.Linear(hid, action_dim)
-                self.candidate_actor = nn.Sequential(nn.Linear(hid + cand_dim, hid), nn.Tanh(), nn.Linear(hid, 1))
-                self.candidate_compute_actor = nn.Sequential(
-                    nn.Linear(hid + cand_dim, hid),
-                    nn.Tanh(),
-                    nn.Linear(hid, resource_action_dim),
-                )
-                self.candidate_bandwidth_actor = nn.Sequential(
-                    nn.Linear(hid + cand_dim, hid),
-                    nn.Tanh(),
-                    nn.Linear(hid, resource_action_dim),
-                )
-                self.critic_body = nn.Sequential(nn.Linear(critic_dim, hid), nn.Tanh(), nn.Linear(hid, hid), nn.Tanh())
+                self.candidate_actor = mlp_head(hid + cand_dim, 1)
+                self.candidate_compute_actor = mlp_head(hid + cand_dim, resource_action_dim)
+                self.candidate_bandwidth_actor = mlp_head(hid + cand_dim, resource_action_dim)
+                self.critic_body = mlp_body(critic_dim)
                 self.critic = nn.Linear(hid, 1)
                 self.hidden_dim = int(hid)
                 self.node_dim = int(node_dim)
@@ -939,36 +954,28 @@ class IPPOPolicy(BaseMARLPolicy):
                     self.register_buffer("prior_logit_scale_raw", prior_scale_raw.clone())
                 self.register_buffer("learned_logit_scale_init", learned_scale_init.clone())
                 self.register_buffer("prior_logit_scale_init", prior_scale_init.clone())
-                self.node_encoder = nn.Sequential(nn.Linear(node_dim, hid), nn.Tanh(), nn.Linear(hid, hid), nn.Tanh())
-                self.edge_encoder = nn.Sequential(nn.Linear(edge_dim, hid), nn.Tanh(), nn.Linear(hid, hid), nn.Tanh())
+                self.node_encoder = mlp_body(node_dim)
+                self.edge_encoder = mlp_body(edge_dim)
                 self.gnn_message_layers = nn.ModuleList(
                     [
-                        nn.Sequential(nn.Linear(hid * 3, hid), nn.Tanh(), nn.Linear(hid, hid), nn.Tanh())
-                        for _ in range(2)
+                        mlp_body(hid * 3)
+                        for _ in range(gnn_depth)
                     ]
                 )
                 self.gnn_update_layers = nn.ModuleList(
                     [
-                        nn.Sequential(nn.Linear(hid * 2, hid), nn.Tanh(), nn.Linear(hid, hid))
-                        for _ in range(2)
+                        mlp_head(hid * 2, hid)
+                        for _ in range(gnn_depth)
                     ]
                 )
-                self.gnn_norms = nn.ModuleList([nn.LayerNorm(hid) for _ in range(2)])
+                self.gnn_norms = nn.ModuleList([nn.LayerNorm(hid) for _ in range(gnn_depth)])
                 self.remote_attention = nn.MultiheadAttention(hid, num_heads=4, batch_first=True)
                 self.temporal_encoder = nn.Sequential(nn.Linear(temporal_dim, hid), nn.Tanh())
-                self.region_context = nn.Sequential(nn.Linear(hid * 4, hid), nn.Tanh(), nn.Linear(hid, hid), nn.Tanh())
-                self.region_candidate_actor = nn.Sequential(nn.Linear(hid + cand_dim, hid), nn.Tanh(), nn.Linear(hid, 1))
-                self.region_compute_actor = nn.Sequential(
-                    nn.Linear(hid + cand_dim, hid),
-                    nn.Tanh(),
-                    nn.Linear(hid, resource_action_dim),
-                )
-                self.region_bandwidth_actor = nn.Sequential(
-                    nn.Linear(hid + cand_dim, hid),
-                    nn.Tanh(),
-                    nn.Linear(hid, resource_action_dim),
-                )
-                self.region_critic_body = nn.Sequential(nn.Linear(hid * max_agents, hid), nn.Tanh(), nn.Linear(hid, hid), nn.Tanh())
+                self.region_context = mlp_body(hid * 4)
+                self.region_candidate_actor = mlp_head(hid + cand_dim, 1)
+                self.region_compute_actor = mlp_head(hid + cand_dim, resource_action_dim)
+                self.region_bandwidth_actor = mlp_head(hid + cand_dim, resource_action_dim)
+                self.region_critic_body = mlp_body(hid * max_agents)
                 self.region_critic = nn.Linear(hid, 1)
 
             def forward(self, x):
@@ -1187,6 +1194,8 @@ class IPPOPolicy(BaseMARLPolicy):
             self.temporal_feature_dim,
             self.max_critic_agents,
             RESOURCE_ACTION_DIM,
+            self.mlp_depth,
+            self.gnn_layers,
             prior_init,
             self.learnable_prior,
             self.learned_logit_scale,
@@ -1194,6 +1203,60 @@ class IPPOPolicy(BaseMARLPolicy):
             self.learnable_logit_blend,
         ).to(self.device)
         self.optimizer = optim.Adam(list(self.model.parameters()), lr=float(lr))
+
+    @staticmethod
+    def _dedupe_parameters(parameters: Sequence[Any]) -> List[Any]:
+        unique = []
+        seen = set()
+        for parameter in parameters:
+            if parameter is None:
+                continue
+            key = id(parameter)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(parameter)
+        return unique
+
+    def actor_head_parameters(self) -> List[Any]:
+        modules = [
+            "actor",
+            "candidate_actor",
+            "candidate_compute_actor",
+            "candidate_bandwidth_actor",
+            "region_candidate_actor",
+            "region_compute_actor",
+            "region_bandwidth_actor",
+        ]
+        parameters: List[Any] = []
+        for name in modules:
+            module = getattr(self.model, name, None)
+            if module is not None:
+                parameters.extend(list(module.parameters()))
+        for name in ("prior_feature_weights", "learned_logit_scale_raw", "prior_logit_scale_raw"):
+            value = getattr(self.model, name, None)
+            if hasattr(value, "requires_grad") and bool(value.requires_grad):
+                parameters.append(value)
+        return self._dedupe_parameters(parameters)
+
+    def shared_encoder_parameters(self) -> List[Any]:
+        modules = [
+            "body",
+            "node_encoder",
+            "edge_encoder",
+            "gnn_message_layers",
+            "gnn_update_layers",
+            "gnn_norms",
+            "remote_attention",
+            "temporal_encoder",
+            "region_context",
+        ]
+        parameters: List[Any] = []
+        for name in modules:
+            module = getattr(self.model, name, None)
+            if module is not None:
+                parameters.extend(list(module.parameters()))
+        return self._dedupe_parameters(parameters)
 
     def act(self, observations: Mapping[str, Mapping[str, Any]], deterministic: bool = False) -> Dict[str, Dict[str, Dict[str, str]]]:
         return self.act_with_logprobs(observations, deterministic=deterministic).actions
@@ -1445,6 +1508,8 @@ class IPPOPolicy(BaseMARLPolicy):
             learned_scores = self.model.region_candidate_logits(obs_tensor, features)
         else:
             learned_scores = self.model.candidate_logits(obs_tensor, features)
+        if not self.action_prior_enabled:
+            return learned_scores
         prior_scores = self._candidate_prior_logits(candidate_set, mask_len, learned_scores)
         return self.model.blend_candidate_logits(learned_scores, prior_scores)
 
@@ -1530,6 +1595,7 @@ class IPPOPolicy(BaseMARLPolicy):
         weights = self.model.prior_feature_weights.detach().cpu().tolist()
         init = self.model.prior_feature_init.detach().cpu().tolist()
         snapshot = {
+            "action_prior_enabled": bool(self.action_prior_enabled),
             "names": names,
             "initial": [float(item) for item in init],
             "learned": [float(item) for item in weights],
@@ -1699,7 +1765,7 @@ class IPPOPolicy(BaseMARLPolicy):
 
     @staticmethod
     def _chosen_action(actions: Mapping[str, Any], agent_id: str, sfc_id: str, sfc_node_id: str) -> Optional[str]:
-        chosen = IPPOPolicy._chosen_action_payload(actions, agent_id, sfc_id, sfc_node_id)
+        chosen = CandidateActorPolicy._chosen_action_payload(actions, agent_id, sfc_id, sfc_node_id)
         instance_id = _action_instance_id(chosen)
         return instance_id if instance_id else None
 
@@ -1760,14 +1826,15 @@ class IPPOPolicy(BaseMARLPolicy):
         return padded
 
 
-class MASACPolicy(IPPOPolicy):
+class IPPOPolicy(CandidateActorPolicy):
+    """On-policy PPO candidate actor-critic policy."""
+
+
+class MASACPolicy(CandidateActorPolicy):
     """Discrete-action MASAC policy for CTDE service-function placement.
 
-    The actor is inherited from ``IPPOPolicy`` because the decentralized
-    execution surface is already correct: each region chooses among its local
-    candidate IDs.  Training is changed to off-policy discrete SAC with twin
-    centralized Q critics over global region context, local region context, and
-    candidate features.
+    MASAC uses the same decentralized candidate-action surface as PPO, but it
+    owns its SAC actor optimizer and twin centralized Q critics separately.
     """
 
     def __init__(
@@ -1782,10 +1849,14 @@ class MASACPolicy(IPPOPolicy):
         alpha_min: float = 0.005,
         alpha_max: float = 0.25,
         tau: float = 0.005,
+        q_mlp_depth: int = 3,
         **kwargs: Any,
     ):
         super().__init__(*args, **kwargs)
+        if not self.use_region_encoder:
+            raise ValueError("MASACPolicy requires the region encoder so SAC actor and critics share learned context features.")
         self.tau = float(tau)
+        self.q_mlp_depth = max(1, int(q_mlp_depth))
         self.auto_alpha = bool(auto_alpha)
         self.alpha_min = max(1e-8, float(alpha_min))
         self.alpha_max = max(self.alpha_min, float(alpha_max))
@@ -1796,7 +1867,7 @@ class MASACPolicy(IPPOPolicy):
         self.log_alpha = self.nn.Parameter(
             self.torch.tensor(math.log(self.fixed_alpha), dtype=self.torch.float32, device=self.device)
         )
-        hidden_dim = int(getattr(self.model, "hidden_dim", 128))
+        hidden_dim = int(getattr(self.model, "hidden_dim"))
         q_context_dim = hidden_dim * self.max_critic_agents + hidden_dim
         candidate_q_input_dim = q_context_dim + self.candidate_feature_dim
         self.q1 = self.nn.ModuleDict(
@@ -1819,31 +1890,29 @@ class MASACPolicy(IPPOPolicy):
             module.eval()
             for parameter in module.parameters():
                 parameter.requires_grad_(False)
-        self.q_optimizer = self.torch.optim.Adam(
-            list(self.q1.parameters()) + list(self.q2.parameters()),
-            lr=float(q_lr if q_lr is not None else kwargs.get("lr", 3e-4)),
-        )
+        self.optimizer = self.torch.optim.Adam(self.actor_head_parameters(), lr=float(kwargs.get("lr", 3e-4)))
+        self.q_optimizer = self.torch.optim.Adam(self.q_train_parameters(), lr=float(q_lr if q_lr is not None else kwargs.get("lr", 3e-4)))
         self.alpha_optimizer = (
             self.torch.optim.Adam([self.log_alpha], lr=float(self.alpha_lr)) if self.auto_alpha else None
         )
 
+    def q_train_parameters(self) -> List[Any]:
+        return self._dedupe_parameters(list(self.q1.parameters()) + list(self.q2.parameters()) + self.shared_encoder_parameters())
+
     def _build_q_network(self, input_dim: int, hidden_dim: int) -> Any:
-        return self.nn.Sequential(
-            self.nn.Linear(int(input_dim), int(hidden_dim)),
-            self.nn.ReLU(),
-            self.nn.Linear(int(hidden_dim), int(hidden_dim)),
-            self.nn.ReLU(),
-            self.nn.Linear(int(hidden_dim), 1),
-        )
+        return self._build_q_head(input_dim, hidden_dim, 1)
 
     def _build_q_vector_network(self, input_dim: int, hidden_dim: int, output_dim: int) -> Any:
-        return self.nn.Sequential(
-            self.nn.Linear(int(input_dim), int(hidden_dim)),
-            self.nn.ReLU(),
-            self.nn.Linear(int(hidden_dim), int(hidden_dim)),
-            self.nn.ReLU(),
-            self.nn.Linear(int(hidden_dim), int(output_dim)),
-        )
+        return self._build_q_head(input_dim, hidden_dim, output_dim)
+
+    def _build_q_head(self, input_dim: int, hidden_dim: int, output_dim: int) -> Any:
+        layers = []
+        last_dim = int(input_dim)
+        for _ in range(max(1, int(self.q_mlp_depth))):
+            layers.extend([self.nn.Linear(last_dim, int(hidden_dim)), self.nn.ReLU()])
+            last_dim = int(hidden_dim)
+        layers.append(self.nn.Linear(last_dim, int(output_dim)))
+        return self.nn.Sequential(*layers)
 
     @property
     def alpha_tensor(self) -> Any:
@@ -1854,10 +1923,11 @@ class MASACPolicy(IPPOPolicy):
     def _alpha_log_bounds(self) -> Tuple[float, float]:
         return math.log(self.alpha_min), math.log(self.alpha_max)
 
-    def _target_entropy_for_count(self, candidate_count: int) -> float:
+    def _target_entropy_for_action_dims(self, candidate_count: int, compute_count: int, bandwidth_count: int) -> float:
         if self.target_entropy is not None:
             return float(self.target_entropy)
-        return float(self.target_entropy_scale) * math.log(max(2, int(candidate_count)))
+        action_dim_sum = max(2, int(candidate_count) + int(compute_count) + int(bandwidth_count))
+        return float(self.target_entropy_scale) * math.log(action_dim_sum)
 
     def update_alpha(self, entropy: Any, target_entropy: Any) -> Any:
         zero = self.torch.tensor(0.0, dtype=self.torch.float32, device=self.device)
@@ -1939,7 +2009,7 @@ class MASACPolicy(IPPOPolicy):
     ) -> Optional[Dict[str, Any]]:
         q1_values: List[Any] = []
         q2_values: List[Any] = []
-        bundle, global_context = self._masac_context_bundle(observations)
+        bundle, global_context = self._masac_context_bundle(observations, detach_encoder=detach_encoder)
         for agent_id, observation in observations.items():
             agent_key = str(agent_id)
             if agent_key not in bundle:
@@ -2030,7 +2100,7 @@ class MASACPolicy(IPPOPolicy):
         entropies: List[Any] = []
         target_entropies: List[Any] = []
         alpha = self.alpha_tensor.detach()
-        for item in self._masac_candidate_items(observations, target=False, detach_encoder=False):
+        for item in self._masac_candidate_items(observations, target=False, detach_encoder=True):
             joint = self._masac_joint_distribution(item)
             q1, q2 = self._masac_joint_q_values(
                 item["global_context"],
@@ -2044,7 +2114,11 @@ class MASACPolicy(IPPOPolicy):
             entropies.append(-(joint["probs"] * joint["log_probs"]).sum())
             target_entropies.append(
                 self.torch.tensor(
-                    self._target_entropy_for_count(int(joint["log_probs"].numel())),
+                    self._target_entropy_for_action_dims(
+                        int(item["logits"].numel()),
+                        int(item["compute_logits"].shape[-1]),
+                        int(item["bandwidth_logits"].shape[-1]),
+                    ),
                     dtype=self.torch.float32,
                     device=self.device,
                 )
@@ -2066,7 +2140,7 @@ class MASACPolicy(IPPOPolicy):
         detach_encoder: bool = False,
     ) -> List[Dict[str, Any]]:
         items_out: List[Dict[str, Any]] = []
-        bundle, global_context = self._masac_context_bundle(observations)
+        bundle, global_context = self._masac_context_bundle(observations, detach_encoder=detach_encoder)
         for agent_id, observation in observations.items():
             agent_key = str(agent_id)
             if agent_key not in bundle:
@@ -2117,13 +2191,18 @@ class MASACPolicy(IPPOPolicy):
                             remaining_deadline_s = _consume_deadline_budget(remaining_deadline_s, chosen_candidate)
         return items_out
 
-    def _masac_context_bundle(self, observations: Mapping[str, Mapping[str, Any]]) -> Tuple[Dict[str, Tuple[Any, Any, Any]], Any]:
+    def _masac_context_bundle(
+        self,
+        observations: Mapping[str, Mapping[str, Any]],
+        detach_encoder: bool = False,
+    ) -> Tuple[Dict[str, Tuple[Any, Any, Any]], Any]:
         bundle: Dict[str, Tuple[Any, Any, Any]] = {}
         local_contexts: List[Any] = []
         for agent_id in sorted(str(item) for item in observations):
             observation = observations.get(agent_id, {})
             if self.use_region_encoder:
-                actor_input = self.model.region_context_tensor(observation, self.device)
+                encoded_context = self.model.region_context_tensor(observation, self.device)
+                actor_input = encoded_context.detach() if detach_encoder else encoded_context
                 base_logits = None
                 local_context = actor_input
             else:
@@ -2137,7 +2216,7 @@ class MASACPolicy(IPPOPolicy):
             bundle[agent_id] = (actor_input, base_logits, local_context)
             if len(local_contexts) < self.max_critic_agents:
                 local_contexts.append(local_context.reshape(-1))
-        hidden_dim = int(getattr(self.model, "hidden_dim", 128))
+        hidden_dim = int(getattr(self.model, "hidden_dim"))
         while len(local_contexts) < self.max_critic_agents:
             local_contexts.append(self.torch.zeros((hidden_dim,), dtype=self.torch.float32, device=self.device))
         return bundle, self.torch.cat(local_contexts[: self.max_critic_agents], dim=-1)

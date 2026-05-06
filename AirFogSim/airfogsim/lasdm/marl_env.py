@@ -411,27 +411,9 @@ class SemanticTopologyMARLEnv:
             offset = 0.0
         return self._episode_start_time + offset
 
-    def _max_active_sfcs(self) -> int:
-        values: List[int] = []
-        for chain in self.chains:
-            context = dict(getattr(chain, "context", {}) or {})
-            raw = context.get("max_concurrent_sfcs")
-            if raw is None:
-                continue
-            try:
-                value = int(float(raw))
-            except (TypeError, ValueError):
-                continue
-            if value > 0:
-                values.append(value)
-        return min(values) if values else 0
-
     def _submit_due_chains(self, current_time: float) -> List[str]:
         submitted: List[str] = []
-        max_active = self._max_active_sfcs()
         while self._pending_chain_ids:
-            if max_active > 0 and self._active_chain_count() >= max_active:
-                break
             sfc_id = self._pending_chain_ids[0]
             if self._arrival_times.get(sfc_id, self._episode_start_time) > float(current_time) + 1e-9:
                 break
@@ -442,9 +424,6 @@ class SemanticTopologyMARLEnv:
             self.manager.submit(chain, current_time=current_time)
             submitted.append(sfc_id)
         return submitted
-
-    def _active_chain_count(self) -> int:
-        return sum(1 for chain in self.manager.chains.values() if chain.status == GraphStatus.RUNNING)
 
     def _submitted_runtime_chains(self) -> List[LASDMServiceChain]:
         return list(self.manager.chains.values())
@@ -461,6 +440,9 @@ class SemanticTopologyMARLEnv:
         lifecycle = getattr(self.runtime_bridge, "runtime_task_lifecycle_trace", None)
         if lifecycle is not None:
             _write_csv(target / "runtime_task_lifecycle_trace.csv", lifecycle)
+        runtime_manifest = getattr(self.env_adapter, "runtime_manifest", None)
+        if runtime_manifest is not None:
+            _write_json(target / "runtime_run_manifest.json", runtime_manifest)
         _write_json(target / "semantic_encoder_manifest.json", self._semantic_encoder_manifest())
 
     def _build_default_discovery_protocol(self) -> DistributedServiceDiscoveryProtocol:
@@ -881,10 +863,9 @@ class SemanticTopologyMARLEnv:
         fields["chain_deadline_s"] = deadline_s
         fields["chain_elapsed_s"] = elapsed_s
         fields["chain_remaining_deadline_s"] = remaining_deadline_s
-        fields["scenario_request_count"] = max(1.0, float(chain_context.get("request_count", 1.0) or 1.0))
-        fields["scenario_max_concurrent_sfcs"] = max(
+        fields["scenario_generated_sfc_count"] = max(
             1.0,
-            float(chain_context.get("max_concurrent_sfcs", 1.0) or 1.0),
+            float(chain_context.get("generated_sfc_count", 1.0) or 1.0),
         )
         fields["scenario_arrival_rate_sfc_per_s"] = max(
             1e-6,
@@ -1478,7 +1459,6 @@ def _reward_aux_from_decisions(decisions: Sequence[LASDMDecision]) -> Dict[str, 
     resource_available_ratios = []
     remaining_deadline_ratios = []
     function_budgets = []
-    scenario_concurrency_values = []
     semantic_group_counts: Dict[str, int] = {}
     route_unavailable = 0
     for item in selected:
@@ -1501,7 +1481,6 @@ def _reward_aux_from_decisions(decisions: Sequence[LASDMDecision]) -> Dict[str, 
         deadline_slacks.append(_to_float(metadata.get("deadline_slack_s"), 0.0))
         utility_priors.append(_to_float(metadata.get("utility_prior"), 0.0))
         function_budgets.append(_to_float(metadata.get("function_budget_s"), 0.0))
-        scenario_concurrency_values.append(_to_float(metadata.get("scenario_max_concurrent_sfcs"), 0.0))
         route_tx_times.append(_to_float(metadata.get("route_tx_time_s"), 0.0))
         rb_waits.append(_to_float(metadata.get("expected_rb_wait_s"), 0.0))
         wireless_pressures.append(_to_float(metadata.get("wireless_pressure"), 0.0))
@@ -1544,7 +1523,7 @@ def _reward_aux_from_decisions(decisions: Sequence[LASDMDecision]) -> Dict[str, 
         "selected_semantic_cumulative_quality_mean": _mean(semantic_cumulative_qualities),
         "reward_time_scale_s": max(1.0, _mean(function_budgets)),
         "reward_route_hop_scale": 4.0,
-        "reward_wireless_pressure_scale": max(1.0, _mean(scenario_concurrency_values) / 8.0),
+        "reward_wireless_pressure_scale": 1.0,
     }
     for group, count in semantic_group_counts.items():
         key = "".join(char if char.isalnum() else "_" for char in group.lower()).strip("_") or "unknown"

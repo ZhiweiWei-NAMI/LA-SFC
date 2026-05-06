@@ -412,6 +412,7 @@ def train_semantic_ippo_runtime(
         sac_batch_size = int(marl_cfg.get("masac_batch_size", 128) or 128)
         sac_replay_warmup_steps = int(marl_cfg.get("masac_replay_warmup_steps", 128) or 128)
         sac_update_interval = max(1, int(marl_cfg.get("masac_update_interval", 1) or 1))
+        sac_actor_update_interval = max(1, int(marl_cfg.get("masac_actor_update_interval", 2) or 2))
         sac_updates_per_env_step = int(marl_cfg.get("masac_updates_per_env_step", 1) or 1)
         sac_tau = float(marl_cfg.get("masac_tau", 0.005) or 0.005)
         sac_auto_alpha = bool(marl_cfg.get("masac_auto_alpha", False))
@@ -493,6 +494,7 @@ def train_semantic_ippo_runtime(
                         alpha_min=sac_alpha_min,
                         alpha_max=sac_alpha_max,
                         tau=sac_tau,
+                        q_mlp_depth=int(marl_cfg.get("masac_q_mlp_depth", 3) or 3),
                     )
                     _append_runtime_debug_event(
                         debug_path,
@@ -543,6 +545,7 @@ def train_semantic_ippo_runtime(
                         )
                     )
                     if len(replay_buffer) >= max(1, sac_replay_warmup_steps) and len(replay_buffer) % sac_update_interval == 0:
+                        next_update_index = sac_update_index + 1
                         _append_runtime_debug_event(
                             debug_path,
                             "sac_update_start",
@@ -551,7 +554,8 @@ def train_semantic_ippo_runtime(
                             episode=int(episode),
                             step=int(step),
                             replay_size=len(replay_buffer),
-                            update_index=int(sac_update_index + 1),
+                            update_index=int(next_update_index),
+                            update_actor=bool(next_update_index % sac_actor_update_interval == 0),
                         )
                         metrics = masac_update_policy(
                             policy,
@@ -563,7 +567,7 @@ def train_semantic_ippo_runtime(
                             max_grad_norm=max_grad_norm,
                             reward_scale=sac_reward_scale,
                             sample_strategy=sac_replay_sample_strategy,
-                            update_actor=True,
+                            update_actor=bool(next_update_index % sac_actor_update_interval == 0),
                         )
                         _append_runtime_debug_event(
                             debug_path,
@@ -573,7 +577,7 @@ def train_semantic_ippo_runtime(
                             episode=int(episode),
                             step=int(step),
                             replay_size=len(replay_buffer),
-                            update_index=int(sac_update_index + 1),
+                            update_index=int(next_update_index),
                             metric_count=len(metrics or {}),
                         )
                         if metrics:
@@ -828,6 +832,7 @@ def train_semantic_ippo_runtime(
             "masac_replay_size": len(replay_buffer),
             "masac_batch_size": sac_batch_size,
             "masac_update_interval": sac_update_interval,
+            "masac_actor_update_interval": sac_actor_update_interval,
             "masac_alpha": float(marl_cfg.get("masac_alpha", 0.05) or 0.05),
             "masac_auto_alpha": sac_auto_alpha,
             "masac_alpha_lr": sac_alpha_lr,
@@ -1209,6 +1214,7 @@ def _semantic_policy_for_eval(
             alpha_min=float(marl_cfg.get("masac_alpha_min", 0.005) or 0.005),
             alpha_max=float(marl_cfg.get("masac_alpha_max", 0.25) or 0.25),
             tau=float(marl_cfg.get("masac_tau", 0.005) or 0.005),
+            q_mlp_depth=int(marl_cfg.get("masac_q_mlp_depth", 3) or 3),
         )
         strict = _checkpoint_has_critic_body(actor_state)
         policy.load_sac_state_dict(state, strict=strict)
@@ -1687,7 +1693,7 @@ def _ippo_policy_kwargs(
         "candidate_feature_dim": int(candidate_feature_dim),
         "seed": int(seed),
         "lr": float(marl_cfg.get("ippo_lr", 3e-4) or 3e-4),
-        "utility_prior_logit_weight": float(marl_cfg.get("ippo_utility_prior_logit_weight", 2.5) or 2.5),
+        "utility_prior_logit_weight": _config_float(marl_cfg, "ippo_utility_prior_logit_weight", 2.5),
         "route_unavailable_penalty": float(marl_cfg.get("ippo_route_unavailable_penalty", 20.0) or 20.0),
         "include_semantic_features": bool(marl_cfg.get("include_semantic_features", True)),
         "include_topology_features": bool(marl_cfg.get("include_topology_features", True)),
@@ -1701,12 +1707,22 @@ def _ippo_policy_kwargs(
         "learned_logit_scale": float(
             marl_cfg.get("ippo_learned_logit_scale_init", marl_cfg.get("ippo_learned_logit_scale", 1.0)) or 1.0
         ),
-        "prior_logit_scale": float(
-            marl_cfg.get("ippo_prior_logit_scale_init", marl_cfg.get("ippo_prior_logit_scale", 1.0)) or 1.0
+        "prior_logit_scale": _config_float(
+            marl_cfg,
+            "ippo_prior_logit_scale_init",
+            _config_float(marl_cfg, "ippo_prior_logit_scale", 1.0),
         ),
         "learnable_logit_blend": bool(marl_cfg.get("ippo_learnable_logit_blend", False)),
+        "action_prior_enabled": bool(marl_cfg.get("ippo_action_prior_enabled", True)),
         "device": device or None,
     }
+
+
+def _config_float(config: Mapping[str, Any], key: str, default: float) -> float:
+    value = config.get(key, default)
+    if value is None or value == "":
+        return float(default)
+    return float(value)
 
 
 def _checkpoint_observation_dim(state: Mapping[str, Any]) -> Optional[int]:

@@ -14,7 +14,7 @@ LASDM_TO_TASK_FIELD_MAPPING = {
     "LASDMServiceChain.payload_mb": "Task.task_size",
     "LASDMSFCNode.metadata.cpu_per_mb * input_payload_mb": "Task.task_cpu",
     "LASDMSFCNode.cpu_mb": "Task.task_cpu",
-    "LASDMQoS.deadline_s": "Task.task_deadline",
+    "LASDMQoS.deadline_s - elapsed_s": "Task.task_deadline",
     "LASDMQoS.priority": "Task.task_priority",
     "LASDMSFCNode.output_payload_mb": "Task.required_returned_size",
     "LASDMServiceChain.sink_node_id": "Task.to_return_node_id",
@@ -230,23 +230,10 @@ class LASDMTaskAdapter:
         current_time: float,
         qos: Any,
     ) -> float:
-        graph_deadline = max(0.1, float(qos.deadline_s))
-        context = dict(chain.context or {})
-        if not bool(context.get("per_function_task_deadline_enabled", False)):
-            return graph_deadline
-
+        graph_deadline = max(0.0, float(qos.deadline_s))
         submit_time = float(chain.submit_time) if chain.submit_time is not None else float(current_time)
         elapsed_s = max(0.0, float(current_time) - submit_time)
-        remaining_deadline_s = max(0.0, graph_deadline - elapsed_s)
-        order = list(chain.topological_order())
-        remaining_count = max(1, len(order))
-        if sfc_node_id in order:
-            remaining_count = max(1, len(order) - order.index(sfc_node_id))
-        base_budget_s = remaining_deadline_s / remaining_count if remaining_deadline_s > 0.0 else graph_deadline / remaining_count
-        multiplier = max(0.1, float(context.get("per_function_task_deadline_multiplier", 1.0) or 1.0))
-        min_deadline_s = max(0.1, float(context.get("per_function_task_deadline_min_s", 1.0) or 1.0))
-        max_deadline_s = max(min_deadline_s, float(context.get("per_function_task_deadline_max_s", graph_deadline) or graph_deadline))
-        return max(min_deadline_s, min(graph_deadline, max_deadline_s, base_budget_s * multiplier))
+        return max(1e-6, graph_deadline - elapsed_s)
 
 
 def build_lasdm_task(

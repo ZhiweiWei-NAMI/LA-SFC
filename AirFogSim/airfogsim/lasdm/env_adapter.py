@@ -63,6 +63,7 @@ class LASDMEnvAdapter:
         self.last_offloading_diagnostics: Dict[str, Dict[str, Any]] = {}
         self.last_wireless_diagnostics: Dict[str, Dict[str, Any]] = {}
         self.last_wireless_allocations: Dict[str, List[int]] = {}
+        self.runtime_manifest: Dict[str, Any] = {}
 
     def sync_from_env(self, env: Any, current_time: Optional[float] = None) -> Dict[str, Any]:
         """Synchronize AirFogSim node/task/link state into LASDM service-instance metadata."""
@@ -767,8 +768,27 @@ class LASDMEnvAdapter:
             if high < low:
                 high = low
             rng = random.Random(int(self.seed if self.seed is not None else 0) * 1000003 + 73037)
-            traffic["replay_start_time_s"] = low if high <= low else rng.uniform(low, high)
+            replay_start_time_s = low if high <= low else rng.uniform(low, high)
+            traffic["replay_start_time_s"] = replay_start_time_s
             traffic["replay_hold_last"] = bool(segment_cfg.get("hold_last", True))
+            self.runtime_manifest.update(
+                {
+                    "seed": int(self.seed if self.seed is not None else 0),
+                    "scenario": str(scenario.get("name", "")),
+                    "trajectory_segment_sampling_enabled": True,
+                    "trajectory_replay_start_time_s": float(replay_start_time_s),
+                    "trajectory_start_range_s": [float(low), float(high)],
+                    "trajectory_replay_hold_last": bool(traffic["replay_hold_last"]),
+                }
+            )
+        else:
+            self.runtime_manifest.update(
+                {
+                    "seed": int(self.seed if self.seed is not None else 0),
+                    "scenario": str(scenario.get("name", "")),
+                    "trajectory_segment_sampling_enabled": False,
+                }
+            )
         if mobility.get("enabled"):
             if mobility.get("uav_speed_scale") is not None:
                 traffic["uav_speed_scale"] = float(mobility["uav_speed_scale"])
@@ -945,6 +965,7 @@ class LASDMEnvAdapter:
         return float(getattr(env, "simulation_time", 0.0)) >= max_time
 
     def _set_seed(self, seed: int) -> None:
+        self.runtime_manifest["seed"] = int(seed)
         random.seed(seed)
         try:
             import numpy as np

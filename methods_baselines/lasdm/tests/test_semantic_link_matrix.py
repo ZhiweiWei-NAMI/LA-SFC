@@ -14,6 +14,8 @@ for path in (AIRFOGSIM_ROOT, METHOD_ROOT):
         sys.path.insert(0, path)
 
 from airfogsim.lasdm.marl_policy import policy_from_name  # noqa: E402
+from airfogsim.lasdm.distributed_catalog import CatalogCandidate  # noqa: E402
+from airfogsim.lasdm.graph_observation import GraphObservationBuilder, GraphObservationConfig  # noqa: E402
 from airfogsim.lasdm.semantic_link_matrix import SemanticLinkMatrix  # noqa: E402
 from airfogsim.lasdm.semantic_link_predictor import SemanticLinkScorer  # noqa: E402
 from evaluate_semantic_topology_marl import IPPO_BASELINE_CONFIG_UPDATES, _baseline_settings  # noqa: E402
@@ -21,11 +23,32 @@ from train_semantic_topology_marl import (  # noqa: E402
     _materialize_offline_config,
     _materialized_node_id,
     _materialized_service_instances,
+    _scenario_chains,
     inject_semantic_topology_decoys,
 )
 
 
 SEMANTIC_ROOT = os.path.join(METHOD_ROOT, "configs", "semantic")
+
+
+def _minimal_chain_config() -> dict:
+    return {
+        "service_chains": [
+            {
+                "sfc_id": "sfc_unit",
+                "source_node_id": "vehicle_0",
+                "sink_node_id": "vehicle_0",
+                "payload_semantic": "video",
+                "payload_mb": 1.0,
+                "qos": {"deadline_s": 5.0},
+                "nodes": [
+                    {"node_id": "n0", "service_type": "detect"},
+                ],
+                "edges": [],
+                "context": {},
+            }
+        ]
+    }
 
 
 def _matrix() -> SemanticLinkMatrix:
@@ -66,6 +89,7 @@ class SemanticLinkMatrixTests(unittest.TestCase):
         scenario = {
             "name": "unit_truth_decoy",
             "service_nodes": {"rsu": 1, "cloud_server": 1},
+            "load_multiplier": 1.0,
             "candidate_decoys": {
                 "enabled": True,
                 "hard_negative_mismatch": 1,
@@ -123,8 +147,10 @@ class SemanticLinkMatrixTests(unittest.TestCase):
             scenario = {
                 "name": "unit_materialize",
                 "service_nodes": {"rsu": 1},
-                "task_nodes": {"uav": 1},
-                "request_count": 1,
+                "task_nodes": {"uav": 4},
+                "arrival_process": "per_task_node_poisson",
+                "arrival_horizon_s": 5.0,
+                "per_task_node_arrival_interval_s": 0.5,
             }
 
             materialized = _materialize_offline_config(config, scenario, "rsu_only", seed=11)
@@ -144,6 +170,34 @@ class SemanticLinkMatrixTests(unittest.TestCase):
 
     def test_cloud_server_materialized_node_id_matches_physical_config(self):
         self.assertEqual(_materialized_node_id("cloud_server", 0), "cloudServer_0")
+
+    def test_legacy_fixed_count_arrival_config_fails_fast(self):
+        scenario = {
+            "name": "legacy_fixed_count",
+            "task_nodes": {"vehicle": 2},
+            "arrival_horizon_s": 5.0,
+            "request_count": 10,
+        }
+
+        with self.assertRaisesRegex(ValueError, "per-task-node Poisson"):
+            _scenario_chains(_minimal_chain_config(), scenario, "full_hybrid", seed=0)
+
+    def test_per_task_node_poisson_reuses_physical_vehicle_entities(self):
+        scenario = {
+            "name": "per_node_arrivals",
+            "task_nodes": {"vehicle": 120},
+            "arrival_horizon_s": 5.0,
+            "per_task_node_arrival_interval_s": 0.2,
+        }
+
+        chains = _scenario_chains(_minimal_chain_config(), scenario, "full_hybrid", seed=0)
+        by_source = {}
+        for chain in chains:
+            by_source.setdefault(chain["source_node_id"], set()).add(chain["context"]["logical_task_node_id"])
+
+        self.assertIn("vehicle_0", by_source)
+        self.assertIn("vehicle_task_0", by_source["vehicle_0"])
+        self.assertIn("vehicle_task_100", by_source["vehicle_0"])
 
 class SemanticBaselinePolicyTests(unittest.TestCase):
     def test_removed_semantic_greedy_names_fail_fast(self):
@@ -217,6 +271,73 @@ class SemanticBaselinePolicyTests(unittest.TestCase):
         self.assertIn("marl_no_semantic", IPPO_BASELINE_CONFIG_UPDATES)
         self.assertIn("marl_semantic_no_topology", IPPO_BASELINE_CONFIG_UPDATES)
         self.assertNotIn("semantic_greedy_no_exchange", IPPO_BASELINE_CONFIG_UPDATES)
+
+    def test_learned_ablation_labels_have_heuristic_smoke_counterparts(self):
+        self.assertEqual(_baseline_settings("proposed_semantic_topology_marl")[0], "topology_greedy")
+        self.assertEqual(_baseline_settings("marl_no_exchange")[0], "topology_greedy")
+        self.assertEqual(_baseline_settings("marl_no_semantic")[0], "marl_no_semantic")
+        self.assertEqual(_baseline_settings("marl_semantic_no_topology")[0], "marl_semantic_no_topology")
+
+    def test_no_semantic_observation_removes_score_and_order_leakage(self):
+        bad_semantic_first = CatalogCandidate(
+            instance_id="semantic_high_runtime_bad",
+            service_id="detect",
+            node_id="RSU_1",
+            region_id="RSU_1",
+            node_type="rsu",
+            source="local",
+            owner_agent_id="RSU_1",
+            semantic_score=0.99,
+            staleness_s=0.0,
+            is_remote=False,
+            metadata={
+                "route_available": 0.0,
+                "expected_runtime_penalty_no_semantic_s": 5.0,
+                "deadline_slack_s": -4.0,
+                "topology_risk": 1.0,
+                "resource_available_ratio": 0.1,
+            },
+        )
+        good_runtime_second = CatalogCandidate(
+            instance_id="semantic_mid_runtime_good",
+            service_id="detect",
+            node_id="RSU_0",
+            region_id="RSU_0",
+            node_type="rsu",
+            source="local",
+            owner_agent_id="RSU_0",
+            semantic_score=0.74,
+            staleness_s=0.0,
+            is_remote=False,
+            metadata={
+                "route_available": 1.0,
+                "expected_runtime_penalty_no_semantic_s": 0.1,
+                "deadline_slack_s": 2.0,
+                "topology_risk": 0.0,
+                "resource_available_ratio": 1.0,
+            },
+        )
+        builder = GraphObservationBuilder(
+            GraphObservationConfig(
+                include_semantic_features=False,
+                include_topology_features=True,
+                include_temporal_features=True,
+                max_candidates=2,
+            )
+        )
+
+        encoded = builder._encode_candidate_set(
+            {
+                "agent_id": "RSU_0",
+                "sfc_id": "sfc0",
+                "sfc_node_id": "node0",
+                "candidates": [bad_semantic_first, good_runtime_second],
+            }
+        )
+
+        self.assertEqual(encoded["candidate_ids"], ["semantic_mid_runtime_good", "semantic_high_runtime_bad"])
+        self.assertEqual(float(encoded["candidate_features"][0][0]), 0.0)
+        self.assertEqual(float(encoded["candidate_features"][1][0]), 0.0)
 
 
 if __name__ == "__main__":

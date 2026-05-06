@@ -20,11 +20,11 @@ runtime_repair:
 
 runtime:
   warmup_steps: 5
-  max_steps: 200
+  max_steps: 100
   step_interval_s: 0.1
   airfogsim_config_overrides:
     simulation:
-      max_simulation_time: 20
+      max_simulation_time: 10
       simulation_interval: 0.1
       traffic_interval: 0.1
     traffic:
@@ -32,8 +32,8 @@ runtime:
     authentication:
       malicious_ratio: 0.0
     task:
-      tti_threshold: 2.0
-      hard_ddl: 2.0
+      tti_threshold: 5.0
+      hard_ddl: 5.0
     fog_profile:
       vehicle:
         cpu: 12
@@ -57,8 +57,8 @@ runtime:
         storage: 100000
 
 training:
-  episodes: 100
-  max_steps: 200
+  episodes: 200
+  max_steps: 100
   train_seeds: [0, 1, 2, 3, 4]
   eval_seeds: [0, 1, 2, 3, 4]
 
@@ -79,14 +79,18 @@ marl:
   include_temporal_features: true
   ippo_centralized_critic: true
   ippo_use_region_encoder: true
-  ippo_learnable_prior: true
-  ippo_prior_l2_coef: 0.001
-  ippo_learnable_logit_blend: true
+  ippo_hidden_dim: 256
+  ippo_mlp_depth: 3
+  ippo_gnn_layers: 3
+  ippo_action_prior_enabled: false
+  ippo_learnable_prior: false
+  ippo_prior_l2_coef: 0.0
+  ippo_learnable_logit_blend: false
   ippo_learned_logit_scale_init: 2.0
-  ippo_prior_logit_scale_init: 0.25
+  ippo_prior_logit_scale_init: 0.0
   ippo_critic_agent_count: 4
   ippo_device: cuda
-  ippo_utility_prior_logit_weight: 3.0
+  ippo_utility_prior_logit_weight: 0.0
   ippo_route_unavailable_penalty: 20.0
   ippo_behavior_clone_pretrain_episodes: 0
   ippo_behavior_clone_finetune_steps_per_observation: 0
@@ -99,20 +103,22 @@ marl:
     - fraction: 0.40
       scenarios: [train_fig_service_nodes_20, train_fig_service_nodes_40, train_fig_service_nodes_60, train_fig_service_nodes_80]
     - fraction: 0.40
-      scenarios: [train_fig_request_count_15, train_fig_request_count_30, train_fig_request_count_45, train_fig_request_count_60, train_fig_request_count_75]
-  masac_gamma: 0.99
+      scenarios: [train_fig_task_nodes_20, train_fig_task_nodes_40, train_fig_task_nodes_60, train_fig_task_nodes_80]
+  masac_gamma: 0.90
   masac_alpha: 0.05
   masac_auto_alpha: true
-  masac_alpha_lr: 0.0001
-  masac_target_entropy_scale: 0.90
+  masac_alpha_lr: 0.005
+  masac_target_entropy_scale: 0.98
   masac_alpha_min: 0.005
   masac_alpha_max: 0.25
-  masac_tau: 0.005
-  masac_q_lr: 0.00015
-  masac_batch_size: 128
-  masac_replay_capacity: 20000
-  masac_replay_warmup_steps: 256
-  masac_update_interval: 4
+  masac_tau: 0.01
+  masac_q_lr: 0.005
+  masac_q_mlp_depth: 3
+  masac_batch_size: 512
+  masac_replay_capacity: 10000
+  masac_replay_warmup_steps: 1024
+  masac_update_interval: 50
+  masac_actor_update_interval: 2
   masac_updates_per_env_step: 1
   masac_max_grad_norm: 1.0
   masac_reward_scale: 1.0
@@ -122,7 +128,7 @@ marl:
   iql_updates_per_transition: 0.0
   iql_diagnostics_interval: 1
   iql_behavior_policy: topology_greedy
-  ippo_lr: 0.0002
+  ippo_lr: 0.005
   topology_greedy_load_penalty: 0.50
   topology_greedy_topology_risk_penalty: 1.40
   topology_greedy_mobility_risk_penalty: 1.80
@@ -147,23 +153,23 @@ marl:
     gs2l_quality_weight: 0.5
     gs2l_clip: 8.0
     route_unavailable: -2.0
-    deadline_slack: 0.08
-    semantic_score: 0.50
-    semantic_cumulative: 0.50
-    utility_prior: 1.80
-    stale_remote: -0.60
-    topology_risk: -0.55
-    mobility_risk: -0.35
-    cold_start: -0.06
-    runtime_penalty: -0.10
-    load_imbalance: -0.20
-    route_hops: -0.12
-    route_tx_time: -0.06
-    rb_wait: -0.04
-    wireless_pressure: -0.04
-    resource_available: 0.25
-    remaining_deadline: 0.30
-    dense_clip: 3.0
+    deadline_slack: 0.03
+    semantic_score: 0.15
+    semantic_cumulative: 0.15
+    utility_prior: 0.0
+    stale_remote: -0.20
+    topology_risk: -0.20
+    mobility_risk: -0.15
+    cold_start: -0.03
+    runtime_penalty: -0.05
+    load_imbalance: -0.10
+    route_hops: -0.05
+    route_tx_time: -0.03
+    rb_wait: -0.03
+    wireless_pressure: -0.03
+    resource_available: 0.10
+    remaining_deadline: 0.10
+    dense_clip: 1.0
   ippo_checkpoint_selection_interval: 0
   ippo_checkpoint_selection_early_interval: 0
   ippo_checkpoint_selection_early_until_episode: 0
@@ -181,17 +187,21 @@ semantic_exchange:
   encoder_device: cuda
   encoder_batch_size: 64
   ttl_s: 8.0
-  fixed_delay_s: 0.05
-  per_hop_delay_s: 0.01
+  fixed_delay_s: 0.0
+  per_hop_delay_s: 0.0
   top_k_per_agent: 64
   compressed_dim: 64
   quantization_bits: 8
 
 semantic_topology_experiment:
   service_pressure_model:
-    episode_duration_s: 20.0
+    ddl_s: 5.0
+    episode_duration_s: 10.0
+    arrival_horizon_s: 5.0
+    per_task_node_arrival_interval_s: 10.0
     service_node_counts: [20, 40, 60, 80]
-    common_request_count: 30
+    common_task_node_count: 60
+    task_node_counts: [20, 40, 60, 80]
     target_trend: stair-step increase rather than exact fixed percentages
     rationale: fixed demand for the service-node sweep; scarce service nodes should be capacity-bound while dense service nodes should be visibly easier
   task_classes: {}
@@ -199,15 +209,13 @@ semantic_topology_experiment:
     - &contention_base
       name: semantic_runtime_contention_stress
       objective: figure-aligned core scenario where semantic-only, topology-only, and utility-only choices are each insufficient
-      task_nodes: {vehicle: 100, uav: 0}
+      task_nodes: {vehicle: 60, uav: 0}
       service_nodes: {rsu: 4, vehicle: 42, uav: 13, cloud_server: 1}
-      request_count: 30
-      max_concurrent_sfcs: 12
       source_node_types: [vehicle]
       task_classes: {}
-      arrival_process: poisson_fixed_count
-      arrival_horizon_s: 20.0
-      arrival_rate_sfc_per_s: 1.50
+      arrival_process: per_task_node_poisson
+      arrival_horizon_s: 5.0
+      per_task_node_arrival_interval_s: 10.0
       load_multiplier: 1.0
       trajectory_segment_sampling:
         enabled: true
@@ -219,11 +227,9 @@ semantic_topology_experiment:
         traffic_surveillance: 0.30
         urban_security: 0.25
         industrial_inspection: 0.15
-      qos_deadline_range_s: [6.0, 12.0]
-      per_function_task_deadline_enabled: true
-      per_function_task_deadline_multiplier: 1.35
-      per_function_task_deadline_min_s: 0.5
-      per_function_task_deadline_max_s: 3.0
+      stratified_request_types: true
+      stratified_sfc_lengths: true
+      qos_deadline_s: 5.0
       payload_mb_range: [0.03, 0.12]
       service_cpu_scale: 0.10
       output_ratio: 0.12
@@ -266,55 +272,31 @@ semantic_topology_experiment:
       <<: *contention_base
       service_nodes: {rsu: 4, vehicle: 11, uav: 4, cloud_server: 1}
       expected_trend_rank: 1
-      max_concurrent_sfcs: 10
     - name: train_fig_service_nodes_40
       <<: *contention_base
       service_nodes: {rsu: 4, vehicle: 26, uav: 9, cloud_server: 1}
       expected_trend_rank: 2
-      max_concurrent_sfcs: 12
     - name: train_fig_service_nodes_60
       <<: *contention_base
       service_nodes: {rsu: 4, vehicle: 42, uav: 13, cloud_server: 1}
       expected_trend_rank: 3
-      max_concurrent_sfcs: 14
     - name: train_fig_service_nodes_80
       <<: *contention_base
       service_nodes: {rsu: 4, vehicle: 56, uav: 19, cloud_server: 1}
       expected_trend_rank: 4
-      max_concurrent_sfcs: 16
-    - name: train_fig_request_count_15
+    - name: train_fig_task_nodes_20
       <<: *contention_base
-      task_nodes: {vehicle: 100, uav: 0}
-      request_count: 15
-      max_concurrent_sfcs: 6
-      arrival_rate_sfc_per_s: 0.75
-    - name: train_fig_request_count_30
+      task_nodes: {vehicle: 20, uav: 0}
+    - name: train_fig_task_nodes_40
       <<: *contention_base
-      task_nodes: {vehicle: 100, uav: 0}
-      request_count: 30
-      max_concurrent_sfcs: 12
-      arrival_rate_sfc_per_s: 1.50
-    - name: train_fig_request_count_45
+      task_nodes: {vehicle: 40, uav: 0}
+    - name: train_fig_task_nodes_60
       <<: *contention_base
-      task_nodes: {vehicle: 100, uav: 0}
-      request_count: 45
-      max_concurrent_sfcs: 18
-      arrival_rate_sfc_per_s: 2.25
-    - name: train_fig_request_count_60
+      task_nodes: {vehicle: 60, uav: 0}
+    - name: train_fig_task_nodes_80
       <<: *contention_base
-      task_nodes: {vehicle: 100, uav: 0}
-      request_count: 60
-      max_concurrent_sfcs: 24
-      arrival_rate_sfc_per_s: 3.00
-    - name: train_fig_request_count_75
-      <<: *contention_base
-      task_nodes: {vehicle: 100, uav: 0}
-      request_count: 75
-      max_concurrent_sfcs: 30
-      arrival_rate_sfc_per_s: 3.75
+      task_nodes: {vehicle: 80, uav: 0}
     - name: distributed_service_discovery_calibrated
       <<: *contention_base
       include_in_default: false
       objective: TTL sweep base derived from the same figure-aligned contention scenario
-      request_count: 30
-      max_concurrent_sfcs: 12

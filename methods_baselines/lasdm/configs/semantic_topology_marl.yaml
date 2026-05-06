@@ -318,6 +318,9 @@ marl:
   include_remote_candidates: true
   ippo_centralized_critic: true
   ippo_use_region_encoder: true
+  ippo_hidden_dim: 256
+  ippo_mlp_depth: 3
+  ippo_gnn_layers: 3
   ippo_learnable_prior: true
   ippo_prior_l2_coef: 0.001
   ippo_learnable_logit_blend: true
@@ -325,20 +328,22 @@ marl:
   ippo_prior_logit_scale_init: 0.2
   ippo_critic_agent_count: 4
   ippo_device: cuda
-  ippo_lr: 0.0002
-  masac_gamma: 0.99
+  ippo_lr: 0.005
+  masac_gamma: 0.90
   masac_alpha: 0.05
   masac_auto_alpha: true
-  masac_alpha_lr: 0.0001
-  masac_target_entropy_scale: 0.90
+  masac_alpha_lr: 0.005
+  masac_target_entropy_scale: 0.98
   masac_alpha_min: 0.005
   masac_alpha_max: 0.25
-  masac_tau: 0.005
-  masac_q_lr: 0.0002
-  masac_batch_size: 32
-  masac_replay_capacity: 20000
-  masac_replay_warmup_steps: 128
-  masac_update_interval: 4
+  masac_tau: 0.01
+  masac_q_lr: 0.005
+  masac_q_mlp_depth: 3
+  masac_batch_size: 512
+  masac_replay_capacity: 10000
+  masac_replay_warmup_steps: 1024
+  masac_update_interval: 50
+  masac_actor_update_interval: 2
   masac_updates_per_env_step: 1
   masac_max_grad_norm: 1.0
   masac_reward_scale: 1.0
@@ -362,13 +367,13 @@ semantic_exchange:
   compressed_dim: 64
   quantization_bits: 8
   ttl_s: 5.0
-  fixed_delay_s: 0.10
-  per_hop_delay_s: 0.02
+  fixed_delay_s: 0.0
+  per_hop_delay_s: 0.0
   top_k_per_agent: 32
 
 semantic_profiles:
   config_root: methods_baselines/lasdm/configs/semantic
-  output_root: experiment_artifacts/raw_data/stage1_v21_learned_semantic_matrix_resource_20260504
+  output_root: experiment_artifacts/raw_data/semantic_profiles_artifacts
   export_artifacts_once: true
 
 topology:
@@ -381,7 +386,7 @@ topology:
     full_hybrid: [rsu, cloud_server, vehicle, uav]
 
 training:
-  episodes: 100
+  episodes: 200
   max_steps: 100
   eval_seeds: [0,1,2,3,4,5,6,7,8,9]
   train_seeds: [0,1,2,3,4]

@@ -241,7 +241,7 @@ class GraphObservationBuilder:
         )
 
     def _encode_candidate_set(self, item: Mapping[str, Any]) -> Dict[str, Any]:
-        candidates: Sequence[CatalogCandidate] = list(item.get("candidates", []))
+        candidates = self._ordered_candidates(item.get("candidates", []))
         features = np.zeros((self.config.max_candidates, self.candidate_feature_dim), dtype=np.float32)
         mask = np.zeros((self.config.max_candidates,), dtype=np.float32)
         ids: List[str] = []
@@ -260,6 +260,41 @@ class GraphObservationBuilder:
             "candidate_mask": mask,
             "raw_candidates": [candidate.to_dict() for candidate in candidates[: self.config.max_candidates]],
         }
+
+    def _ordered_candidates(self, candidates: Sequence[CatalogCandidate]) -> List[CatalogCandidate]:
+        items = list(candidates)
+        if self.config.include_semantic_features:
+            return items
+        if not self.config.include_topology_features:
+            return sorted(items, key=lambda candidate: (candidate.node_type, candidate.node_id, candidate.instance_id))
+
+        def semantic_blind_key(candidate: CatalogCandidate) -> Tuple[float, int, float, float, float, float, bool, float, str, str, str]:
+            metadata = dict(candidate.metadata or {})
+            route_available = _float_feature(metadata.get("route_available"), 1.0)
+            expected_runtime = _float_feature(
+                metadata.get("expected_runtime_penalty_no_semantic_s", metadata.get("expected_runtime_penalty_s")),
+                0.0,
+            )
+            deadline_slack = _float_feature(metadata.get("deadline_slack_s"), 0.0)
+            topology_risk = _float_feature(metadata.get("topology_risk"), 0.0)
+            mobility_risk = _float_feature(metadata.get("mobility_risk"), 0.0) if self.config.include_temporal_features else 0.0
+            resource_available = _float_feature(metadata.get("resource_available_ratio"), 1.0)
+            staleness = float(candidate.staleness_s) if self.config.include_temporal_features else 0.0
+            return (
+                -route_available,
+                1 if deadline_slack < 0.0 else 0,
+                expected_runtime,
+                topology_risk,
+                mobility_risk,
+                -resource_available,
+                bool(candidate.is_remote),
+                staleness,
+                str(candidate.node_type),
+                str(candidate.node_id),
+                str(candidate.instance_id),
+            )
+
+        return sorted(items, key=semantic_blind_key)
 
 
 def flatten_observation(observation: Mapping[str, Any]) -> np.ndarray:
@@ -310,3 +345,12 @@ def _one_hot(value: str, choices: Sequence[str], default_value: str = "unknown")
     arr = np.zeros((len(choices),), dtype=np.float32)
     arr[list(choices).index(value)] = 1.0
     return arr
+
+
+def _float_feature(value: Any, default: float) -> float:
+    try:
+        if value is None or value == "":
+            return float(default)
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)

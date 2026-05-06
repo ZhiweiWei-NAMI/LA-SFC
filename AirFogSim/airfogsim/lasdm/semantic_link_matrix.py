@@ -19,7 +19,7 @@ except ImportError:  # pragma: no cover - non-POSIX fallback
     fcntl = None
 
 
-V21_OUTPUT_ROOT = Path("experiment_artifacts/raw_data/stage1_v21_learned_semantic_matrix_resource_20260504")
+DEFAULT_SEMANTIC_OUTPUT_ROOT = Path("experiment_artifacts/raw_data/semantic_profiles_artifacts")
 
 VARIANT_TYPE_SCORE = {
     "exact": 1.00,
@@ -143,7 +143,7 @@ class SemanticImplementation:
 
 
 class SemanticLinkMatrix:
-    """Frozen V21 semantic truth matrix built from reviewed YAML profiles.
+    """Semantic truth matrix built from reviewed YAML profiles.
 
     The matrix is an environment artifact. It computes audit-only truth fields
     from request type, implementation profile, and link input semantics. Runtime

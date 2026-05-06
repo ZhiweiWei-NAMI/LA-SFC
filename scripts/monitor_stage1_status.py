@@ -17,7 +17,7 @@ from typing import Any, Iterable, Mapping, Sequence
 DEFAULT_RAW_ROOT = Path("experiment_artifacts/raw_data")
 DEFAULT_CONFIG = Path("methods_baselines/lasdm/configs/semantic_topology_marl.yaml")
 DEFAULT_REPAIR_CONFIG = Path("methods_baselines/lasdm/configs/semantic_topology_runtime_figures_aligned.yaml")
-DEFAULT_EPISODES = 100
+DEFAULT_EPISODES = 200
 DEFAULT_SCENARIOS = (
     "semantic_runtime_probe_preprocess_only",
     "semantic_runtime_calibration_easy",
@@ -56,6 +56,8 @@ def main() -> int:
     parser.add_argument("--repair-config", type=Path, default=DEFAULT_REPAIR_CONFIG, help="Optional runtime repair config merged over --config.")
     parser.add_argument("--watch-s", type=float, default=0.0, help="Refresh every N seconds. Omit or set 0 for one-shot output.")
     parser.add_argument("--no-clear", action="store_true", help="Do not clear the terminal between watch refreshes.")
+    parser.add_argument("--include-eval", action="store_true", help="Also print runtime evaluation tables.")
+    parser.add_argument("--include-artifacts", action="store_true", help="Also print semantic artifact checks.")
     args = parser.parse_args()
 
     root = args.root or newest_stage1_root(DEFAULT_RAW_ROOT)
@@ -75,6 +77,8 @@ def main() -> int:
                 expected_episodes=max(1, args.episodes),
                 eval_seed_count=max(1, args.eval_seed_count),
                 scenarios=scenarios,
+                include_eval=bool(args.include_eval),
+                include_artifacts=bool(args.include_artifacts),
             )
         )
         if args.watch_s <= 0:
@@ -89,7 +93,14 @@ def newest_stage1_root(raw_root: Path) -> Path | None:
     return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
-def render_status(root: Path, expected_episodes: int, eval_seed_count: int, scenarios: Sequence[str]) -> str:
+def render_status(
+    root: Path,
+    expected_episodes: int,
+    eval_seed_count: int,
+    scenarios: Sequence[str],
+    include_eval: bool = False,
+    include_artifacts: bool = False,
+) -> str:
     now = time.time()
     process_rows = ps_rows()
     root_tokens = {str(root)}
@@ -119,36 +130,38 @@ def render_status(root: Path, expected_episodes: int, eval_seed_count: int, scen
         lines.append(f"  ... {len(active_lines) - 8} more")
     lines.append("")
     lines.extend(render_training(root, expected_episodes, process_rows, now))
-    lines.append("")
-    lines.extend(render_eval_suite(
-        root / "semantic_runtime_eval",
-        "Runtime Eval",
-        [*DEFAULT_NONLEARNING_BASELINES, *DEFAULT_LEARNING_EVAL_BASELINES],
-        expected_runs=(len(DEFAULT_NONLEARNING_BASELINES) + len(DEFAULT_LEARNING_EVAL_BASELINES)) * len(scenarios) * eval_seed_count,
-        process_rows=process_rows,
-        now=now,
-    ))
-    if (root / "nonlearning_runtime_eval").exists() or (root / "learning_runtime_eval").exists():
+    if include_eval:
         lines.append("")
         lines.extend(render_eval_suite(
-            root / "nonlearning_runtime_eval" / "semantic_runtime_eval",
-            "Nonlearning Eval",
-            DEFAULT_NONLEARNING_BASELINES,
-            expected_runs=len(DEFAULT_NONLEARNING_BASELINES) * len(scenarios) * eval_seed_count,
+            root / "semantic_runtime_eval",
+            "Runtime Eval",
+            [*DEFAULT_NONLEARNING_BASELINES, *DEFAULT_LEARNING_EVAL_BASELINES],
+            expected_runs=(len(DEFAULT_NONLEARNING_BASELINES) + len(DEFAULT_LEARNING_EVAL_BASELINES)) * len(scenarios) * eval_seed_count,
             process_rows=process_rows,
             now=now,
         ))
+        if (root / "nonlearning_runtime_eval").exists() or (root / "learning_runtime_eval").exists():
+            lines.append("")
+            lines.extend(render_eval_suite(
+                root / "nonlearning_runtime_eval" / "semantic_runtime_eval",
+                "Nonlearning Eval",
+                DEFAULT_NONLEARNING_BASELINES,
+                expected_runs=len(DEFAULT_NONLEARNING_BASELINES) * len(scenarios) * eval_seed_count,
+                process_rows=process_rows,
+                now=now,
+            ))
+            lines.append("")
+            lines.extend(render_eval_suite(
+                root / "learning_runtime_eval" / "semantic_runtime_eval",
+                "Learning Eval",
+                DEFAULT_LEARNING_EVAL_BASELINES,
+                expected_runs=len(DEFAULT_LEARNING_EVAL_BASELINES) * len(scenarios) * eval_seed_count,
+                process_rows=process_rows,
+                now=now,
+            ))
+    if include_artifacts:
         lines.append("")
-        lines.extend(render_eval_suite(
-            root / "learning_runtime_eval" / "semantic_runtime_eval",
-            "Learning Eval",
-            DEFAULT_LEARNING_EVAL_BASELINES,
-            expected_runs=len(DEFAULT_LEARNING_EVAL_BASELINES) * len(scenarios) * eval_seed_count,
-            process_rows=process_rows,
-            now=now,
-        ))
-    lines.append("")
-    lines.extend(render_artifacts(root))
+        lines.extend(render_artifacts(root))
     return "\n".join(lines)
 
 
@@ -195,13 +208,8 @@ def render_training(root: Path, expected_episodes: int, process_rows: Sequence[M
         "best",
         "w10(sfc/task/r)",
         "avg(sfc/task/r)",
-        "diag",
-        "dataset",
-        "offline",
-        "eval",
     ]
-    lines = [title, table(headers, rows)]
-    return lines
+    return [title, table(headers, rows)]
 
 
 def training_seed_dir(root: Path, variant: str, seed: str) -> Path:
@@ -224,9 +232,6 @@ def training_row(
 ) -> list[str]:
     rows = read_csv_rows(progress_path)
     summary = read_json(summary_path)
-    seed_dir = progress_path.parent
-    diag_text, diag_paths = diagnostic_progress(seed_dir, variant)
-    _phase_text, phase_paths = runtime_phase_progress(seed_dir, now)
     filtered = filter_expected_rows(rows, expected_episodes)
     latest = filtered[-1] if filtered else (rows[-1] if rows else {})
     latest_ep = safe_int(latest.get("episode")) if latest else None
@@ -246,11 +251,10 @@ def training_row(
         state = "CHECKPOINT_PARTIAL"
     elif rows:
         state = "PARTIAL"
-    activity_paths = [progress_path, selection_path, summary_path, *diag_paths, *phase_paths]
+    activity_paths = [progress_path, selection_path, summary_path]
     last_activity = newest_mtime(activity_paths)
     last_update = age(last_activity, now) if last_activity else "-"
     best = best_selection(selection_path, summary, progress_path.parent)
-    dataset_progress, offline_progress, eval_progress = iql_progress_fields(progress_path.parent, variant, expected_episodes)
     return [
         variant,
         state,
@@ -263,86 +267,7 @@ def training_row(
         best,
         metric_triplet(filtered or rows, tail_count=10),
         metric_triplet(filtered or rows, tail_count=None),
-        diag_text,
-        dataset_progress,
-        offline_progress,
-        eval_progress,
     ]
-
-
-def runtime_phase_progress(seed_dir: Path, now: float) -> tuple[str, list[Path]]:
-    heartbeat_path = seed_dir / "runtime_heartbeat.json"
-    heartbeat = read_json(heartbeat_path)
-    if not isinstance(heartbeat, Mapping):
-        return "-", [heartbeat_path, seed_dir / "runtime_debug.jsonl"]
-    event = str(heartbeat.get("event", "") or "-")
-    episode = safe_int(heartbeat.get("episode"))
-    step = safe_int(heartbeat.get("step"))
-    update = safe_int(heartbeat.get("update_index"))
-    timestamp = safe_float(heartbeat.get("time_s"))
-    age_text = age(timestamp, now) if timestamp is not None else "-"
-    suffix = ""
-    if episode is not None and step is not None:
-        suffix = f"@e{episode}s{step}"
-    elif episode is not None:
-        suffix = f"@e{episode}"
-    if update is not None:
-        suffix += f"u{update}"
-    return f"{event}{suffix}/{age_text}", [heartbeat_path, seed_dir / "runtime_debug.jsonl"]
-
-
-def diagnostic_progress(seed_dir: Path, variant: str) -> tuple[str, list[Path]]:
-    if variant == "iql_offline":
-        path = seed_dir / "iql_diagnostics.csv"
-        rows = read_csv_rows(path)
-        if not rows:
-            return "-", [path, seed_dir / "iql_behavior_reward_curve.csv", seed_dir / "iql_eval_reward_curve.csv"]
-        last = rows[-1]
-        return f"iql:{len(rows)}", [path, seed_dir / "iql_behavior_reward_curve.csv", seed_dir / "iql_eval_reward_curve.csv"]
-    if variant == "mappo_ctde":
-        path = seed_dir / "mappo_diagnostics.csv"
-        rows = read_csv_rows(path)
-        if not rows:
-            return "-", [path]
-        update = safe_int(rows[-1].get("update_index")) or len(rows)
-        episode = safe_int(rows[-1].get("episode"))
-        return f"ppo:{update}" + (f"@e{episode}" if episode is not None else ""), [path]
-    path = seed_dir / "sac_diagnostics.csv"
-    rows = read_csv_rows(path)
-    if not rows:
-        return "-", [path]
-    last = rows[-1]
-    update = safe_int(last.get("update_index")) or len(rows)
-    episode = safe_int(last.get("episode"))
-    step = safe_int(last.get("step"))
-    suffix = ""
-    if episode is not None and step is not None:
-        suffix = f"@e{episode}s{step}"
-    elif episode is not None:
-        suffix = f"@e{episode}"
-    return f"sac:{update}{suffix}", [path]
-
-
-def iql_progress_fields(seed_dir: Path, variant: str, expected_episodes: int) -> tuple[str, str, str]:
-    if variant != "iql_offline":
-        return "-", "-", "-"
-    behavior_rows = read_csv_rows(seed_dir / "iql_behavior_reward_curve.csv")
-    diagnostics_rows = read_csv_rows(seed_dir / "iql_diagnostics.csv")
-    eval_rows = read_csv_rows(seed_dir / "iql_eval_reward_curve.csv")
-    dataset = episode_progress(behavior_rows, expected_episodes)
-    offline = str(len(diagnostics_rows)) if diagnostics_rows else "0"
-    evaluation = "1/1" if eval_rows else "0/1"
-    return dataset, offline, evaluation
-
-
-def episode_progress(rows: Sequence[Mapping[str, str]], expected_episodes: int) -> str:
-    if not rows:
-        return f"0/{expected_episodes}"
-    episodes = [value for row in rows if (value := safe_int(row.get("episode"))) is not None]
-    if not episodes:
-        return f"{min(len(rows), expected_episodes)}/{expected_episodes}"
-    count = min(expected_episodes, max(episodes) + 1)
-    return f"{count}/{expected_episodes}"
 
 
 def filter_expected_rows(rows: Sequence[Mapping[str, str]], expected_episodes: int) -> list[Mapping[str, str]]:
@@ -581,11 +506,13 @@ def row_success(row: Mapping[str, Any]) -> float | None:
     if value is not None:
         return value
     succeeded = safe_float(row.get("succeeded"))
+    submitted = safe_float(row.get("submitted"))
     failed = safe_float(row.get("failed"))
     timed_out = safe_float(row.get("timed_out"))
+    active = safe_float(row.get("active_graphs"))
     if succeeded is None:
         return None
-    total = float(succeeded) + float(failed or 0.0) + float(timed_out or 0.0)
+    total = float(submitted) if submitted is not None else float(succeeded) + float(failed or 0.0) + float(timed_out or 0.0) + float(active or 0.0)
     return float(succeeded) / total if total > 0.0 else None
 
 

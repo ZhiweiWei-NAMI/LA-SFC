@@ -205,9 +205,12 @@ def main() -> None:
                                 "service_role_sweep": role,
                                 "seed": seed,
                                 "task_node_counts": json.dumps(scenario.get("task_nodes", {}), sort_keys=True),
-                                "request_count": scenario.get("request_count", ""),
+                                "task_node_count": int(sum((scenario.get("task_nodes", {}) or {}).values())),
                                 "service_node_counts": json.dumps(scenario.get("service_nodes", {}), sort_keys=True),
-                                "arrival_rate_sfc_per_s": scenario.get("arrival_rate_sfc_per_s", ""),
+                                "per_task_node_arrival_interval_s": scenario.get("per_task_node_arrival_interval_s", ""),
+                                "per_task_node_arrival_rate_sfc_per_s": scenario.get("per_task_node_arrival_rate_sfc_per_s", ""),
+                                "arrival_horizon_s": scenario.get("arrival_horizon_s", ""),
+                                "generated_sfc_count": int(metrics.get("submitted", 0) or 0),
                                 "exchange_ttl_s": scenario.get("exchange_ttl_s", ""),
                                 "compressed_dim": config.get("semantic_exchange", {}).get("compressed_dim", ""),
                                 **last,
@@ -254,7 +257,11 @@ def _baseline_settings(name: str) -> Tuple[str, Dict[str, Any]]:
         return "topology_greedy", {"auto_exchange": True, "include_remote_candidates": True}
     canonical = canonical_ippo_baseline(name)
     if canonical in IPPO_BASELINE_CONFIG_UPDATES:
-        return "proposed_semantic_topology_marl", dict(IPPO_BASELINE_CONFIG_UPDATES[canonical])
+        if canonical in {"marl_no_semantic", "marl_topology_no_semantic"}:
+            return "marl_no_semantic", dict(IPPO_BASELINE_CONFIG_UPDATES[canonical])
+        if canonical in {"marl_semantic_no_topology", "marl_no_topology"}:
+            return "marl_semantic_no_topology", dict(IPPO_BASELINE_CONFIG_UPDATES[canonical])
+        return "topology_greedy", dict(IPPO_BASELINE_CONFIG_UPDATES[canonical])
     if name in {"centralized_planner", "centralized_oracle"}:
         # centralized_oracle is a legacy alias. This is a full-information
         # heuristic planner, not a claim of mathematical optimality.

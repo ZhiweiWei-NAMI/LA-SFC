@@ -6,7 +6,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from .marl_env import SemanticTopologyMARLEnv
 from .marl_policy import BaseMARLPolicy, MASACPolicy
@@ -81,38 +81,63 @@ class ReplayBuffer:
 
 
 class HeuristicEvaluator:
-    def __init__(self, env: SemanticTopologyMARLEnv, policy: BaseMARLPolicy):
+    def __init__(
+        self,
+        env: SemanticTopologyMARLEnv,
+        policy: BaseMARLPolicy,
+        env_factory: Optional[Callable[[int], SemanticTopologyMARLEnv]] = None,
+        close_env: Optional[Callable[[SemanticTopologyMARLEnv], None]] = None,
+    ):
         self.env = env
         self.policy = policy
+        self.env_factory = env_factory
+        self.close_env = close_env
 
-    def run(self, episodes: int = 1, max_steps: int = 100) -> List[TrainingMetrics]:
+    def run(self, episodes: int = 1, max_steps: int = 100, output_dir: Optional[str] = None) -> List[TrainingMetrics]:
         rows: List[TrainingMetrics] = []
-        scenario_name = str(getattr(getattr(self.env, "config", None), "scenario_name", "") or "")
+        target = Path(output_dir) if output_dir is not None else None
         for episode in range(int(episodes)):
-            observations = self.env.reset()
-            total = 0.0
-            for step in range(int(max_steps)):
-                actions = self.policy.act(observations, deterministic=True)
-                observations, rewards, done, info = self.env.step(actions)
-                mean_reward = sum(rewards.values()) / max(1, len(rewards))
-                total += mean_reward
-                summary = info.get("summary", {})
-                rows.append(
-                    TrainingMetrics(
-                        episode=episode,
-                        step=step,
-                        mean_reward=mean_reward,
-                        total_reward=total,
-                        succeeded=int(summary.get("succeeded", 0) or 0),
-                        failed=int(summary.get("failed", 0) or 0),
-                        timed_out=int(summary.get("timed_out", 0) or 0),
-                        active_graphs=int(summary.get("active_graphs", 0) or 0),
-                        scenario=scenario_name,
+            env = self._episode_env(episode)
+            try:
+                scenario_name = str(getattr(getattr(env, "config", None), "scenario_name", "") or "")
+                observations = env.reset()
+                total = 0.0
+                for step in range(int(max_steps)):
+                    actions = self.policy.act(observations, deterministic=True)
+                    observations, rewards, done, info = env.step(actions)
+                    mean_reward = sum(rewards.values()) / max(1, len(rewards))
+                    total += mean_reward
+                    summary = info.get("summary", {})
+                    rows.append(
+                        TrainingMetrics(
+                            episode=episode,
+                            step=step,
+                            mean_reward=mean_reward,
+                            total_reward=total,
+                            succeeded=int(summary.get("succeeded", 0) or 0),
+                            failed=int(summary.get("failed", 0) or 0),
+                            timed_out=int(summary.get("timed_out", 0) or 0),
+                            active_graphs=int(summary.get("active_graphs", 0) or 0),
+                            scenario=scenario_name,
+                        )
                     )
-                )
-                if done:
-                    break
+                    if done:
+                        break
+                if target is not None and episode + 1 == int(episodes):
+                    target.mkdir(parents=True, exist_ok=True)
+                    env.write_traces(str(target))
+            finally:
+                self._close_episode_env(env)
         return rows
+
+    def _episode_env(self, episode: int) -> SemanticTopologyMARLEnv:
+        if self.env_factory is None:
+            return self.env
+        return self.env_factory(int(episode))
+
+    def _close_episode_env(self, env: SemanticTopologyMARLEnv) -> None:
+        if self.env_factory is not None and self.close_env is not None:
+            self.close_env(env)
 
 
 class MASACTrainer:
@@ -122,12 +147,15 @@ class MASACTrainer:
         self,
         env: SemanticTopologyMARLEnv,
         policy: MASACPolicy,
+        env_factory: Optional[Callable[[int], SemanticTopologyMARLEnv]] = None,
+        close_env: Optional[Callable[[SemanticTopologyMARLEnv], None]] = None,
         gamma: float = 0.99,
         tau: float = 0.005,
         batch_size: int = 128,
         replay_capacity: int = 10000,
         replay_warmup_steps: int = 64,
         update_interval: int = 1,
+        actor_update_interval: int = 2,
         updates_per_env_step: int = 1,
         max_grad_norm: float = 1.0,
         reward_scale: float = 1.0,
@@ -135,12 +163,15 @@ class MASACTrainer:
         seed: int = 0,
     ):
         self.env = env
+        self.env_factory = env_factory
+        self.close_env = close_env
         self.policy = policy
         self.gamma = float(gamma)
         self.tau = float(tau)
         self.batch_size = int(batch_size)
         self.replay_warmup_steps = int(replay_warmup_steps)
         self.update_interval = max(1, int(update_interval))
+        self.actor_update_interval = max(1, int(actor_update_interval))
         self.updates_per_env_step = int(updates_per_env_step)
         self.max_grad_norm = float(max_grad_norm)
         self.reward_scale = float(reward_scale)
@@ -151,65 +182,81 @@ class MASACTrainer:
         rows: List[TrainingMetrics] = []
         diagnostics: List[Dict[str, Any]] = []
         update_index = 0
-        scenario_name = str(getattr(getattr(self.env, "config", None), "scenario_name", "") or "")
+        target = Path(output_dir) if output_dir is not None else None
         for episode in range(int(episodes)):
-            observations = self.env.reset()
-            total = 0.0
-            for step in range(int(max_steps)):
-                current_observations = observations
-                policy_step = self.policy.act_with_logprobs(current_observations, deterministic=False, track_grad=False)
-                observations, rewards, done, info = self.env.step(policy_step.actions)
-                mean_reward = sum(rewards.values()) / max(1, len(rewards))
-                total += mean_reward
-                self.replay.add(
-                    SACTransition(
-                        observations=current_observations,
-                        actions=policy_step.actions,
-                        reward=float(mean_reward),
-                        next_observations=observations,
-                        done=bool(done or step + 1 >= int(max_steps)),
-                        episode=int(episode),
-                    )
-                )
-                if len(self.replay) >= max(1, self.replay_warmup_steps) and len(self.replay) % self.update_interval == 0:
-                    metrics = masac_update_policy(
-                        self.policy,
-                        self.replay,
-                        batch_size=self.batch_size,
-                        updates=self.updates_per_env_step,
-                        gamma=self.gamma,
-                        tau=self.tau,
-                        max_grad_norm=self.max_grad_norm,
-                        reward_scale=self.reward_scale,
-                        sample_strategy=self.replay_sample_strategy,
-                    )
-                    if metrics:
-                        update_index += 1
-                        diagnostics.append(
-                            {
-                                "episode": int(episode),
-                                "step": int(step),
-                                "update_index": update_index,
-                                "replay_size": len(self.replay),
-                                **metrics,
-                            }
+            env = self._episode_env(episode)
+            try:
+                scenario_name = str(getattr(getattr(env, "config", None), "scenario_name", "") or "")
+                observations = env.reset()
+                total = 0.0
+                for step in range(int(max_steps)):
+                    current_observations = observations
+                    policy_step = self.policy.act_with_logprobs(current_observations, deterministic=False, track_grad=False)
+                    observations, rewards, done, info = env.step(policy_step.actions)
+                    mean_reward = sum(rewards.values()) / max(1, len(rewards))
+                    total += mean_reward
+                    self.replay.add(
+                        SACTransition(
+                            observations=current_observations,
+                            actions=policy_step.actions,
+                            reward=float(mean_reward),
+                            next_observations=observations,
+                            done=bool(done or step + 1 >= int(max_steps)),
+                            episode=int(episode),
+                            scenario=scenario_name,
                         )
-                summary = info.get("summary", {})
-                rows.append(
-                    TrainingMetrics(
-                        episode=episode,
-                        step=step,
-                        mean_reward=mean_reward,
-                        total_reward=total,
-                        succeeded=int(summary.get("succeeded", 0) or 0),
-                        failed=int(summary.get("failed", 0) or 0),
-                        timed_out=int(summary.get("timed_out", 0) or 0),
-                        active_graphs=int(summary.get("active_graphs", 0) or 0),
-                        scenario=scenario_name,
                     )
-                )
-                if done:
-                    break
+                    if len(self.replay) >= max(1, self.replay_warmup_steps) and len(self.replay) % self.update_interval == 0:
+                        next_update_index = update_index + 1
+                        metrics = masac_update_policy(
+                            self.policy,
+                            self.replay,
+                            batch_size=self.batch_size,
+                            updates=self.updates_per_env_step,
+                            gamma=self.gamma,
+                            tau=self.tau,
+                            max_grad_norm=self.max_grad_norm,
+                            reward_scale=self.reward_scale,
+                            sample_strategy=self.replay_sample_strategy,
+                            update_actor=(next_update_index % self.actor_update_interval == 0),
+                        )
+                        if metrics:
+                            update_index += 1
+                            diagnostics.append(
+                                {
+                                    "episode": int(episode),
+                                    "step": int(step),
+                                    "scenario": scenario_name,
+                                    "update_index": update_index,
+                                    "replay_size": len(self.replay),
+                                    **metrics,
+                                }
+                            )
+                    summary = info.get("summary", {})
+                    rows.append(
+                        TrainingMetrics(
+                            episode=episode,
+                            step=step,
+                            mean_reward=mean_reward,
+                            total_reward=total,
+                            succeeded=int(summary.get("succeeded", 0) or 0),
+                            failed=int(summary.get("failed", 0) or 0),
+                            timed_out=int(summary.get("timed_out", 0) or 0),
+                            active_graphs=int(summary.get("active_graphs", 0) or 0),
+                            scenario=scenario_name,
+                        )
+                    )
+                    if done:
+                        break
+                if target is not None and episode + 1 == int(episodes):
+                    target.mkdir(parents=True, exist_ok=True)
+                    env.write_traces(str(target))
+            finally:
+                self._close_episode_env(env)
+            if target is not None:
+                target.mkdir(parents=True, exist_ok=True)
+                write_reward_curve(target / "reward_curve.csv", rows)
+                write_sac_diagnostics(target / "sac_diagnostics.csv", diagnostics)
         if output_dir is not None:
             target = Path(output_dir)
             target.mkdir(parents=True, exist_ok=True)
@@ -219,8 +266,16 @@ class MASACTrainer:
                 self.policy.torch.save(self.policy.sac_state_dict(), target / "masac_policy.pt")
             except Exception:
                 pass
-            self.env.write_traces(str(target))
         return rows
+
+    def _episode_env(self, episode: int) -> SemanticTopologyMARLEnv:
+        if self.env_factory is None:
+            return self.env
+        return self.env_factory(int(episode))
+
+    def _close_episode_env(self, env: SemanticTopologyMARLEnv) -> None:
+        if self.env_factory is not None and self.close_env is not None:
+            self.close_env(env)
 
 
 def write_reward_curve(path: str | Path, rows: List[TrainingMetrics]) -> None:
@@ -270,7 +325,7 @@ def masac_update_policy(
         target_items = []
         selected_actions = 0
         for transition in batch:
-            selected = policy.masac_selected_q_values(transition.observations, transition.actions, detach_encoder=True)
+            selected = policy.masac_selected_q_values(transition.observations, transition.actions, detach_encoder=False)
             if selected is None:
                 continue
             with torch.no_grad():
@@ -294,10 +349,7 @@ def masac_update_policy(
         critic_loss = torch.nn.functional.mse_loss(q1_values, targets) + torch.nn.functional.mse_loss(q2_values, targets)
         policy.q_optimizer.zero_grad()
         critic_loss.backward()
-        q_grad_norm = torch.nn.utils.clip_grad_norm_(
-            list(policy.q1.parameters()) + list(policy.q2.parameters()),
-            float(max_grad_norm),
-        )
+        q_grad_norm = torch.nn.utils.clip_grad_norm_(policy.q_train_parameters(), float(max_grad_norm))
         policy.q_optimizer.step()
         critic_backward_end = time.perf_counter()
 
@@ -321,7 +373,7 @@ def masac_update_policy(
             target_entropy_mean = torch.stack(target_entropy_values).mean()
             policy.optimizer.zero_grad()
             actor_loss.backward()
-            actor_grad_norm = torch.nn.utils.clip_grad_norm_(policy.model.parameters(), float(max_grad_norm))
+            actor_grad_norm = torch.nn.utils.clip_grad_norm_(policy.actor_head_parameters(), float(max_grad_norm))
             policy.optimizer.step()
             alpha_loss = policy.update_alpha(entropy_mean, target_entropy_mean)
         else:
