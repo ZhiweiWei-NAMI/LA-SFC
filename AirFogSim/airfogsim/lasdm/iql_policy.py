@@ -46,9 +46,15 @@ class IQLPolicy(MASACPolicy):
         self,
         observations: Mapping[str, Mapping[str, Any]],
         detach_encoder: bool = True,
+        action_filter: Mapping[str, str] | None = None,
     ) -> Any:
         values = []
-        for item in self._masac_candidate_items(observations, target=False, detach_encoder=detach_encoder):
+        for item in self._masac_candidate_items(
+            observations,
+            target=False,
+            detach_encoder=detach_encoder,
+            action_filter=action_filter,
+        ):
             values.append(self.v_net(self.iql_v_input(item)).squeeze(-1))
         if not values:
             return self.torch.tensor(0.0, dtype=self.torch.float32, device=self.device)

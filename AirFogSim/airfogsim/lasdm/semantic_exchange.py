@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import json
-import math
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 import numpy as np
 
 from .instance_directory import ServiceInstanceDirectory
 from .semantic_cache import SemanticAdvertisement
-from .semantic_encoder import SemanticEncoder, normalize_vector, service_instance_text
+from .semantic_encoder import SemanticEncoder, service_instance_text
 
 
 @dataclass(frozen=True)
@@ -19,8 +18,7 @@ class SemanticExchangeConfig:
     fixed_delay_s: float = 0.1
     per_hop_delay_s: float = 0.02
     top_k_per_agent: int = 32
-    compressed_dim: int = 64
-    quantization_bits: int = 8
+    embedding_dim: int = 384
     include_metadata: bool = True
     min_advertised_health: float = 0.0
 
@@ -48,62 +46,11 @@ class SemanticMessage:
         }
 
 
-class SemanticCompressor:
-    """Random-projection + int8 quantization for distributed semantic exchange."""
-
-    def __init__(self, input_dim: int = 384, compressed_dim: int = 64, seed: int = 17, quantization_bits: int = 8):
-        self.input_dim = int(input_dim)
-        self.compressed_dim = int(compressed_dim)
-        self.seed = int(seed)
-        self.quantization_bits = int(quantization_bits)
-        if self.quantization_bits != 8:
-            raise ValueError("Only int8 semantic compression is implemented in this core module")
-        rng = np.random.default_rng(self.seed)
-        proj = rng.normal(0.0, 1.0 / math.sqrt(max(1, self.compressed_dim)), size=(self.input_dim, self.compressed_dim))
-        self.projection = proj.astype(np.float32)
-
-    def compress(self, vector: np.ndarray) -> List[int]:
-        vector = np.asarray(vector, dtype=np.float32).reshape(-1)
-        if vector.shape[0] != self.input_dim:
-            self._resize_projection(vector.shape[0])
-        projected = normalize_vector(vector @ self.projection)
-        quantized = np.clip(np.round(projected * 127.0), -127, 127).astype(np.int8)
-        return [int(item) for item in quantized.tolist()]
-
-    def decompress(self, compressed: Sequence[int]) -> np.ndarray:
-        arr = np.asarray(list(compressed), dtype=np.float32)
-        if arr.size == 0:
-            return np.zeros(self.compressed_dim, dtype=np.float32)
-        return normalize_vector(arr / 127.0)
-
-    def compressed_similarity(self, query_vector: np.ndarray, compressed: Sequence[int]) -> float:
-        q = np.asarray(self.compress(query_vector), dtype=np.float32) / 127.0
-        c = self.decompress(compressed)
-        denom = max(1e-12, float(np.linalg.norm(q) * np.linalg.norm(c)))
-        return float(np.dot(q, c) / denom)
-
-    def metadata(self) -> Dict[str, Any]:
-        return {
-            "method": "random_projection_int8",
-            "input_dim": self.input_dim,
-            "compressed_dim": self.compressed_dim,
-            "quantization_bits": self.quantization_bits,
-            "seed": self.seed,
-        }
-
-    def _resize_projection(self, input_dim: int) -> None:
-        self.input_dim = int(input_dim)
-        rng = np.random.default_rng(self.seed)
-        proj = rng.normal(0.0, 1.0 / math.sqrt(max(1, self.compressed_dim)), size=(self.input_dim, self.compressed_dim))
-        self.projection = proj.astype(np.float32)
-
-
 class SemanticExchange:
     """Delay-aware message bus for local semantic advertisement exchange."""
 
-    def __init__(self, config: Optional[SemanticExchangeConfig] = None, compressor: Optional[SemanticCompressor] = None):
+    def __init__(self, config: Optional[SemanticExchangeConfig] = None):
         self.config = config or SemanticExchangeConfig()
-        self.compressor = compressor or SemanticCompressor(compressed_dim=self.config.compressed_dim)
         self.pending: List[SemanticMessage] = []
         self.delivered_messages: List[SemanticMessage] = []
         self.trace_rows: List[Dict[str, Any]] = []
@@ -124,8 +71,9 @@ class SemanticExchange:
         ads: List[SemanticAdvertisement] = []
         for instance in instances[: max(0, limit)]:
             text = service_instance_text(instance)
-            vector = encoder.encode(text)
-            compressed = self.compressor.compress(vector)
+            vector = np.asarray(encoder.encode(text), dtype=np.float32).reshape(-1)
+            if vector.size != int(self.config.embedding_dim):
+                raise ValueError(f"semantic embedding dimension mismatch: expected {int(self.config.embedding_dim)}, got {vector.size}")
             metadata = dict(instance.metadata or {}) if self.config.include_metadata else {}
             if self.config.include_metadata:
                 metadata.setdefault("cold_start_s", float(instance.cold_start_s))
@@ -143,8 +91,7 @@ class SemanticExchange:
                 capabilities=tuple(instance.capabilities),
                 input_semantic=instance.input_semantic,
                 output_semantic=instance.output_semantic,
-                compressed_embedding=compressed,
-                compression=self.compressor.metadata(),
+                semantic_embedding=[float(item) for item in vector.tolist()],
                 created_at_s=float(now_s),
                 ttl_s=float(self.config.ttl_s),
                 version=instance.version,
@@ -181,8 +128,7 @@ class SemanticExchange:
                     "exchange_ttl_s": float(self.config.ttl_s),
                     "exchange_radius_hops": int(self.config.radius_hops),
                     "exchange_top_k": int(self.config.top_k_per_agent),
-                    "semantic_compressed_dim": int(self.config.compressed_dim),
-                    "quantization_bits": int(self.config.quantization_bits),
+                    "semantic_embedding_dim": int(self.config.embedding_dim),
                 },
             )
             self.pending.append(message)
@@ -234,7 +180,6 @@ class SemanticExchange:
     def estimate_advertisement_bytes(self, ad: SemanticAdvertisement) -> int:
         # JSON length is a conservative, reproducible proxy for message overhead.
         raw = ad.to_dict()
-        raw["compressed_embedding"] = list(ad.compressed_embedding)
         return len(json.dumps(raw, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
 
     def overhead_summary(self) -> Dict[str, float]:

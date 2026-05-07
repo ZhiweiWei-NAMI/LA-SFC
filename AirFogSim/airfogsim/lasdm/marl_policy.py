@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .graph_observation import flatten_observation
+from .graph_observation import BASE_CANDIDATE_FEATURE_DIM, flatten_observation
 
 
 RESOURCE_LEVEL_VALUES: Tuple[float, ...] = (0.2, 0.4, 0.6, 0.8, 1.0)
@@ -822,6 +822,9 @@ class CandidateActorPolicy(BaseMARLPolicy):
         prior_logit_scale: float = 1.0,
         learnable_logit_blend: bool = False,
         action_prior_enabled: bool = True,
+        semantic_projection_dim: int = 8,
+        cross_agent_attention_enabled: bool = True,
+        cross_agent_attention_heads: int = 4,
     ):
         try:
             import torch
@@ -834,7 +837,12 @@ class CandidateActorPolicy(BaseMARLPolicy):
         self.nn = nn
         self.observation_dim = int(observation_dim)
         self.max_candidates = int(max_candidates)
-        self.candidate_feature_dim = int(candidate_feature_dim)
+        self.raw_candidate_feature_dim = max(BASE_CANDIDATE_FEATURE_DIM, int(candidate_feature_dim))
+        self.semantic_embedding_dim = max(0, self.raw_candidate_feature_dim - BASE_CANDIDATE_FEATURE_DIM)
+        self.semantic_projection_dim = max(0, int(semantic_projection_dim))
+        if self.semantic_embedding_dim <= 0:
+            self.semantic_projection_dim = 0
+        self.candidate_feature_dim = BASE_CANDIDATE_FEATURE_DIM - 1 + self.semantic_projection_dim
         self.route_unavailable_penalty = abs(float(route_unavailable_penalty))
         self.utility_prior_logit_weight = float(utility_prior_logit_weight)
         self.include_semantic_features = bool(include_semantic_features)
@@ -855,10 +863,14 @@ class CandidateActorPolicy(BaseMARLPolicy):
         self.prior_logit_scale = float(prior_logit_scale)
         self.learnable_logit_blend = bool(learnable_logit_blend)
         self.action_prior_enabled = bool(action_prior_enabled)
+        self.cross_agent_attention_enabled = bool(cross_agent_attention_enabled)
+        self.cross_agent_attention_heads = max(1, int(cross_agent_attention_heads))
         self.rng = random.Random(seed)
         torch.manual_seed(seed)
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.resource_levels_tensor = torch.tensor(RESOURCE_LEVEL_VALUES, dtype=torch.float32, device=self.device)
+        if self.cross_agent_attention_enabled and int(hidden_dim) % self.cross_agent_attention_heads != 0:
+            raise ValueError("cross_agent_attention_heads must divide hidden_dim")
         prior_init = (
             1.5,
             self.utility_prior_logit_weight,
@@ -890,6 +902,9 @@ class CandidateActorPolicy(BaseMARLPolicy):
                 action_dim: int,
                 hid: int,
                 cand_dim: int,
+                raw_cand_dim: int,
+                semantic_embedding_dim: int,
+                semantic_projection_dim: int,
                 node_dim: int,
                 edge_dim: int,
                 temporal_dim: int,
@@ -902,6 +917,8 @@ class CandidateActorPolicy(BaseMARLPolicy):
                 learned_logit_scale_value: float,
                 prior_logit_scale_value: float,
                 learnable_logit_blend_value: bool,
+                cross_agent_attention_enabled_value: bool,
+                cross_agent_attention_heads_value: int,
             ):
                 super().__init__()
                 depth = max(1, int(mlp_depth_value))
@@ -932,10 +949,25 @@ class CandidateActorPolicy(BaseMARLPolicy):
                 self.critic_body = mlp_body(critic_dim)
                 self.critic = nn.Linear(hid, 1)
                 self.hidden_dim = int(hid)
+                self.raw_candidate_dim = int(raw_cand_dim)
+                self.semantic_embedding_dim = int(semantic_embedding_dim)
+                self.semantic_projection_dim = int(semantic_projection_dim)
                 self.node_dim = int(node_dim)
                 self.edge_dim = int(edge_dim)
                 self.temporal_dim = int(temporal_dim)
                 self.max_agents = int(max_agents)
+                self.semantic_projector = (
+                    nn.Linear(self.semantic_embedding_dim, self.semantic_projection_dim)
+                    if self.semantic_embedding_dim > 0 and self.semantic_projection_dim > 0
+                    else None
+                )
+                self.cross_agent_attention_enabled = bool(cross_agent_attention_enabled_value)
+                self.cross_agent_attention = (
+                    nn.MultiheadAttention(hid, num_heads=int(cross_agent_attention_heads_value), batch_first=True)
+                    if self.cross_agent_attention_enabled
+                    else None
+                )
+                self.cross_agent_norm = nn.LayerNorm(hid)
                 prior_init_tensor = torch.tensor(list(prior_init_values), dtype=torch.float32)
                 if bool(learnable_prior_value):
                     self.prior_feature_weights = nn.Parameter(prior_init_tensor.clone())
@@ -977,6 +1009,49 @@ class CandidateActorPolicy(BaseMARLPolicy):
                 self.region_bandwidth_actor = mlp_head(hid + cand_dim, resource_action_dim)
                 self.region_critic_body = mlp_body(hid * max_agents)
                 self.region_critic = nn.Linear(hid, 1)
+
+            def project_candidate_features(self, raw_features):
+                import torch
+
+                if raw_features.ndim == 1:
+                    raw_features = raw_features.unsqueeze(0)
+                if raw_features.shape[-1] != self.raw_candidate_dim:
+                    raise ValueError(
+                        f"candidate feature dimension mismatch: expected {self.raw_candidate_dim}, got {raw_features.shape[-1]}"
+                    )
+                base = raw_features[:, :BASE_CANDIDATE_FEATURE_DIM]
+                non_semantic = base[:, 1:BASE_CANDIDATE_FEATURE_DIM]
+                if self.semantic_projector is None:
+                    return non_semantic
+                semantic = raw_features[:, BASE_CANDIDATE_FEATURE_DIM:self.raw_candidate_dim]
+                projected = self.semantic_projector(semantic)
+                return torch.cat([non_semantic, projected], dim=-1)
+
+            def cross_agent_contexts(self, agent_ids, contexts, neighbor_ids_by_agent):
+                import torch
+
+                keys = [str(item) for item in agent_ids]
+                if not self.cross_agent_attention_enabled or self.cross_agent_attention is None or len(keys) <= 1:
+                    return {agent_id: context for agent_id, context in zip(keys, contexts)}
+                sequence = torch.stack([context.reshape(-1) for context in contexts], dim=0)
+                memory = sequence.unsqueeze(0)
+                outputs = {}
+                for index, agent_id in enumerate(keys):
+                    allowed = {agent_id}
+                    allowed.update(str(item) for item in neighbor_ids_by_agent.get(agent_id, ()) or ())
+                    key_padding_mask = torch.ones((1, len(keys)), dtype=torch.bool, device=sequence.device)
+                    for candidate_index, candidate_agent_id in enumerate(keys):
+                        if candidate_agent_id in allowed:
+                            key_padding_mask[0, candidate_index] = False
+                    attended = self.cross_agent_attention(
+                        sequence[index].view(1, 1, -1),
+                        memory,
+                        memory,
+                        key_padding_mask=key_padding_mask,
+                        need_weights=False,
+                    )[0].reshape(-1)
+                    outputs[agent_id] = self.cross_agent_norm(sequence[index] + attended)
+                return outputs
 
             def forward(self, x):
                 return self.actor_logits(x), self.critic_value(x)
@@ -1189,6 +1264,9 @@ class CandidateActorPolicy(BaseMARLPolicy):
             self.max_candidates,
             int(hidden_dim),
             self.candidate_feature_dim,
+            self.raw_candidate_feature_dim,
+            self.semantic_embedding_dim,
+            self.semantic_projection_dim,
             self.node_feature_dim,
             self.edge_feature_dim,
             self.temporal_feature_dim,
@@ -1201,6 +1279,8 @@ class CandidateActorPolicy(BaseMARLPolicy):
             self.learned_logit_scale,
             self.prior_logit_scale,
             self.learnable_logit_blend,
+            self.cross_agent_attention_enabled,
+            self.cross_agent_attention_heads,
         ).to(self.device)
         self.optimizer = optim.Adam(list(self.model.parameters()), lr=float(lr))
 
@@ -1227,6 +1307,7 @@ class CandidateActorPolicy(BaseMARLPolicy):
             "region_candidate_actor",
             "region_compute_actor",
             "region_bandwidth_actor",
+            "semantic_projector",
         ]
         parameters: List[Any] = []
         for name in modules:
@@ -1250,6 +1331,9 @@ class CandidateActorPolicy(BaseMARLPolicy):
             "remote_attention",
             "temporal_encoder",
             "region_context",
+            "semantic_projector",
+            "cross_agent_attention",
+            "cross_agent_norm",
         ]
         parameters: List[Any] = []
         for name in modules:
@@ -1257,6 +1341,29 @@ class CandidateActorPolicy(BaseMARLPolicy):
             if module is not None:
                 parameters.extend(list(module.parameters()))
         return self._dedupe_parameters(parameters)
+
+    def _region_context_bundle(
+        self,
+        observations: Mapping[str, Mapping[str, Any]],
+        detach_encoder: bool = False,
+    ) -> Dict[str, Any]:
+        obs_by_agent = {str(agent_id): observation for agent_id, observation in dict(observations or {}).items()}
+        agent_ids = sorted(obs_by_agent)
+        contexts = [self.model.region_context_tensor(obs_by_agent[agent_id], self.device) for agent_id in agent_ids]
+        if detach_encoder:
+            contexts = [context.detach() for context in contexts]
+        if self.cross_agent_attention_enabled:
+            missing = [agent_id for agent_id in agent_ids if "neighbor_agent_ids" not in obs_by_agent[agent_id]]
+            if missing:
+                raise ValueError(f"cross-agent attention requires explicit neighbor_agent_ids for agents: {missing}")
+        neighbors = {
+            agent_id: [str(item) for item in (obs_by_agent[agent_id].get("neighbor_agent_ids", []) or [])]
+            for agent_id in agent_ids
+        }
+        enhanced = self.model.cross_agent_contexts(agent_ids, contexts, neighbors)
+        if detach_encoder:
+            return {agent_id: context.detach() for agent_id, context in enhanced.items()}
+        return enhanced
 
     def act(self, observations: Mapping[str, Mapping[str, Any]], deterministic: bool = False) -> Dict[str, Dict[str, Dict[str, str]]]:
         return self.act_with_logprobs(observations, deterministic=deterministic).actions
@@ -1277,10 +1384,11 @@ class CandidateActorPolicy(BaseMARLPolicy):
         grad_context = torch.enable_grad() if track_grad else torch.no_grad()
         with grad_context:
             centralized_value = self._centralized_value_tensor(observations) if self.centralized_critic else None
+            region_contexts = self._region_context_bundle(observations) if self.use_region_encoder else {}
             centralized_action_count = 0
             for agent_id, observation in observations.items():
                 if self.use_region_encoder:
-                    obs_tensor = self.model.region_context_tensor(observation, self.device)
+                    obs_tensor = region_contexts[str(agent_id)]
                     logits = None
                     value = None if self.centralized_critic else self.model.region_critic_value([obs_tensor])
                 else:
@@ -1396,6 +1504,7 @@ class CandidateActorPolicy(BaseMARLPolicy):
         action_count = 0
         torch = self.torch
         centralized_value = self._centralized_value_tensor(observations) if self.centralized_critic else None
+        region_contexts = self._region_context_bundle(observations) if self.use_region_encoder else {}
         filter_agent = str(action_filter.get("agent_id", "")) if action_filter else ""
         filter_sfc = str(action_filter.get("sfc_id", "")) if action_filter else ""
         filter_node = str(action_filter.get("sfc_node_id", "")) if action_filter else ""
@@ -1403,7 +1512,7 @@ class CandidateActorPolicy(BaseMARLPolicy):
             if filter_agent and str(agent_id) != filter_agent:
                 continue
             if self.use_region_encoder:
-                obs_tensor = self.model.region_context_tensor(observation, self.device)
+                obs_tensor = region_contexts[str(agent_id)]
                 logits = None
                 value = None if self.centralized_critic else self.model.region_critic_value([obs_tensor])
             else:
@@ -1523,19 +1632,15 @@ class CandidateActorPolicy(BaseMARLPolicy):
             features = features.reshape(1, -1)
         if features.numel() == 0:
             return self.torch.zeros((0, self.candidate_feature_dim), dtype=reference.dtype, device=reference.device)
-        if features.shape[-1] < self.candidate_feature_dim:
-            pad = self.torch.zeros(
-                (features.shape[0], self.candidate_feature_dim - features.shape[-1]),
-                dtype=features.dtype,
-                device=features.device,
+        if features.shape[-1] != self.raw_candidate_feature_dim:
+            raise ValueError(
+                f"raw candidate feature dimension mismatch: expected {self.raw_candidate_feature_dim}, got {features.shape[-1]}"
             )
-            features = self.torch.cat([features, pad], dim=-1)
-        elif features.shape[-1] > self.candidate_feature_dim:
-            features = features[:, : self.candidate_feature_dim]
-        if not self.include_semantic_features and features.shape[-1] > 0:
+        if not self.include_semantic_features:
             features = features.clone()
             features[:, 0] = 0.0
-        return features
+            features[:, BASE_CANDIDATE_FEATURE_DIM:] = 0.0
+        return self.model.project_candidate_features(features)
 
     def _resource_logits(self, obs_tensor: Any, candidate_features: Any) -> Tuple[Any, Any]:
         if self.use_region_encoder:
@@ -1550,15 +1655,13 @@ class CandidateActorPolicy(BaseMARLPolicy):
             deadline_slack = float(metadata.get("deadline_slack_s", 0.0) or 0.0)
             deadline_violation = max(0.0, -deadline_slack) / budget
             semantic_score = float(candidate.get("semantic_score", metadata.get("semantic_score", 0.0)) or 0.0)
-            runtime_utility = metadata.get("runtime_prior_no_semantic")
-            if runtime_utility is None:
-                runtime_utility = -float(metadata.get("expected_runtime_penalty_no_semantic_s", 0.0) or 0.0) / budget
+            route_available = float(metadata.get("route_available", 0.0) or 0.0)
             rows.append(
                 [
                     semantic_score if self.include_semantic_features else 0.0,
-                    float(runtime_utility or 0.0) if self.include_topology_features else 0.0,
+                    route_available if self.include_topology_features else 0.0,
                     deadline_violation if self.include_topology_features else 0.0,
-                    float(metadata.get("expected_runtime_penalty_s", 0.0) or 0.0) / budget
+                    float(metadata.get("estimated_compute_s", 0.0) or 0.0) / budget
                     if self.include_topology_features
                     else 0.0,
                     float(metadata.get("route_tx_time_s", 0.0) or 0.0) if self.include_topology_features else 0.0,
@@ -1583,9 +1686,9 @@ class CandidateActorPolicy(BaseMARLPolicy):
             return {}
         names = [
             "semantic",
-            "runtime_utility",
+            "route_available",
             "deadline_violation",
-            "runtime_penalty",
+            "compute_time",
             "route_tx_time",
             "route_hops",
             "topology_risk",
@@ -1618,8 +1721,14 @@ class CandidateActorPolicy(BaseMARLPolicy):
         original_ids = [str(item) for item in candidate_set.get("candidate_ids", []) or []]
         original_features = np.asarray(candidate_set.get("candidate_features", []), dtype=np.float32)
         if original_features.ndim != 2:
-            original_features = np.zeros((self.max_candidates, self.candidate_feature_dim), dtype=np.float32)
-        feature_dim = max(int(original_features.shape[1]), self.candidate_feature_dim)
+            if original_candidates:
+                raise ValueError("candidate_features must be a 2-D array when raw_candidates are present")
+            original_features = np.zeros((self.max_candidates, self.raw_candidate_feature_dim), dtype=np.float32)
+        if original_features.shape[1] != self.raw_candidate_feature_dim:
+            raise ValueError(
+                f"raw candidate feature dimension mismatch: expected {self.raw_candidate_feature_dim}, got {original_features.shape[1]}"
+            )
+        feature_dim = self.raw_candidate_feature_dim
         features = np.zeros((self.max_candidates, feature_dim), dtype=np.float32)
         candidate_mask = np.zeros((self.max_candidates,), dtype=np.float32)
         raw_candidates: List[Dict[str, Any]] = []
@@ -1630,15 +1739,6 @@ class CandidateActorPolicy(BaseMARLPolicy):
             route_available = float(_source_metric(metadata, "route_available", source, metadata.get("route_available", 0.0)) or 0.0)
             route_hops = float(_source_metric(metadata, "route_hops", source, metadata.get("route_hops", 4.0)) or 0.0)
             utility = float(_source_metric(metadata, "utility_prior", source, metadata.get("utility_prior", 0.0)) or 0.0)
-            runtime_utility = float(
-                _source_metric(
-                    metadata,
-                    "runtime_prior_no_semantic",
-                    source,
-                    metadata.get("runtime_prior_no_semantic", utility),
-                )
-                or 0.0
-            )
             deadline_slack = float(_source_metric(metadata, "deadline_slack_s", source, metadata.get("deadline_slack_s", 0.0)) or 0.0)
             function_budget = max(1.0, float(metadata.get("function_budget_s", 20.0) or 20.0))
             expected_penalty = _source_metric(metadata, "expected_runtime_penalty_s", source, metadata.get("expected_runtime_penalty_s", None))
@@ -1703,30 +1803,18 @@ class CandidateActorPolicy(BaseMARLPolicy):
             if idx < original_features.shape[0]:
                 width = min(feature_dim, original_features.shape[1])
                 features[new_idx, :width] = original_features[idx, :width]
-            if features.shape[1] >= self.candidate_feature_dim:
+            if features.shape[1] >= BASE_CANDIDATE_FEATURE_DIM:
                 if self.include_topology_features:
-                    feature_utility = utility if self.include_semantic_features else runtime_utility
+                    semantic_quality = float(metadata.get("semantic_cumulative_quality_if_selected", candidate.get("semantic_score", 0.0)) or 0.0)
+                    feature_utility = semantic_quality if self.include_semantic_features else route_available
                     features[new_idx, 5] = np.float32(load_ratio)
                     features[new_idx, 14] = np.float32(metadata["route_hops_norm"])
                     features[new_idx, 15] = np.float32(route_available)
                     features[new_idx, 18] = np.float32(max(-1.0, min(1.0, feature_utility)))
                     features[new_idx, 19] = np.float32(max(-1.0, min(1.0, deadline_slack / function_budget)))
                     features[new_idx, 20] = np.float32(min(1.0, route_tx_time / 20.0))
-                    features[new_idx, 21] = np.float32(
-                        min(
-                            1.0,
-                            float(
-                                _source_metric(
-                                    metadata,
-                                    "expected_runtime_penalty_s",
-                                    source,
-                                    metadata.get("expected_runtime_penalty_s", 0.0),
-                                )
-                                or 0.0
-                            )
-                            / function_budget,
-                        )
-                    )
+                    stale_penalty_s = float(metadata.get("stale_latency_penalty_s", 0.0) or 0.0)
+                    features[new_idx, 21] = np.float32(min(1.0, max(0.0, stale_penalty_s) / function_budget))
                     features[new_idx, 22] = np.float32(min(1.0, float(metadata.get("estimated_compute_s", 0.0) or 0.0) / 20.0))
                     features[new_idx, 23] = np.float32(1.0 if deadline_slack < 0.0 else 0.0)
                     features[new_idx, 26] = np.float32(min(1.0, wireless_hops / 4.0))
@@ -1738,6 +1826,9 @@ class CandidateActorPolicy(BaseMARLPolicy):
                     features[new_idx, 24] = np.float32(min(1.0, expected_rb_wait / 20.0))
                     features[new_idx, 25] = np.float32(min(1.0, wireless_pressure / 8.0))
                     features[new_idx, 27] = np.float32(min(1.0, rb_slowdown / 8.0))
+                if not self.include_semantic_features:
+                    features[new_idx, 0] = 0.0
+                    features[new_idx, BASE_CANDIDATE_FEATURE_DIM:] = 0.0
         updated = dict(candidate_set)
         updated["raw_candidates"] = raw_candidates
         updated["candidate_ids"] = candidate_ids
@@ -1781,11 +1872,8 @@ class CandidateActorPolicy(BaseMARLPolicy):
 
     def _centralized_value_tensor(self, observations: Mapping[str, Mapping[str, Any]]) -> Any:
         if self.use_region_encoder:
-            contexts = []
-            for agent_id in sorted(str(item) for item in observations):
-                contexts.append(self.model.region_context_tensor(observations.get(agent_id, {}), self.device))
-                if len(contexts) >= self.max_critic_agents:
-                    break
+            context_bundle = self._region_context_bundle(observations)
+            contexts = [context_bundle[agent_id] for agent_id in sorted(context_bundle)[: self.max_critic_agents]]
             return self.model.region_critic_value(contexts).squeeze()
         torch_tensor = self.torch.tensor(
             self._fit_critic_dim(self._flatten_global_state(observations)),
@@ -1841,9 +1929,9 @@ class MASACPolicy(CandidateActorPolicy):
         self,
         *args: Any,
         q_lr: Optional[float] = None,
-        alpha: float = 0.05,
+        alpha: float = 0.20,
         auto_alpha: bool = False,
-        alpha_lr: Optional[float] = None,
+        alpha_lr: Optional[float] = 3e-4,
         target_entropy: Optional[float] = None,
         target_entropy_scale: float = 0.90,
         alpha_min: float = 0.005,
@@ -1861,7 +1949,7 @@ class MASACPolicy(CandidateActorPolicy):
         self.alpha_min = max(1e-8, float(alpha_min))
         self.alpha_max = max(self.alpha_min, float(alpha_max))
         self.fixed_alpha = min(max(float(alpha), self.alpha_min), self.alpha_max)
-        self.alpha_lr = float(alpha_lr if alpha_lr is not None else kwargs.get("lr", 3e-4))
+        self.alpha_lr = float(alpha_lr if alpha_lr is not None else 3e-4)
         self.target_entropy = None if target_entropy is None else float(target_entropy)
         self.target_entropy_scale = max(0.0, float(target_entropy_scale))
         self.log_alpha = self.nn.Parameter(
@@ -1890,8 +1978,13 @@ class MASACPolicy(CandidateActorPolicy):
             module.eval()
             for parameter in module.parameters():
                 parameter.requires_grad_(False)
-        self.optimizer = self.torch.optim.Adam(self.actor_head_parameters(), lr=float(kwargs.get("lr", 3e-4)))
-        self.q_optimizer = self.torch.optim.Adam(self.q_train_parameters(), lr=float(q_lr if q_lr is not None else kwargs.get("lr", 3e-4)))
+        actor_lr = float(kwargs.get("lr", 3e-4))
+        critic_lr = float(q_lr if q_lr is not None else actor_lr)
+        lr_ratio = max(actor_lr, critic_lr) / max(1e-12, min(actor_lr, critic_lr))
+        if lr_ratio > 2.0:
+            raise ValueError(f"MASAC actor/critic learning rates differ by >2x: actor_lr={actor_lr}, q_lr={critic_lr}")
+        self.optimizer = self.torch.optim.Adam(self.actor_head_parameters(), lr=actor_lr)
+        self.q_optimizer = self.torch.optim.Adam(self.q_train_parameters(), lr=critic_lr)
         self.alpha_optimizer = (
             self.torch.optim.Adam([self.log_alpha], lr=float(self.alpha_lr)) if self.auto_alpha else None
         )
@@ -1929,23 +2022,33 @@ class MASACPolicy(CandidateActorPolicy):
         action_dim_sum = max(2, int(candidate_count) + int(compute_count) + int(bandwidth_count))
         return float(self.target_entropy_scale) * math.log(action_dim_sum)
 
-    def update_alpha(self, entropy: Any, target_entropy: Any) -> Any:
+    def update_alpha(self, entropy: Any, target_entropy: Any, max_grad_norm: Optional[float] = None) -> Tuple[Any, Any]:
         zero = self.torch.tensor(0.0, dtype=self.torch.float32, device=self.device)
         if not self.auto_alpha or self.alpha_optimizer is None:
-            return zero
+            return zero, zero
         alpha_loss = self.log_alpha * (entropy.detach() - target_entropy.detach())
         self.alpha_optimizer.zero_grad()
         alpha_loss.backward()
+        if max_grad_norm is not None and float(max_grad_norm) > 0.0:
+            alpha_grad_norm = self.torch.nn.utils.clip_grad_norm_([self.log_alpha], float(max_grad_norm))
+        else:
+            grad = self.log_alpha.grad
+            alpha_grad_norm = grad.detach().abs() if grad is not None else zero
         self.alpha_optimizer.step()
         with self.torch.no_grad():
             lower, upper = self._alpha_log_bounds()
             self.log_alpha.data.clamp_(lower, upper)
-        return alpha_loss.detach()
+        return alpha_loss.detach(), alpha_grad_norm.detach()
 
     def sac_state_dict(self) -> Dict[str, Any]:
         return {
             "algorithm": "masac_joint_resource_ctde",
             "resource_levels": list(RESOURCE_LEVEL_VALUES),
+            "raw_candidate_feature_dim": int(self.raw_candidate_feature_dim),
+            "semantic_embedding_dim": int(self.semantic_embedding_dim),
+            "semantic_projection_dim": int(self.semantic_projection_dim),
+            "cross_agent_attention_enabled": bool(self.cross_agent_attention_enabled),
+            "cross_agent_attention_heads": int(self.cross_agent_attention_heads),
             "actor": self.model.state_dict(),
             "q1": self.q1.state_dict(),
             "q2": self.q2.state_dict(),
@@ -2005,64 +2108,65 @@ class MASACPolicy(CandidateActorPolicy):
         self,
         observations: Mapping[str, Mapping[str, Any]],
         actions: Mapping[str, Any],
+        action_filter: Mapping[str, str],
         detach_encoder: bool = True,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Dict[str, Any]:
+        if not action_filter:
+            raise ValueError("masac_selected_q_values requires action_filter for per-action MASAC")
+        filter_agent = str(action_filter.get("agent_id", "") or "")
+        filter_sfc = str(action_filter.get("sfc_id", "") or "")
+        filter_node = str(action_filter.get("sfc_node_id", "") or "")
+        if not filter_agent or not filter_sfc or not filter_node:
+            raise ValueError(f"incomplete MASAC action_filter: {dict(action_filter)}")
         q1_values: List[Any] = []
         q2_values: List[Any] = []
         bundle, global_context = self._masac_context_bundle(observations, detach_encoder=detach_encoder)
         for agent_id, observation in observations.items():
             agent_key = str(agent_id)
+            if agent_key != filter_agent:
+                continue
             if agent_key not in bundle:
                 continue
             actor_input, base_logits, local_context = bundle[agent_key]
-            grouped: Dict[str, List[Mapping[str, Any]]] = {}
             for candidate_set in observation.get("candidate_sets", []) or []:
-                grouped.setdefault(str(candidate_set.get("sfc_id", "")), []).append(candidate_set)
-            for sfc_id, candidate_sets in grouped.items():
-                current_source = str(candidate_sets[0].get("source_node_id", "")) if candidate_sets else ""
-                planned_node_load: Dict[str, int] = {}
-                remaining_deadline_s, total_deadline_s = _chain_deadline_budget(candidate_sets)
-                for candidate_set in sorted(candidate_sets, key=lambda item: int(item.get("sfc_node_index", 0) or 0)):
-                    contextual = self._contextual_candidate_set(
-                        candidate_set,
-                        current_source,
-                        planned_node_load,
-                        remaining_deadline_s=remaining_deadline_s,
-                        total_deadline_s=total_deadline_s,
-                    )
-                    sfc_node_id = str(contextual.get("sfc_node_id", ""))
-                    chosen_payload = self._chosen_action_payload(actions, agent_key, str(sfc_id), sfc_node_id)
-                    chosen = _action_instance_id(chosen_payload)
-                    ids = list(contextual.get("candidate_ids", []) or [])
-                    mask_len = min(len(ids), self.max_candidates)
-                    if not chosen or str(chosen) not in ids[:mask_len] or mask_len <= 0:
-                        continue
-                    action_idx = ids[:mask_len].index(str(chosen))
-                    candidate_features = self._masac_candidate_features(contextual, mask_len, global_context)
-                    q1, q2 = self._masac_joint_q_values(
-                        global_context,
-                        local_context,
-                        candidate_features,
-                        target=False,
-                        detach_encoder=detach_encoder,
-                    )
-                    compute_idx = _resource_level_index(_action_resource_level(chosen_payload, "compute_level"))
-                    bandwidth_idx = _resource_level_index(_action_resource_level(chosen_payload, "bandwidth_level"))
-                    q1_values.append(q1[action_idx, compute_idx, bandwidth_idx])
-                    q2_values.append(q2[action_idx, compute_idx, bandwidth_idx])
-                    chosen_candidate = self._candidate_by_id(contextual, str(chosen))
-                    if chosen_candidate is not None:
-                        node_id = str(chosen_candidate.get("node_id", ""))
-                        if node_id:
-                            current_source = node_id
-                            planned_node_load[node_id] = planned_node_load.get(node_id, 0) + 1
-                            remaining_deadline_s = _consume_deadline_budget(remaining_deadline_s, chosen_candidate)
+                if str(candidate_set.get("sfc_id", "") or "") != filter_sfc:
+                    continue
+                if str(candidate_set.get("sfc_node_id", "") or "") != filter_node:
+                    continue
+                contextual = self._contextual_candidate_set(
+                    candidate_set,
+                    str(candidate_set.get("source_node_id", "") or ""),
+                    {},
+                    remaining_deadline_s=None,
+                    total_deadline_s=None,
+                )
+                chosen_payload = self._chosen_action_payload(actions, agent_key, filter_sfc, filter_node)
+                chosen = _action_instance_id(chosen_payload)
+                ids = list(contextual.get("candidate_ids", []) or [])
+                mask_len = min(len(ids), self.max_candidates)
+                if not chosen or str(chosen) not in ids[:mask_len] or mask_len <= 0:
+                    raise ValueError(f"selected action {chosen!r} is not valid for {dict(action_filter)}")
+                action_idx = ids[:mask_len].index(str(chosen))
+                candidate_features = self._masac_candidate_features(contextual, mask_len, global_context)
+                q1, q2 = self._masac_joint_q_values(
+                    global_context,
+                    local_context,
+                    candidate_features,
+                    target=False,
+                    detach_encoder=detach_encoder,
+                )
+                compute_idx = _resource_level_index(_action_resource_level(chosen_payload, "compute_level"))
+                bandwidth_idx = _resource_level_index(_action_resource_level(chosen_payload, "bandwidth_level"))
+                q1_values.append(q1[action_idx, compute_idx, bandwidth_idx])
+                q2_values.append(q2[action_idx, compute_idx, bandwidth_idx])
         if not q1_values:
-            return None
+            raise ValueError(f"no MASAC Q sample matched action_filter {dict(action_filter)}")
+        if len(q1_values) != 1:
+            raise RuntimeError(f"per-action MASAC expected one Q sample, got {len(q1_values)} for {dict(action_filter)}")
         return {
-            "q1": self.torch.stack([item.reshape(()) for item in q1_values]).mean(),
-            "q2": self.torch.stack([item.reshape(()) for item in q2_values]).mean(),
-            "action_count": len(q1_values),
+            "q1": q1_values[0].reshape(()),
+            "q2": q2_values[0].reshape(()),
+            "action_count": 1,
         }
 
     def masac_soft_state_value(
@@ -2070,11 +2174,17 @@ class MASACPolicy(CandidateActorPolicy):
         observations: Mapping[str, Mapping[str, Any]],
         target: bool = False,
         detach_encoder: bool = True,
+        action_filter: Optional[Mapping[str, str]] = None,
     ) -> Tuple[Any, Any, int]:
         values: List[Any] = []
         entropies: List[Any] = []
         alpha = self.alpha_tensor
-        for item in self._masac_candidate_items(observations, target=target, detach_encoder=detach_encoder):
+        for item in self._masac_candidate_items(
+            observations,
+            target=target,
+            detach_encoder=detach_encoder,
+            action_filter=action_filter,
+        ):
             joint = self._masac_joint_distribution(item)
             q1, q2 = self._masac_joint_q_values(
                 item["global_context"],
@@ -2095,12 +2205,21 @@ class MASACPolicy(CandidateActorPolicy):
             len(values),
         )
 
-    def masac_actor_loss(self, observations: Mapping[str, Mapping[str, Any]]) -> Tuple[Any, Any, Any, int]:
+    def masac_actor_loss(
+        self,
+        observations: Mapping[str, Mapping[str, Any]],
+        action_filter: Optional[Mapping[str, str]] = None,
+    ) -> Tuple[Any, Any, Any, int]:
         losses: List[Any] = []
         entropies: List[Any] = []
         target_entropies: List[Any] = []
         alpha = self.alpha_tensor.detach()
-        for item in self._masac_candidate_items(observations, target=False, detach_encoder=True):
+        for item in self._masac_candidate_items(
+            observations,
+            target=False,
+            detach_encoder=True,
+            action_filter=action_filter,
+        ):
             joint = self._masac_joint_distribution(item)
             q1, q2 = self._masac_joint_q_values(
                 item["global_context"],
@@ -2138,11 +2257,17 @@ class MASACPolicy(CandidateActorPolicy):
         observations: Mapping[str, Mapping[str, Any]],
         target: bool = False,
         detach_encoder: bool = False,
+        action_filter: Optional[Mapping[str, str]] = None,
     ) -> List[Dict[str, Any]]:
         items_out: List[Dict[str, Any]] = []
         bundle, global_context = self._masac_context_bundle(observations, detach_encoder=detach_encoder)
+        filter_agent = str(action_filter.get("agent_id", "") or "") if action_filter else ""
+        filter_sfc = str(action_filter.get("sfc_id", "") or "") if action_filter else ""
+        filter_node = str(action_filter.get("sfc_node_id", "") or "") if action_filter else ""
         for agent_id, observation in observations.items():
             agent_key = str(agent_id)
+            if filter_agent and agent_key != filter_agent:
+                continue
             if agent_key not in bundle:
                 continue
             actor_input, base_logits, local_context = bundle[agent_key]
@@ -2150,6 +2275,8 @@ class MASACPolicy(CandidateActorPolicy):
             for candidate_set in observation.get("candidate_sets", []) or []:
                 grouped.setdefault(str(candidate_set.get("sfc_id", "")), []).append(candidate_set)
             for _sfc_id, candidate_sets in grouped.items():
+                if filter_sfc and str(_sfc_id) != filter_sfc:
+                    continue
                 current_source = str(candidate_sets[0].get("source_node_id", "")) if candidate_sets else ""
                 planned_node_load: Dict[str, int] = {}
                 remaining_deadline_s, total_deadline_s = _chain_deadline_budget(candidate_sets)
@@ -2161,6 +2288,8 @@ class MASACPolicy(CandidateActorPolicy):
                         remaining_deadline_s=remaining_deadline_s,
                         total_deadline_s=total_deadline_s,
                     )
+                    if filter_node and str(contextual.get("sfc_node_id", "") or "") != filter_node:
+                        continue
                     ids = list(contextual.get("candidate_ids", []) or [])
                     mask_len = min(len(ids), self.max_candidates)
                     if mask_len <= 0:
@@ -2198,11 +2327,12 @@ class MASACPolicy(CandidateActorPolicy):
     ) -> Tuple[Dict[str, Tuple[Any, Any, Any]], Any]:
         bundle: Dict[str, Tuple[Any, Any, Any]] = {}
         local_contexts: List[Any] = []
-        for agent_id in sorted(str(item) for item in observations):
-            observation = observations.get(agent_id, {})
+        context_bundle = self._region_context_bundle(observations, detach_encoder=detach_encoder) if self.use_region_encoder else {}
+        obs_by_agent = {str(agent_id): observation for agent_id, observation in dict(observations or {}).items()}
+        for agent_id in sorted(obs_by_agent):
+            observation = obs_by_agent.get(agent_id, {})
             if self.use_region_encoder:
-                encoded_context = self.model.region_context_tensor(observation, self.device)
-                actor_input = encoded_context.detach() if detach_encoder else encoded_context
+                actor_input = context_bundle[agent_id]
                 base_logits = None
                 local_context = actor_input
             else:

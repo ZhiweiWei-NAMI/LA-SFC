@@ -26,13 +26,18 @@ for path in (AIRFOGSIM_ROOT, METHOD_ROOT, WORKSPACE_ROOT):
 from airfogsim.lasdm.baselines import baseline_names
 from airfogsim.lasdm.benchmark_adapter import run_lasdm_benchmark_suite
 from airfogsim.lasdm.env_adapter import LASDMEnvAdapter
-from airfogsim.lasdm.graph_observation import flatten_observation
+from airfogsim.lasdm.graph_observation import BASE_CANDIDATE_FEATURE_DIM, flatten_observation
 from airfogsim.lasdm.marl_policy import IPPOPolicy, MASACPolicy, policy_from_name
 from airfogsim.lasdm.marl_trainer import (
     ReplayBuffer,
-    SACTransition,
+    RunningRewardNormalizer,
     TrainingMetrics,
+    add_per_action_transitions,
+    apply_terminal_credits,
+    build_per_action_transitions,
+    count_placement_actions,
     masac_update_policy,
+    reward_config_from_env,
     write_reward_curve,
 )
 from airfogsim.lasdm.runtime_bridge import LASDMRuntimeBridge
@@ -408,6 +413,11 @@ def train_semantic_ippo_runtime(
             capacity=int(marl_cfg.get("masac_replay_capacity", 20000) or 20000),
             seed=int(seed),
         )
+        reward_normalizer = (
+            RunningRewardNormalizer(clip=float(marl_cfg.get("masac_reward_clip", 5.0) or 5.0))
+            if bool(marl_cfg.get("masac_reward_normalization", True))
+            else None
+        )
         sac_update_index = 0
         sac_batch_size = int(marl_cfg.get("masac_batch_size", 128) or 128)
         sac_replay_warmup_steps = int(marl_cfg.get("masac_replay_warmup_steps", 128) or 128)
@@ -416,13 +426,13 @@ def train_semantic_ippo_runtime(
         sac_updates_per_env_step = int(marl_cfg.get("masac_updates_per_env_step", 1) or 1)
         sac_tau = float(marl_cfg.get("masac_tau", 0.005) or 0.005)
         sac_auto_alpha = bool(marl_cfg.get("masac_auto_alpha", False))
-        sac_alpha_lr = float(marl_cfg.get("masac_alpha_lr", marl_cfg.get("masac_q_lr", 3e-4)) or 3e-4)
+        sac_alpha_lr = float(marl_cfg.get("masac_alpha_lr", 3e-4) or 3e-4)
         sac_target_entropy = _float_metric(marl_cfg.get("masac_target_entropy", None))
         sac_target_entropy_scale = float(marl_cfg.get("masac_target_entropy_scale", 0.90) or 0.90)
         sac_alpha_min = float(marl_cfg.get("masac_alpha_min", 0.005) or 0.005)
         sac_alpha_max = float(marl_cfg.get("masac_alpha_max", 0.25) or 0.25)
         sac_reward_scale = float(marl_cfg.get("masac_reward_scale", 1.0) or 1.0)
-        max_grad_norm = float(marl_cfg.get("masac_max_grad_norm", 1.0) or 1.0)
+        max_grad_norm = float(marl_cfg.get("masac_max_grad_norm", 10.0) or 10.0)
         sac_replay_sample_strategy = str(marl_cfg.get("masac_replay_sample_strategy", "uniform") or "uniform")
         for episode in range(int(episodes)):
             scenario = _ippo_training_scenario_for_episode(
@@ -486,7 +496,7 @@ def train_semantic_ippo_runtime(
                     policy = MASACPolicy(
                         **_ippo_policy_kwargs(policy_config, obs_dim, max_candidates, seed, observations=observations),
                         q_lr=float(marl_cfg.get("masac_q_lr", marl_cfg.get("ippo_lr", 3e-4)) or 3e-4),
-                        alpha=float(marl_cfg.get("masac_alpha", 0.05) or 0.05),
+                            alpha=float(marl_cfg.get("masac_alpha", 0.20) or 0.20),
                         auto_alpha=sac_auto_alpha,
                         alpha_lr=sac_alpha_lr,
                         target_entropy=sac_target_entropy,
@@ -505,96 +515,130 @@ def train_semantic_ippo_runtime(
                         obs_dim=int(obs_dim),
                         max_candidates=int(max_candidates),
                     )
-                total = 0.0
-                for step in range(int(max_steps)):
-                    current_observations = observations
-                    _append_runtime_debug_event(
-                        debug_path,
-                        "step_policy_start",
-                        baseline=baseline,
-                        seed=int(seed),
-                        episode=int(episode),
-                        step=int(step),
-                        replay_size=len(replay_buffer),
-                    )
-                    policy_step = policy.act_with_logprobs(current_observations, deterministic=False, track_grad=False)
-                    actions = policy_step.actions
-                    action_count = sum(len(agent_actions or []) for agent_actions in actions.values())
-                    _append_runtime_debug_event(
-                        debug_path,
-                        "step_env_start",
-                        baseline=baseline,
-                        seed=int(seed),
-                        episode=int(episode),
-                        step=int(step),
-                        action_count=int(action_count),
-                    )
-                    observations, rewards, done, info = env.step(actions)
-                    mean_reward = sum(rewards.values()) / max(1, len(rewards))
-                    total += mean_reward
-                    replay_buffer.add(
-                        SACTransition(
-                            observations=current_observations,
-                            actions=actions,
-                            reward=float(mean_reward),
-                            next_observations=observations,
-                            done=bool(done or step + 1 >= int(max_steps)),
-                            episode=int(episode),
-                            scenario=str(scenario.get("name", "default")),
-                            source="policy",
-                        )
-                    )
-                    if len(replay_buffer) >= max(1, sac_replay_warmup_steps) and len(replay_buffer) % sac_update_interval == 0:
-                        next_update_index = sac_update_index + 1
+                    total = 0.0
+                    last_transition_by_chain: Dict[str, Any] = {}
+                    step_diagnostic_totals = {
+                        "env_action_count": 0.0,
+                        "replay_transitions_added": 0.0,
+                        "no_action_steps_skipped": 0.0,
+                        "orphan_terminal_credit_count": 0.0,
+                    }
+                    for step in range(int(max_steps)):
+                        current_observations = observations
                         _append_runtime_debug_event(
                             debug_path,
-                            "sac_update_start",
+                            "step_policy_start",
                             baseline=baseline,
                             seed=int(seed),
                             episode=int(episode),
                             step=int(step),
                             replay_size=len(replay_buffer),
-                            update_index=int(next_update_index),
-                            update_actor=bool(next_update_index % sac_actor_update_interval == 0),
                         )
-                        metrics = masac_update_policy(
-                            policy,
+                        policy_step = policy.act_with_logprobs(current_observations, deterministic=False, track_grad=False)
+                        actions = policy_step.actions
+                        action_count = count_placement_actions(actions)
+                        _append_runtime_debug_event(
+                            debug_path,
+                            "step_env_start",
+                            baseline=baseline,
+                            seed=int(seed),
+                            episode=int(episode),
+                            step=int(step),
+                            action_count=int(action_count),
+                        )
+                        observations, rewards, done, info = env.step(actions)
+                        mean_reward = sum(rewards.values()) / max(1, len(rewards))
+                        total += mean_reward
+                        transitions, replay_step_metrics = build_per_action_transitions(
+                            current_observations,
+                            actions,
+                            observations,
+                            bool(done or step + 1 >= int(max_steps)),
+                            int(episode),
+                            str(scenario.get("name", "default")),
+                            reward_config_from_env(env),
+                        )
+                        add_per_action_transitions(
                             replay_buffer,
-                            batch_size=sac_batch_size,
-                            updates=sac_updates_per_env_step,
-                            gamma=float(marl_cfg.get("masac_gamma", 0.99) or 0.99),
-                            tau=sac_tau,
-                            max_grad_norm=max_grad_norm,
-                            reward_scale=sac_reward_scale,
-                            sample_strategy=sac_replay_sample_strategy,
-                            update_actor=bool(next_update_index % sac_actor_update_interval == 0),
+                            transitions,
+                            last_transition_by_chain,
+                            reward_normalizer=reward_normalizer,
                         )
-                        _append_runtime_debug_event(
-                            debug_path,
-                            "sac_update_end",
-                            baseline=baseline,
-                            seed=int(seed),
-                            episode=int(episode),
-                            step=int(step),
-                            replay_size=len(replay_buffer),
-                            update_index=int(next_update_index),
-                            metric_count=len(metrics or {}),
+                        terminal_metrics = apply_terminal_credits(
+                            info.get("terminal_events", []) or [],
+                            last_transition_by_chain,
+                            replay_buffer,
+                            reward_normalizer=reward_normalizer,
                         )
-                        if metrics:
-                            sac_update_index += 1
-                            sac_diagnostic_rows.append(
-                                {
-                                    "episode": int(episode),
-                                    "step": int(step),
-                                    "seed": int(seed),
-                                    "baseline": baseline,
-                                    "update_index": sac_update_index,
-                                    "replay_size": len(replay_buffer),
-                                    "batch_size": sac_batch_size,
-                                    **metrics,
-                                }
+                        for metrics_source in (replay_step_metrics, terminal_metrics):
+                            for key in step_diagnostic_totals:
+                                step_diagnostic_totals[key] += float(metrics_source.get(key, 0.0) or 0.0)
+                        replay_buffer.mark_env_step()
+                        if replay_buffer.should_update(sac_replay_warmup_steps, sac_update_interval):
+                            next_update_index = sac_update_index + 1
+                            _append_runtime_debug_event(
+                                debug_path,
+                                "sac_update_start",
+                                baseline=baseline,
+                                seed=int(seed),
+                                episode=int(episode),
+                                step=int(step),
+                                replay_size=len(replay_buffer),
+                                replay_total_added=int(replay_buffer.total_added),
+                                update_index=int(next_update_index),
+                                update_actor=bool(next_update_index % sac_actor_update_interval == 0),
                             )
-                            _write_csv_dynamic(seed_dir / "sac_diagnostics.csv", sac_diagnostic_rows)
+                            metrics = masac_update_policy(
+                                policy,
+                                replay_buffer,
+                                batch_size=sac_batch_size,
+                                updates=sac_updates_per_env_step,
+                                gamma=float(marl_cfg.get("masac_gamma", 0.99) or 0.99),
+                                tau=sac_tau,
+                                max_grad_norm=max_grad_norm,
+                                reward_scale=sac_reward_scale,
+                                reward_transform=reward_normalizer.transform if reward_normalizer is not None else None,
+                                sample_strategy=sac_replay_sample_strategy,
+                                update_actor=bool(next_update_index % sac_actor_update_interval == 0),
+                            )
+                            if metrics and reward_normalizer is not None:
+                                metrics = {**metrics, **reward_normalizer.snapshot()}
+                            if metrics:
+                                metrics = {**metrics, **step_diagnostic_totals}
+                                step_diagnostic_totals = {
+                                    "env_action_count": 0.0,
+                                    "replay_transitions_added": 0.0,
+                                    "no_action_steps_skipped": 0.0,
+                                    "orphan_terminal_credit_count": 0.0,
+                                }
+                            _append_runtime_debug_event(
+                                debug_path,
+                                "sac_update_end",
+                                baseline=baseline,
+                                seed=int(seed),
+                                episode=int(episode),
+                                step=int(step),
+                                replay_size=len(replay_buffer),
+                                replay_total_added=int(replay_buffer.total_added),
+                                update_index=int(next_update_index),
+                                metric_count=len(metrics or {}),
+                            )
+                            if metrics:
+                                sac_update_index += 1
+                                sac_diagnostic_rows.append(
+                                    {
+                                        "episode": int(episode),
+                                        "step": int(step),
+                                        "seed": int(seed),
+                                        "baseline": baseline,
+                                        "update_index": sac_update_index,
+                                        "replay_size": len(replay_buffer),
+                                        "replay_total_added": int(replay_buffer.total_added),
+                                        "batch_size": sac_batch_size,
+                                        **metrics,
+                                    }
+                                )
+                                _write_csv_dynamic(seed_dir / "sac_diagnostics.csv", sac_diagnostic_rows)
                     summary_dict = dict(info.get("summary", {}) or {})
                     summary_dict.update(_runtime_task_summary_from_env(env))
                     episode_summary = dict(summary_dict)
@@ -833,7 +877,7 @@ def train_semantic_ippo_runtime(
             "masac_batch_size": sac_batch_size,
             "masac_update_interval": sac_update_interval,
             "masac_actor_update_interval": sac_actor_update_interval,
-            "masac_alpha": float(marl_cfg.get("masac_alpha", 0.05) or 0.05),
+            "masac_alpha": float(marl_cfg.get("masac_alpha", 0.20) or 0.20),
             "masac_auto_alpha": sac_auto_alpha,
             "masac_alpha_lr": sac_alpha_lr,
             "masac_target_entropy": sac_target_entropy if sac_target_entropy is not None else "",
@@ -842,6 +886,8 @@ def train_semantic_ippo_runtime(
             "masac_alpha_max": sac_alpha_max,
             "masac_tau": sac_tau,
             "masac_replay_sample_strategy": sac_replay_sample_strategy,
+            "masac_reward_normalization": bool(reward_normalizer is not None),
+            "masac_reward_clip": float(marl_cfg.get("masac_reward_clip", 5.0) or 5.0),
             "checkpoint_selection_interval": selection_interval,
             "checkpoint_selection_early_interval": early_selection_interval,
             "checkpoint_selection_early_until_episode": early_selection_until,
@@ -1199,6 +1245,9 @@ def _semantic_policy_for_eval(
         except TypeError:
             state = torch.load(checkpoint, map_location="cpu")
         actor_state = state.get("actor", state) if isinstance(state, Mapping) else state
+        if isinstance(actor_state, Mapping) and isinstance(state, Mapping) and "raw_candidate_feature_dim" in state:
+            actor_state = dict(actor_state)
+            actor_state["raw_candidate_feature_dim"] = state["raw_candidate_feature_dim"]
         obs_dim = _checkpoint_observation_dim(actor_state) or (
             max(len(flatten_observation(obs)) for obs in observations.values()) if observations else 1
         )
@@ -1206,9 +1255,9 @@ def _semantic_policy_for_eval(
         policy = MASACPolicy(
             **_ippo_policy_kwargs(policy_config, obs_dim, action_dim, seed, observations=observations, state=actor_state),
             q_lr=float(marl_cfg.get("masac_q_lr", marl_cfg.get("ippo_lr", 3e-4)) or 3e-4),
-            alpha=float(marl_cfg.get("masac_alpha", 0.05) or 0.05),
+            alpha=float(marl_cfg.get("masac_alpha", 0.20) or 0.20),
             auto_alpha=bool(marl_cfg.get("masac_auto_alpha", False)),
-            alpha_lr=float(marl_cfg.get("masac_alpha_lr", marl_cfg.get("masac_q_lr", 3e-4)) or 3e-4),
+            alpha_lr=float(marl_cfg.get("masac_alpha_lr", 3e-4) or 3e-4),
             target_entropy=_float_metric(marl_cfg.get("masac_target_entropy", None)),
             target_entropy_scale=float(marl_cfg.get("masac_target_entropy_scale", 0.90) or 0.90),
             alpha_min=float(marl_cfg.get("masac_alpha_min", 0.005) or 0.005),
@@ -1216,8 +1265,7 @@ def _semantic_policy_for_eval(
             tau=float(marl_cfg.get("masac_tau", 0.005) or 0.005),
             q_mlp_depth=int(marl_cfg.get("masac_q_mlp_depth", 3) or 3),
         )
-        strict = _checkpoint_has_critic_body(actor_state)
-        policy.load_sac_state_dict(state, strict=strict)
+        policy.load_sac_state_dict(state, strict=True)
         policy.checkpoint_loaded = True
         policy.checkpoint_path = str(checkpoint)
         policy.checkpoint_sha256 = _sha256_file(checkpoint)
@@ -1276,9 +1324,9 @@ def _trained_policy_for_eval(
         policy = IQLPolicy(
             **_ippo_policy_kwargs(policy_config, obs_dim, action_dim, seed, observations=observations, state=actor_state),
             q_lr=float(marl_cfg.get("iql_q_lr", marl_cfg.get("masac_q_lr", marl_cfg.get("ippo_lr", 3e-4))) or 3e-4),
-            alpha=float(marl_cfg.get("masac_alpha", 0.05) or 0.05),
+            alpha=float(marl_cfg.get("masac_alpha", 0.20) or 0.20),
             auto_alpha=bool(marl_cfg.get("masac_auto_alpha", False)),
-            alpha_lr=float(marl_cfg.get("masac_alpha_lr", marl_cfg.get("masac_q_lr", 3e-4)) or 3e-4),
+            alpha_lr=float(marl_cfg.get("masac_alpha_lr", 3e-4) or 3e-4),
             target_entropy=_float_metric(marl_cfg.get("masac_target_entropy", None)),
             target_entropy_scale=float(marl_cfg.get("masac_target_entropy_scale", 0.90) or 0.90),
             alpha_min=float(marl_cfg.get("masac_alpha_min", 0.005) or 0.005),
@@ -1673,8 +1721,6 @@ def _ippo_policy_kwargs(
     marl_cfg = dict(config.get("marl", {}) or {})
     checkpoint_critic_dim = _checkpoint_critic_observation_dim(state or {})
     centralized_critic = bool(marl_cfg.get("ippo_centralized_critic", True))
-    if state is not None and not _checkpoint_has_critic_body(state):
-        centralized_critic = False
     region_agents = list(dict(config.get("topology", {}) or {}).get("region_agents", []) or [])
     observed_agents = list((observations or {}).keys())
     critic_agents = int(
@@ -1686,7 +1732,9 @@ def _ippo_policy_kwargs(
     )
     critic_dim = int(checkpoint_critic_dim or (int(obs_dim) * max(1, critic_agents)))
     device = str(marl_cfg.get("ippo_device", "") or "")
-    candidate_feature_dim = _checkpoint_candidate_feature_dim(state or {}) or _observation_candidate_feature_dim(observations or {}) or 31
+    candidate_feature_dim = _checkpoint_candidate_feature_dim(state or {}) or _observation_candidate_feature_dim(observations or {})
+    if candidate_feature_dim is None:
+        candidate_feature_dim = _configured_candidate_feature_dim(config)
     return {
         "observation_dim": int(obs_dim),
         "max_candidates": int(max_candidates),
@@ -1714,6 +1762,9 @@ def _ippo_policy_kwargs(
         ),
         "learnable_logit_blend": bool(marl_cfg.get("ippo_learnable_logit_blend", False)),
         "action_prior_enabled": bool(marl_cfg.get("ippo_action_prior_enabled", True)),
+        "semantic_projection_dim": int(marl_cfg.get("semantic_projection_dim", 8) or 8),
+        "cross_agent_attention_enabled": bool(marl_cfg.get("cross_agent_attention_enabled", True)),
+        "cross_agent_attention_heads": int(marl_cfg.get("cross_agent_attention_heads", 4) or 4),
         "device": device or None,
     }
 
@@ -1736,29 +1787,45 @@ def _checkpoint_observation_dim(state: Mapping[str, Any]) -> Optional[int]:
 def _observation_candidate_feature_dim(observations: Mapping[str, Mapping[str, Any]]) -> Optional[int]:
     for observation in observations.values():
         for candidate_set in observation.get("candidate_sets", []) or []:
-            features = candidate_set.get("candidate_features")
-            shape = getattr(features, "shape", None)
-            if shape is not None and len(shape) == 2 and int(shape[1]) > 0:
-                return int(shape[1])
+            width = _candidate_feature_width(candidate_set.get("candidate_features"))
+            if width is not None:
+                return width
     return None
+
+
+def _configured_candidate_feature_dim(config: Mapping[str, Any]) -> int:
+    semantic_cfg = dict(config.get("semantic_exchange", {}) or {})
+    embedding_dim = int(semantic_cfg.get("embedding_dim", 0) or 0)
+    if embedding_dim <= 0:
+        raise ValueError("semantic_exchange.embedding_dim must be set to build learned policy candidate features.")
+    return int(BASE_CANDIDATE_FEATURE_DIM + embedding_dim)
+
+
+def _candidate_feature_width(features: Any) -> Optional[int]:
+    shape = getattr(features, "shape", None)
+    if shape is not None:
+        if len(shape) != 2:
+            raise ValueError(f"candidate_features must be 2-D, got shape {tuple(shape)}")
+        width = int(shape[1])
+        return width if width > 0 and int(shape[0]) > 0 else None
+    if not features:
+        return None
+    first = features[0]
+    if not hasattr(first, "__len__") or isinstance(first, (str, bytes)):
+        raise ValueError("candidate_features must be a 2-D numeric sequence")
+    width = len(first)
+    if width <= 0:
+        return None
+    return int(width)
 
 
 def _checkpoint_candidate_feature_dim(state: Mapping[str, Any]) -> Optional[int]:
     if not isinstance(state, Mapping):
         return None
-    hidden_dim = None
-    body_weight = state.get("body.0.weight")
-    body_shape = getattr(body_weight, "shape", None)
-    if body_shape is not None and len(body_shape) >= 1:
-        hidden_dim = int(body_shape[0])
-    for key in ("region_candidate_actor.0.weight", "candidate_actor.0.weight"):
-        weight = state.get(key)
-        shape = getattr(weight, "shape", None)
-        if shape is None or len(shape) < 2:
-            continue
-        if hidden_dim is not None and int(shape[1]) > hidden_dim:
-            return int(shape[1]) - hidden_dim
-    return None
+    value = state.get("raw_candidate_feature_dim")
+    if value in (None, ""):
+        return None
+    return int(value)
 
 
 def _checkpoint_action_dim(state: Mapping[str, Any]) -> Optional[int]:
@@ -1775,10 +1842,6 @@ def _checkpoint_critic_observation_dim(state: Mapping[str, Any]) -> Optional[int
     if shape is not None and len(shape) >= 2:
         return int(shape[1])
     return None
-
-
-def _checkpoint_has_critic_body(state: Mapping[str, Any]) -> bool:
-    return isinstance(state, Mapping) and "critic_body.0.weight" in state
 
 
 def _read_checkpoint_summary_seed(path: Path) -> Optional[int]:
@@ -1910,7 +1973,7 @@ def _semantic_runtime_explainability_metrics(env: Any) -> Dict[str, Any]:
         1.0
         for candidate in selected_candidates
         if float(candidate.get("staleness_s", 0.0) or 0.0) > 0.0
-        or str(dict(candidate.get("metadata", {}) or {}).get("semantic_group", "")) == "stale_remote_candidates"
+        or str(dict(candidate.get("metadata", {}) or {}).get("semantic_group", "")) == "stale_clone_exact"
     ]
     phase_durations = _task_phase_durations(lifecycle_rows)
     encoder_manifest = {}

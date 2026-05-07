@@ -25,7 +25,7 @@ import time
 import uuid
 import subprocess
 import socket
-from typing import List, Dict
+from typing import Dict, List
 from .utils.tk_utils import parse_location_info
 
 
@@ -110,6 +110,9 @@ class AirFogSimEnv():
         self.V2U_channel = {'time': 0, 'data_size': 0}
         self.V2I_channel = {'time': 0, 'data_size': 0}
         self.U2I_channel = {'time': 0, 'data_size': 0}
+        self._last_wireless_link_metrics = []
+        self._last_wired_link_metrics = []
+        self.last_link_metrics_snapshot = self._link_metrics_snapshot()
 
     def reset(self):
         """Reset the environment.
@@ -564,6 +567,7 @@ class AirFogSimEnv():
         tmp_failed_tasks = [] # 临时存储失败的任务，仅包括传输层面的失败1）节点不在场景中；2）两次传输间隔超过channel timeout
         tx_size_dict = {}
         rx_size_dict = {}
+        wireless_metrics = {}
         for task_idx, task_profile in activated_task_dict.items():
             task = task_profile['task']
             assert isinstance(task, Task)
@@ -578,16 +582,12 @@ class AirFogSimEnv():
                 task.setTaskFailueCode(EnumerateConstants.TASK_FAIL_OUT_OF_NODE)
                 tmp_failed_tasks.append(task_profile)
                 continue
-            # check if the task is out of the transmission time
-            last_transmission_time = task.getLastTransmissionTime()
-            if task.isReturning():
-                last_transmission_time = task.getLastReturnTime()
-            trans_data = np.sum(
-                self.channel_manager.getRateByChannelType(tx_idx, rx_idx, channel_type, allocated_RB_Nos)) * self.simulation_interval
+            rate_mbps_sum = float(np.sum(self.channel_manager.getRateByChannelType(tx_idx, rx_idx, channel_type, allocated_RB_Nos)))
+            trans_data = rate_mbps_sum * float(self.simulation_interval)
 
             tx_size = tx_size_dict.get(tx_id, 0)
             tx_size += trans_data
-            tx_size_dict[rx_id] = tx_size
+            tx_size_dict[tx_id] = tx_size
             rx_size = rx_size_dict.get(rx_id, 0)
             rx_size += trans_data
             rx_size_dict[rx_id] = rx_size
@@ -596,6 +596,37 @@ class AirFogSimEnv():
             trans_flag = task.transmit_to_Node(rx_id, trans_data, self.simulation_time)
             if trans_flag:
                 tmp_succeed_tasks.append(task_profile)
+            metric_key = (str(tx_id), str(rx_id), str(channel_type).lower())
+            metric = wireless_metrics.setdefault(
+                metric_key,
+                {
+                    'src': str(tx_id),
+                    'dst': str(rx_id),
+                    'link_type': str(channel_type).lower(),
+                    'channel_type': str(channel_type),
+                    'is_wireless': True,
+                    'rate_mbps_sum': 0.0,
+                    'transmitted_mbit': 0.0,
+                    'transmitted_bytes': 0.0,
+                    'simulation_interval_s': float(self.simulation_interval),
+                    'allocated_rb_nos': [],
+                    'allocated_rb_count': 0,
+                    'task_count': 0,
+                    'success_count': 0,
+                    'failure_count': 0,
+                },
+            )
+            allocated = [int(item) for item in list(allocated_RB_Nos)] if allocated_RB_Nos is not None else []
+            metric['rate_mbps_sum'] += rate_mbps_sum
+            metric['transmitted_mbit'] += float(trans_data)
+            metric['transmitted_bytes'] += float(trans_data) * 1e6 / 8.0
+            metric['allocated_rb_nos'] = sorted(set(metric['allocated_rb_nos'] + allocated))
+            metric['allocated_rb_count'] = len(metric['allocated_rb_nos'])
+            metric['task_count'] += 1
+            if float(trans_data) > 0.0:
+                metric['success_count'] += 1
+            else:
+                metric['failure_count'] += 1
 
             self.channel['data_size'] += trans_data
             if channel_type == 'V2I':
@@ -610,6 +641,8 @@ class AirFogSimEnv():
         self.U2I_channel['time'] += self.simulation_interval
 
         self.channel_manager.setThisTimeslotTransSize(tx_size_dict, rx_size_dict)  # used for update energy in self._updateEnergy()
+        self._last_wireless_link_metrics = sorted(wireless_metrics.values(), key=lambda item: (item['src'], item['dst'], item['link_type']))
+        self._refresh_link_metrics_snapshot()
 
         for task_profile in tmp_succeed_tasks:
             flag = self.task_manager.finishOffloadingTask(task_profile['task'], self.simulation_time)
@@ -767,6 +800,11 @@ class AirFogSimEnv():
         
         # 执行一步有线传输
         results = self.wired_manager.step(self.simulation_interval)
+        self._last_wired_link_metrics = [
+            dict(item, is_wireless=False)
+            for item in getattr(self.wired_manager, 'last_step_link_metrics', [])
+        ]
+        self._refresh_link_metrics_snapshot()
         
         # 更新任务传输状态
         for task_id, transmitted_bytes in results.items():
@@ -784,6 +822,25 @@ class AirFogSimEnv():
             trans_flag = task.transmit_to_Node(rx_id, transmitted_bytes, self.simulation_time)
             if trans_flag:
                 self.task_manager.finishOffloadingTask(task, self.simulation_time)
+
+    def _refresh_link_metrics_snapshot(self):
+        self.last_link_metrics_snapshot = self._link_metrics_snapshot()
+
+    def _link_metrics_snapshot(self):
+        measured_links = [dict(item) for item in getattr(self, '_last_wireless_link_metrics', [])]
+        measured_links.extend(dict(item) for item in getattr(self, '_last_wired_link_metrics', []))
+        return {
+            'time_s': float(getattr(self, 'simulation_time', 0.0) or 0.0),
+            'measured_links': measured_links,
+            'wireless': [dict(item) for item in getattr(self, '_last_wireless_link_metrics', [])],
+            'wired': [dict(item) for item in getattr(self, '_last_wired_link_metrics', [])],
+            'aggregates': {
+                'channel': dict(getattr(self, 'channel', {}) or {}),
+                'v2u': dict(getattr(self, 'V2U_channel', {}) or {}),
+                'v2i': dict(getattr(self, 'V2I_channel', {}) or {}),
+                'u2i': dict(getattr(self, 'U2I_channel', {}) or {}),
+            },
+        }
 
     def _updateComputation(self):
         """Update the computation for the entities.

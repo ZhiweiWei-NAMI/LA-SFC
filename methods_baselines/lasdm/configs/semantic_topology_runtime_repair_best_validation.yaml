@@ -56,10 +56,10 @@ runtime:
         storage: 4096
 
 training:
-  episodes: 100
+  episodes: 500
   max_steps: 100
-  train_seeds: [0, 1, 2, 3, 4]
-  eval_seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  train_seeds: [0]
+  eval_seeds: [0]
 
 marl:
   runtime_ticks_per_marl_step: 1
@@ -86,15 +86,20 @@ marl:
   ippo_prior_l2_coef: 0.001
   ippo_critic_agent_count: 4
   ippo_device: cuda
+  semantic_projection_dim: 8
+  cross_agent_attention_enabled: true
+  cross_agent_attention_heads: 4
   ippo_utility_prior_logit_weight: 2.5
   ippo_route_unavailable_penalty: 20.0
   masac_training_scenario_sampling: balanced
-  masac_alpha: 0.05
+  masac_alpha: 0.20
   masac_auto_alpha: true
-  masac_alpha_lr: 0.0001
+  masac_alpha_lr: 0.0003
   masac_target_entropy_scale: 0.90
   masac_alpha_min: 0.005
   masac_alpha_max: 0.25
+  masac_reward_normalization: true
+  masac_reward_clip: 5.0
   masac_replay_sample_strategy: scenario_balanced
   # topology_greedy penalties use the same observable runtime factors as the reward.
   topology_greedy_load_penalty: 0.50
@@ -145,8 +150,7 @@ semantic_exchange:
   fixed_delay_s: 0.05
   per_hop_delay_s: 0.01
   top_k_per_agent: 48
-  compressed_dim: 64
-  quantization_bits: 8
+  embedding_dim: 384
 
 semantic_topology_experiment:
   task_classes:
@@ -199,7 +203,7 @@ semantic_topology_experiment:
       exchange_ttl_s: 6.0
       exchange_radius_hops: 2
       exchange_top_k: 64
-      semantic_compressed_dim: 64
+      semantic_embedding_dim: 384
       wireless_rb_budget: 10
       wireless_contention_factor: 1.0
       candidate_decoys:
@@ -233,7 +237,7 @@ semantic_topology_figure_sweeps:
   ttl_radius:
     ttl_s: [2.0, 6.0, 10.0]
     exchange_radius_hops: [1, 2, 3]
-    eval_seeds: [0, 1, 2]
+    eval_seeds: [0]
     baselines: [topology_greedy, proposed_semantic_topology_marl, centralized_planner]
     rationale: >
       TTL and exchange radius control distributed semantic discovery coverage.

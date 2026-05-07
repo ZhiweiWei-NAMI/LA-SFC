@@ -18,7 +18,7 @@ from .model import GraphStatus, LASDMServiceChain, SFCFailureReason
 from .orchestrator import LASDMDecision
 from .runtime_bridge import LASDMRuntimeBridge
 from .semantic_encoder import SemanticEncoder
-from .semantic_exchange import SemanticCompressor, SemanticExchange, SemanticExchangeConfig
+from .semantic_exchange import SemanticExchange, SemanticExchangeConfig
 from .service_discovery_protocol import DistributedServiceDiscoveryProtocol
 from .temporal_state_buffer import TemporalStateBuffer
 from .topology_builder import DynamicTopology, TopologyBuilder
@@ -44,9 +44,8 @@ class MARLEnvConfig:
     semantic_exchange_fixed_delay_s: float = 0.10
     semantic_exchange_per_hop_delay_s: float = 0.02
     semantic_exchange_top_k_per_agent: int = 32
-    semantic_exchange_compressed_dim: int = 64
-    semantic_exchange_quantization_bits: int = 8
-    semantic_encoder_backend: str = "hash"
+    semantic_exchange_embedding_dim: int = 384
+    semantic_encoder_backend: str = "sbert"
     semantic_encoder_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
     semantic_encoder_hash_dim: int = 384
     semantic_encoder_batch_size: int = 64
@@ -56,7 +55,7 @@ class MARLEnvConfig:
     runtime_ticks_per_marl_step: int = 1
     runtime_max_ticks_after_action: int = 25
     runtime_stop_when_progress: bool = True
-    route_hop_floor_s: float = 1.0
+    route_hop_floor_s: float = 0.10
     global_candidate_catalog: bool = False
     region_agents: Tuple[str, ...] = ()
     sequential_capacity_enabled: bool = True
@@ -130,6 +129,7 @@ class SemanticTopologyMARLEnv:
                 include_topology_features=self.config.include_topology_features,
                 include_temporal_features=self.config.include_temporal_features,
                 include_semantic_features=self.config.include_semantic_features,
+                semantic_embedding_dim=self.config.semantic_exchange_embedding_dim,
             )
         )
         self.temporal_buffer = TemporalStateBuffer(maxlen=self.config.temporal_window)
@@ -161,6 +161,7 @@ class SemanticTopologyMARLEnv:
                 include_topology_features=self.config.include_topology_features,
                 include_temporal_features=self.config.include_temporal_features,
                 include_semantic_features=self.config.include_semantic_features,
+                semantic_embedding_dim=self.config.semantic_exchange_embedding_dim,
             )
         )
         self.discovery_protocol = self._build_default_discovery_protocol()
@@ -221,6 +222,7 @@ class SemanticTopologyMARLEnv:
         previous_done_tasks = len(getattr(self.runtime_bridge, "processed_done_tasks", set()) or set())
         previous_failed_tasks = len(getattr(self.runtime_bridge, "processed_failed_tasks", set()) or set())
         submitted_before_action = self._submit_due_chains(now)
+        previous_chain_status = _chain_status_snapshot(self.manager.chains)
         topology = self._update_topology(now)
         if self.config.auto_exchange:
             self._semantic_exchange_tick(now, topology)
@@ -296,6 +298,7 @@ class SemanticTopologyMARLEnv:
         )
         reward_value = self.reward_fn(previous_summary, self.manager.summary(), aux)
         rewards = {agent_id: reward_value for agent_id in self.agent_ids}
+        terminal_events = _chain_terminal_events(previous_chain_status, self.manager.chains, self.reward_fn)
         done = self.done()
         info = {
             "time_s": next_now,
@@ -305,6 +308,7 @@ class SemanticTopologyMARLEnv:
             "summary": self.manager.summary(),
             "runtime_report": runtime_report,
             "reward_aux": aux,
+            "terminal_events": terminal_events,
             "message_overhead": self.discovery_protocol.exchange.overhead_summary(),
             "arrival_queue": {
                 "pending": len(self._pending_chain_ids),
@@ -454,21 +458,17 @@ class SemanticTopologyMARLEnv:
             device=str(self.config.semantic_encoder_device) or None,
         )
         _ = encoder.backend_active
+        if str(self.config.semantic_encoder_backend).lower() == "sbert" and str(encoder.backend_active) != "sbert":
+            raise RuntimeError(f"semantic encoder backend mismatch: configured sbert, active {encoder.backend_active}")
         exchange_config = SemanticExchangeConfig(
             ttl_s=float(self.config.semantic_exchange_ttl_s),
             radius_hops=int(self.config.semantic_exchange_radius_hops),
             fixed_delay_s=float(self.config.semantic_exchange_fixed_delay_s),
             per_hop_delay_s=float(self.config.semantic_exchange_per_hop_delay_s),
             top_k_per_agent=int(self.config.semantic_exchange_top_k_per_agent),
-            compressed_dim=int(self.config.semantic_exchange_compressed_dim),
-            quantization_bits=int(self.config.semantic_exchange_quantization_bits),
+            embedding_dim=int(self.config.semantic_exchange_embedding_dim),
         )
-        compressor = SemanticCompressor(
-            input_dim=encoder.embedding_dim,
-            compressed_dim=exchange_config.compressed_dim,
-            quantization_bits=exchange_config.quantization_bits,
-        )
-        exchange = SemanticExchange(exchange_config, compressor=compressor)
+        exchange = SemanticExchange(exchange_config)
         per_region = split_directory_by_region(self.manager.directory)
         if not per_region:
             raise RuntimeError("semantic discovery requires at least one service region")
@@ -492,7 +492,6 @@ class SemanticTopologyMARLEnv:
                 region_id,
                 directory,
                 encoder=encoder,
-                compressor=compressor,
                 respect_local_visibility=not self.config.global_candidate_catalog,
                 semantic_matrix=self.config.semantic_matrix,
             )
@@ -522,14 +521,20 @@ class SemanticTopologyMARLEnv:
 
     def _build_observations(self, topology: DynamicTopology, now: float) -> Dict[str, Dict[str, Any]]:
         observations: Dict[str, Dict[str, Any]] = {}
+        neighbor_map: Mapping[str, Mapping[str, int]] = {}
+        if self.config.include_topology_features:
+            direct_neighbors = self.topology_builder.neighbor_map_by_region(topology)
+            neighbor_map = _expand_neighbor_map_by_radius(direct_neighbors, int(self.config.semantic_exchange_radius_hops))
         for agent_id in self.agent_ids:
             candidate_sets = self._candidate_sets_for_agent(agent_id, now)
-            observations[agent_id] = self.observation_builder.build(
+            observation = self.observation_builder.build(
                 agent_id=agent_id,
                 topology=topology,
                 candidate_sets=candidate_sets,
                 temporal_buffer=self.temporal_buffer,
             )
+            observation["neighbor_agent_ids"] = sorted(str(item) for item in dict(neighbor_map.get(agent_id, {}) or {}))
+            observations[agent_id] = observation
         return observations
 
     def _candidate_sets_for_agent(self, agent_id: str, now: float) -> List[Dict[str, Any]]:
@@ -686,6 +691,9 @@ class SemanticTopologyMARLEnv:
                     "wireless_hops",
                     "rb_slowdown",
                     "rb_slowdown_tx_extra_s",
+                    "minimum_runtime_s",
+                    "semantic_mismatch_cost_s",
+                    "stale_latency_penalty_s",
                     "expected_runtime_penalty_s",
                     "deadline_slack_s",
                     "utility_prior",
@@ -833,16 +841,7 @@ class SemanticTopologyMARLEnv:
         resource_available_ratio = max(0.0, min(1.0, float(resource_available_slots) / float(max_concurrency)))
         effective_cpu = max(0.1, (capacity_cpu / float(max_concurrency)) * max(0.1, 1.0 - 0.5 * load_ratio))
         estimated_compute_s = max(0.0, task_cpu / effective_cpu) if task_cpu > 0.0 else 0.0
-        expected_penalty_s = (
-            mismatch_cost_s
-            + estimated_compute_s
-            + cold_start_s
-            + stale_cost_s
-            + route_tx_time_s
-            + 4.0 * topology_risk
-            + 4.0 * mobility_risk
-        )
-        runtime_penalty_no_semantic_s = max(0.0, expected_penalty_s - mismatch_cost_s)
+        minimum_runtime_s = max(0.0, estimated_compute_s) + max(0.0, cold_start_s) + max(0.0, stale_cost_s) + max(0.0, route_tx_time_s)
         fields["semantic_score"] = semantic_score
         fields["link_similarity"] = semantic_score
         fields["node_template_similarity"] = max(0.0, min(1.0, float(metadata.get("node_template_similarity", semantic_score) or 0.0)))
@@ -857,8 +856,11 @@ class SemanticTopologyMARLEnv:
         fields["candidate_capacity_cpu"] = capacity_cpu
         fields["effective_cpu"] = effective_cpu
         fields["estimated_compute_s"] = estimated_compute_s
-        fields["expected_runtime_penalty_s"] = expected_penalty_s
-        fields["expected_runtime_penalty_no_semantic_s"] = runtime_penalty_no_semantic_s
+        fields["semantic_mismatch_cost_s"] = mismatch_cost_s
+        fields["stale_latency_penalty_s"] = stale_cost_s
+        fields["minimum_runtime_s"] = minimum_runtime_s
+        fields["expected_runtime_penalty_s"] = minimum_runtime_s
+        fields["expected_runtime_penalty_no_semantic_s"] = minimum_runtime_s
         fields["function_budget_s"] = function_budget_s
         fields["chain_deadline_s"] = deadline_s
         fields["chain_elapsed_s"] = elapsed_s
@@ -882,16 +884,16 @@ class SemanticTopologyMARLEnv:
         fields["capacity_exhausted"] = 1.0 if resource_available_slots <= 0 else 0.0
         fields["hops_from_prev_function"] = hop_count
         fields["hops_from_prev_function_norm"] = min(1.0, float(hop_count) / 4.0)
-        fields["deadline_slack_s"] = function_budget_s - expected_penalty_s if function_budget_s > 0.0 else 0.0
+        fields["deadline_slack_s"] = function_budget_s - minimum_runtime_s if function_budget_s > 0.0 else 0.0
         fields["sequential_deadline_feasible"] = (
             1.0
             if not self.config.sequential_deadline_pruning_enabled
             or deadline_s <= 0.0
-            or expected_penalty_s <= remaining_deadline_s + 1e-9
+            or minimum_runtime_s <= remaining_deadline_s + 1e-9
             else 0.0
         )
-        fields["utility_prior"] = semantic_cumulative_quality - (expected_penalty_s / max(1.0, function_budget_s or 1.0))
-        fields["runtime_prior_no_semantic"] = -(runtime_penalty_no_semantic_s / max(1.0, function_budget_s or 1.0))
+        fields["utility_prior"] = semantic_cumulative_quality
+        fields["runtime_prior_no_semantic"] = -(minimum_runtime_s / max(1.0, function_budget_s or 1.0))
         return fields
 
     def _semantic_input_for_sfc_node(self, chain: LASDMServiceChain, sfc_node_id: str) -> str:
@@ -1041,7 +1043,7 @@ class SemanticTopologyMARLEnv:
             return True, 0, 0.0, 0.0, 0.0, 0, 0.0
         topology = self.last_topology
         if topology is None or source not in topology.nodes or target not in topology.nodes:
-            return False, 4, 1.0, 4.0, 4.0, 4, 0.1
+            return False, 0, 1.0, 0.0, 0.0, 0, 0.0
         payload_key = round(max(0.0, float(payload_mb)), 6)
         cache_key = (source, target, payload_key)
         cached = self._route_reachability_cache.get(cache_key)
@@ -1051,7 +1053,7 @@ class SemanticTopologyMARLEnv:
         if result is not None:
             self._route_reachability_cache[cache_key] = result
             return result
-        result = (False, 4, 1.0, 4.0, 4.0, 4, 0.1)
+        result = (False, 0, 1.0, 0.0, 0.0, 0, 0.0)
         self._route_reachability_cache[cache_key] = result
         return result
 
@@ -1117,8 +1119,10 @@ class SemanticTopologyMARLEnv:
             return self._route_adjacency_cache
         adjacency: Dict[str, List[Tuple[str, float, float, bool, float]]] = {}
         for edge in topology.edges:
+            if float(edge.rate_mbps or 0.0) <= 0.0 or float(edge.reliability or 0.0) <= 0.0:
+                continue
             edge_risk = max(0.0, min(1.0, 1.0 - float(edge.reliability)))
-            rate_mbps = max(0.1, float(edge.rate_mbps or 0.0))
+            rate_mbps = float(edge.rate_mbps or 0.0)
             edge_latency_s = max(0.0, float(edge.latency_s or 0.0))
             adjacency.setdefault(str(edge.src), []).append(
                 (str(edge.dst), edge_risk, edge_latency_s, bool(edge.is_wireless), rate_mbps)
@@ -1258,6 +1262,9 @@ class SemanticTopologyMARLEnv:
             "wireless_pressure": "wireless_pressure_by_source",
             "wireless_hops": "wireless_hops_by_source",
             "rb_slowdown": "rb_slowdown_by_source",
+            "minimum_runtime_s": "minimum_runtime_s_by_source",
+            "semantic_mismatch_cost_s": "semantic_mismatch_cost_s_by_source",
+            "stale_latency_penalty_s": "stale_latency_penalty_s_by_source",
             "expected_runtime_penalty_s": "expected_runtime_penalty_s_by_source",
             "deadline_slack_s": "deadline_slack_s_by_source",
             "utility_prior": "utility_prior_by_source",
@@ -1429,6 +1436,35 @@ def _topology_trace_summary(topology: DynamicTopology) -> Dict[str, Any]:
         "edge_types": edge_types,
         "metadata": dict(topology.metadata),
     }
+
+
+def _chain_status_snapshot(chains: Mapping[str, LASDMServiceChain]) -> Dict[str, GraphStatus]:
+    return {str(sfc_id): chain.status for sfc_id, chain in chains.items()}
+
+
+def _chain_terminal_events(
+    previous_status: Mapping[str, GraphStatus],
+    chains: Mapping[str, LASDMServiceChain],
+    reward_fn: SFCReward,
+) -> List[Dict[str, Any]]:
+    if not isinstance(reward_fn, SFCReward):
+        raise TypeError("terminal event attribution requires SFCReward")
+    terminal_statuses = {GraphStatus.SUCCEEDED, GraphStatus.FAILED, GraphStatus.TIMED_OUT}
+    events: List[Dict[str, Any]] = []
+    for sfc_id, chain in chains.items():
+        old_status = previous_status.get(str(sfc_id))
+        new_status = chain.status
+        if old_status in terminal_statuses or new_status not in terminal_statuses:
+            continue
+        terminal_reward = reward_fn.config.success if new_status == GraphStatus.SUCCEEDED else reward_fn.config.timeout
+        events.append(
+            {
+                "sfc_id": str(sfc_id),
+                "status": str(new_status.value),
+                "terminal_reward": float(terminal_reward),
+            }
+        )
+    return events
 
 
 def _reward_aux_from_decisions(decisions: Sequence[LASDMDecision]) -> Dict[str, float]:

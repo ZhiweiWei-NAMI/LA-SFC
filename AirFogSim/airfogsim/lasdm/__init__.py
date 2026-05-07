@@ -15,7 +15,7 @@ from .api import build_manager_from_yaml, load_chains_from_yaml, load_instances_
 # Semantic-topology MARL extension exports.
 from .semantic_encoder import SemanticEncoder, SemanticTextRecord, SemanticMatch
 from .semantic_cache import EmbeddingCache, SemanticAdvertisement, SemanticAdvertisementCache
-from .semantic_exchange import SemanticCompressor, SemanticExchange, SemanticExchangeConfig
+from .semantic_exchange import SemanticExchange, SemanticExchangeConfig
 from .distributed_catalog import CatalogCandidate, DistributedServiceCatalog
 from .service_discovery_protocol import DistributedServiceDiscoveryProtocol, DiscoveryRequest
 from .topology_builder import DynamicTopology, TopologyBuilder, TopologyNode, TopologyEdge

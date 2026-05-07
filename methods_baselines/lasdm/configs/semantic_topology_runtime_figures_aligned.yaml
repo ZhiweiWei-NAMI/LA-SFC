@@ -57,10 +57,10 @@ runtime:
         storage: 100000
 
 training:
-  episodes: 200
+  episodes: 500
   max_steps: 100
-  train_seeds: [0, 1, 2, 3, 4]
-  eval_seeds: [0, 1, 2, 3, 4]
+  train_seeds: [0]
+  eval_seeds: [0]
 
 marl:
   runtime_ticks_per_marl_step: 1
@@ -90,6 +90,9 @@ marl:
   ippo_prior_logit_scale_init: 0.0
   ippo_critic_agent_count: 4
   ippo_device: cuda
+  semantic_projection_dim: 8
+  cross_agent_attention_enabled: true
+  cross_agent_attention_heads: 4
   ippo_utility_prior_logit_weight: 0.0
   ippo_route_unavailable_penalty: 20.0
   ippo_behavior_clone_pretrain_episodes: 0
@@ -105,23 +108,25 @@ marl:
     - fraction: 0.40
       scenarios: [train_fig_task_nodes_20, train_fig_task_nodes_40, train_fig_task_nodes_60, train_fig_task_nodes_80]
   masac_gamma: 0.90
-  masac_alpha: 0.05
+  masac_alpha: 0.20
   masac_auto_alpha: true
-  masac_alpha_lr: 0.005
+  masac_alpha_lr: 0.0003
   masac_target_entropy_scale: 0.98
   masac_alpha_min: 0.005
   masac_alpha_max: 0.25
   masac_tau: 0.01
   masac_q_lr: 0.005
   masac_q_mlp_depth: 3
-  masac_batch_size: 512
+  masac_batch_size: 256
   masac_replay_capacity: 10000
   masac_replay_warmup_steps: 1024
   masac_update_interval: 50
   masac_actor_update_interval: 2
   masac_updates_per_env_step: 1
-  masac_max_grad_norm: 1.0
+  masac_max_grad_norm: 10.0
   masac_reward_scale: 1.0
+  masac_reward_normalization: true
+  masac_reward_clip: 5.0
   masac_replay_sample_strategy: scenario_balanced
   iql_batch_size: 8
   iql_offline_updates: 80
@@ -157,7 +162,6 @@ marl:
     semantic_score: 0.15
     semantic_cumulative: 0.15
     utility_prior: 0.0
-    stale_remote: -0.20
     topology_risk: -0.20
     mobility_risk: -0.15
     cold_start: -0.03
@@ -190,8 +194,7 @@ semantic_exchange:
   fixed_delay_s: 0.0
   per_hop_delay_s: 0.0
   top_k_per_agent: 64
-  compressed_dim: 64
-  quantization_bits: 8
+  embedding_dim: 384
 
 semantic_topology_experiment:
   service_pressure_model:

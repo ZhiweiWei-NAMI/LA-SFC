@@ -284,13 +284,24 @@ class LASDMEnvAdapter:
         }
 
     def collect_link_snapshot(self, env: Any) -> Dict[str, Any]:
-        """Return lightweight communication state available without mutating AirFogSim."""
+        """Return measured communication state from the previous AirFogSim tick."""
 
+        snapshot = copy.deepcopy(getattr(env, "last_link_metrics_snapshot", {}) or {})
+        measured_links = snapshot.get("measured_links", [])
+        if not isinstance(measured_links, list):
+            raise ValueError("last_link_metrics_snapshot.measured_links must be a list")
         return {
-            "channel": dict(getattr(env, "channel", {}) or {}),
-            "v2u": dict(getattr(env, "V2U_channel", {}) or {}),
-            "v2i": dict(getattr(env, "V2I_channel", {}) or {}),
-            "u2i": dict(getattr(env, "U2I_channel", {}) or {}),
+            "time_s": float(snapshot.get("time_s", _resolve_time(env)) or 0.0),
+            "measured_links": measured_links,
+            "wireless": list(snapshot.get("wireless", []) or []),
+            "wired": list(snapshot.get("wired", []) or []),
+            "aggregates": {
+                **dict(snapshot.get("aggregates", {}) or {}),
+                "channel": dict(getattr(env, "channel", {}) or {}),
+                "v2u": dict(getattr(env, "V2U_channel", {}) or {}),
+                "v2i": dict(getattr(env, "V2I_channel", {}) or {}),
+                "u2i": dict(getattr(env, "U2I_channel", {}) or {}),
+            },
         }
 
     def sync_service_instances(
@@ -1088,6 +1099,15 @@ def _percentile(values: Sequence[float], percentile: float) -> float:
 
 def _link_data_size(links: Mapping[str, Any]) -> float:
     total = 0.0
+    aggregates = links.get("aggregates") if isinstance(links, Mapping) else None
+    if isinstance(aggregates, Mapping):
+        for value in aggregates.values():
+            if isinstance(value, Mapping):
+                try:
+                    total += float(value.get("data_size", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    continue
+        return total
     for value in links.values():
         if isinstance(value, Mapping):
             try:

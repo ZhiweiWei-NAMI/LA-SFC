@@ -336,8 +336,11 @@ class SemanticBaselinePolicyTests(unittest.TestCase):
         )
 
         self.assertEqual(encoded["candidate_ids"], ["semantic_mid_runtime_good", "semantic_high_runtime_bad"])
+        self.assertEqual(encoded["candidate_features"].shape, (2, 415))
         self.assertEqual(float(encoded["candidate_features"][0][0]), 0.0)
         self.assertEqual(float(encoded["candidate_features"][1][0]), 0.0)
+        self.assertEqual(float(encoded["candidate_features"][0][31:].sum()), 0.0)
+        self.assertEqual(float(encoded["candidate_features"][1][31:].sum()), 0.0)
 
 
 if __name__ == "__main__":

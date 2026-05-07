@@ -9,7 +9,6 @@ from .instance_directory import ServiceInstance, ServiceInstanceDirectory
 from .semantic_link_matrix import SemanticLinkMatrix
 from .semantic_cache import SemanticAdvertisement, SemanticAdvertisementCache
 from .semantic_encoder import SemanticEncoder, service_instance_text, sfc_node_text
-from .semantic_exchange import SemanticCompressor
 
 
 @dataclass(frozen=True)
@@ -27,6 +26,7 @@ class CatalogCandidate:
     payload_bytes: int = 0
     input_semantic: str = "any"
     output_semantic: str = "any"
+    semantic_embedding: Tuple[float, ...] = field(default_factory=tuple)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -44,6 +44,7 @@ class CatalogCandidate:
             "payload_bytes": self.payload_bytes,
             "input_semantic": self.input_semantic,
             "output_semantic": self.output_semantic,
+            "semantic_embedding": list(self.semantic_embedding),
             "metadata": dict(self.metadata),
         }
 
@@ -56,14 +57,12 @@ class DistributedServiceCatalog:
         agent_id: str,
         local_directory: Optional[ServiceInstanceDirectory] = None,
         encoder: Optional[SemanticEncoder] = None,
-        compressor: Optional[SemanticCompressor] = None,
         respect_local_visibility: bool = True,
         semantic_matrix: Optional[SemanticLinkMatrix] = None,
     ):
         self.agent_id = str(agent_id)
         self.local_directory = local_directory or ServiceInstanceDirectory()
-        self.encoder = encoder or SemanticEncoder(backend="hash")
-        self.compressor = compressor or SemanticCompressor(input_dim=self.encoder.embedding_dim)
+        self.encoder = encoder or SemanticEncoder(backend="sbert")
         self.respect_local_visibility = bool(respect_local_visibility)
         self.semantic_matrix = semantic_matrix
         self.remote_cache = SemanticAdvertisementCache(owner_agent_id=self.agent_id)
@@ -126,6 +125,7 @@ class DistributedServiceCatalog:
                 self._local_embedding_key_by_instance[instance.instance_id] = (str(instance.version), str(instance_text))
             similarity = float(self.encoder.similarity(query_vec, np.asarray(vector, dtype=np.float32).reshape(1, -1))[0])
             score = _semantic_fidelity(similarity)
+            semantic_embedding = _embedding_tuple(vector)
             metadata.update(
                 {
                     "node_template_similarity": score,
@@ -153,6 +153,7 @@ class DistributedServiceCatalog:
                     is_remote=False,
                     input_semantic=str(instance.input_semantic),
                     output_semantic=str(instance.output_semantic),
+                    semantic_embedding=semantic_embedding,
                     metadata=metadata,
                 )
             )
@@ -167,8 +168,12 @@ class DistributedServiceCatalog:
                     continue
                 metadata = _remote_candidate_metadata(ad, now_s)
                 truth = self._truth_metadata(request_type, ad.service_id, metadata, link_input_semantic)
-                similarity = float(self.compressor.compressed_similarity(query_vec, ad.compressed_embedding))
+                remote_vector = np.asarray(ad.semantic_embedding, dtype=np.float32).reshape(1, -1)
+                if remote_vector.shape[1] != query_vec.size:
+                    raise ValueError(f"remote semantic embedding dimension mismatch: expected {query_vec.size}, got {remote_vector.shape[1]}")
+                similarity = float(self.encoder.similarity(query_vec, remote_vector)[0])
                 score = _semantic_fidelity(similarity)
+                semantic_embedding = _embedding_tuple(remote_vector.reshape(-1))
                 metadata.update(
                     {
                         "node_template_similarity": score,
@@ -197,6 +202,7 @@ class DistributedServiceCatalog:
                         payload_bytes=ad.payload_bytes,
                         input_semantic=str(ad.input_semantic),
                         output_semantic=str(ad.output_semantic),
+                        semantic_embedding=semantic_embedding,
                         metadata=metadata,
                     )
                 )
@@ -274,6 +280,10 @@ def _semantic_fidelity(score: float) -> float:
         # weak negative evidence through hard clipping.
         value = 0.5 * (value + 1.0)
     return max(0.0, min(1.0, value))
+
+
+def _embedding_tuple(vector: np.ndarray) -> Tuple[float, ...]:
+    return tuple(float(item) for item in np.asarray(vector, dtype=np.float32).reshape(-1).tolist())
 
 
 def _candidate_metadata(instance: ServiceInstance) -> Dict[str, Any]:

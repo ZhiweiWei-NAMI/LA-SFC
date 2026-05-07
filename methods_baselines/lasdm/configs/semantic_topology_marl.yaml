@@ -314,6 +314,7 @@ marl:
   min_semantic_similarity: -1.0
   temporal_window: 4
   max_candidates: 64
+  route_hop_floor_s: 0.10
   auto_exchange: true
   include_remote_candidates: true
   ippo_centralized_critic: true
@@ -328,25 +329,30 @@ marl:
   ippo_prior_logit_scale_init: 0.2
   ippo_critic_agent_count: 4
   ippo_device: cuda
+  semantic_projection_dim: 8
+  cross_agent_attention_enabled: true
+  cross_agent_attention_heads: 4
   ippo_lr: 0.005
   masac_gamma: 0.90
-  masac_alpha: 0.05
+  masac_alpha: 0.20
   masac_auto_alpha: true
-  masac_alpha_lr: 0.005
+  masac_alpha_lr: 0.0003
   masac_target_entropy_scale: 0.98
   masac_alpha_min: 0.005
   masac_alpha_max: 0.25
   masac_tau: 0.01
   masac_q_lr: 0.005
   masac_q_mlp_depth: 3
-  masac_batch_size: 512
+  masac_batch_size: 256
   masac_replay_capacity: 10000
   masac_replay_warmup_steps: 1024
   masac_update_interval: 50
   masac_actor_update_interval: 2
   masac_updates_per_env_step: 1
-  masac_max_grad_norm: 1.0
+  masac_max_grad_norm: 10.0
   masac_reward_scale: 1.0
+  masac_reward_normalization: true
+  masac_reward_clip: 5.0
   masac_replay_sample_strategy: scenario_balanced
   masac_training_scenario_sampling: balanced
   ippo_checkpoint_selection_interval: 0
@@ -364,8 +370,7 @@ semantic_exchange:
   sbert_model_name: sentence-transformers/all-MiniLM-L6-v2
   encoder_device: cuda
   encoder_batch_size: 64
-  compressed_dim: 64
-  quantization_bits: 8
+  embedding_dim: 384
   ttl_s: 5.0
   fixed_delay_s: 0.0
   per_hop_delay_s: 0.0
@@ -386,10 +391,10 @@ topology:
     full_hybrid: [rsu, cloud_server, vehicle, uav]
 
 training:
-  episodes: 200
+  episodes: 500
   max_steps: 100
-  eval_seeds: [0,1,2,3,4,5,6,7,8,9]
-  train_seeds: [0,1,2,3,4]
+  eval_seeds: [0]
+  train_seeds: [0]
 
 semantic_topology_experiment:
   baselines:
@@ -436,4 +441,3 @@ semantic_topology_experiment:
     task_arrival_rate_sfc_per_s: [0.3, 0.6, 1.2]
     service_supply_ratio: [0.5, 1.0, 1.5]
     ttl_s: [1.0, 3.0, 5.0, 10.0]
-    compressed_dim: [16, 32, 64, 128]

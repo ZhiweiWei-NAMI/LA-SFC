@@ -41,7 +41,7 @@ class SemanticEncoder:
     def __init__(
         self,
         model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
-        backend: str = "hash",
+        backend: str = "sbert",
         normalize: bool = True,
         hash_dim: int = 384,
         batch_size: int = 64,

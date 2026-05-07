@@ -7,7 +7,17 @@ from typing import Any, Callable, Dict, List, Mapping, Optional
 from .iql_policy import IQLPolicy
 from .marl_env import SemanticTopologyMARLEnv
 from .marl_policy import BaseMARLPolicy, policy_from_name
-from .marl_trainer import HeuristicEvaluator, ReplayBuffer, SACTransition, TrainingMetrics, write_reward_curve
+from .marl_trainer import (
+    HeuristicEvaluator,
+    ReplayBuffer,
+    SACTransition,
+    TrainingMetrics,
+    add_per_action_transitions,
+    apply_terminal_credits,
+    build_per_action_transitions,
+    reward_config_from_env,
+    write_reward_curve,
+)
 
 
 class IQLTrainer:
@@ -57,23 +67,35 @@ class IQLTrainer:
                 scenario_name = str(getattr(getattr(env, "config", None), "scenario_name", "") or "")
                 observations = env.reset()
                 total = 0.0
+                last_transition_by_chain: Dict[str, SACTransition] = {}
+                replay_added = 0
+                no_action_steps = 0
+                orphan_terminal_credits = 0
                 for step in range(int(max_steps)):
                     current = observations
                     actions = self.behavior_policy.act(current, deterministic=True)
                     observations, rewards, done, info = env.step(actions)
                     mean_reward = sum(rewards.values()) / max(1, len(rewards))
                     total += mean_reward
-                    self.replay.add(
-                        SACTransition(
-                            observations=current,
-                            actions=actions,
-                            reward=float(mean_reward),
-                            next_observations=observations,
-                            done=bool(done or step + 1 >= int(max_steps)),
-                            episode=int(episode),
-                            source="offline_behavior",
-                        )
+                    transitions, transition_metrics = build_per_action_transitions(
+                        current,
+                        actions,
+                        observations,
+                        bool(done or step + 1 >= int(max_steps)),
+                        int(episode),
+                        scenario_name,
+                        reward_config_from_env(env),
+                        source="offline_behavior",
                     )
+                    add_per_action_transitions(self.replay, transitions, last_transition_by_chain)
+                    terminal_metrics = apply_terminal_credits(
+                        info.get("terminal_events", []) or [],
+                        last_transition_by_chain,
+                        self.replay,
+                    )
+                    replay_added += int(transition_metrics.get("replay_transitions_added", 0.0) or 0.0)
+                    no_action_steps += int(transition_metrics.get("no_action_steps_skipped", 0.0) or 0.0)
+                    orphan_terminal_credits += int(terminal_metrics.get("orphan_terminal_credit_count", 0.0) or 0.0)
                     summary = info.get("summary", {})
                     behavior_rows.append(
                         TrainingMetrics(
@@ -98,6 +120,9 @@ class IQLTrainer:
                     "episode": int(episode),
                     "scenario": scenario_name,
                     "replay_size": len(self.replay),
+                    "replay_transitions_added": replay_added,
+                    "no_action_steps_skipped": no_action_steps,
+                    "orphan_terminal_credit_count": orphan_terminal_credits,
                 }
             )
             if output_dir is not None:
@@ -196,9 +221,16 @@ def iql_update_policy(
         target_items = []
         actor_losses = []
         weights = []
+        valid_q_samples = 0
 
         for transition in batch:
-            for item in policy._masac_candidate_items(transition.observations, target=False, detach_encoder=True):
+            action_filter = transition.action_filter()
+            for item in policy._masac_candidate_items(
+                transition.observations,
+                target=False,
+                detach_encoder=True,
+                action_filter=action_filter,
+            ):
                 q1, q2 = policy._masac_joint_q_values(
                     item["global_context"],
                     item["local_context"],
@@ -212,25 +244,33 @@ def iql_update_policy(
                 v_pred = policy.v_net(policy.iql_v_input(item)).squeeze(-1)
                 v_losses.append(expectile_loss(q_data - v_pred, policy.expectile))
 
-            selected = policy.masac_selected_q_values(transition.observations, transition.actions, detach_encoder=True)
-            if selected is not None:
-                with torch.no_grad():
-                    next_v = policy.iql_state_value(transition.next_observations, detach_encoder=True)
-                    done = 1.0 if transition.done else 0.0
-                    target = float(reward_scale) * float(transition.reward) + float(gamma) * (1.0 - done) * next_v
-                q1_items.append(selected["q1"])
-                q2_items.append(selected["q2"])
-                target_items.append(target.reshape(()))
+            selected = policy.masac_selected_q_values(
+                transition.observations,
+                transition.actions,
+                action_filter=action_filter,
+                detach_encoder=True,
+            )
+            with torch.no_grad():
+                next_filter = transition.next_action_filter if transition.next_action_filter else None
+                next_v = policy.iql_state_value(transition.next_observations, detach_encoder=True, action_filter=next_filter) if next_filter else torch.tensor(0.0, dtype=torch.float32, device=policy.device)
+                done = 1.0 if transition.done else 0.0
+                target = float(reward_scale) * float(transition.reward) + float(gamma) * (1.0 - done) * next_v
+            q1_items.append(selected["q1"])
+            q2_items.append(selected["q2"])
+            target_items.append(target.reshape(()))
+            valid_q_samples += 1
 
-                evaluation = policy.evaluate_actions(transition.observations, transition.actions)
-                if evaluation is not None:
-                    with torch.no_grad():
-                        v_current = policy.iql_state_value(transition.observations, detach_encoder=True)
-                        q_selected = torch.minimum(selected["q1"], selected["q2"]).detach()
-                        advantage = q_selected - v_current.detach()
-                        weight = torch.exp(advantage / max(1e-6, float(policy.beta))).clamp(max=100.0)
-                    actor_losses.append(-weight * evaluation.log_prob_tensor.reshape(()))
-                    weights.append(weight.reshape(()))
+            evaluation = policy.evaluate_actions(transition.observations, transition.actions, action_filter=action_filter)
+            if evaluation is not None:
+                with torch.no_grad():
+                    v_current = policy.iql_state_value(transition.observations, detach_encoder=True, action_filter=action_filter)
+                    q_selected = torch.minimum(selected["q1"], selected["q2"]).detach()
+                    advantage = q_selected - v_current.detach()
+                    weight = torch.exp(advantage / max(1e-6, float(policy.beta))).clamp(max=100.0)
+                actor_losses.append(-weight * evaluation.log_prob_tensor.reshape(()))
+                weights.append(weight.reshape(()))
+        if valid_q_samples != len(batch):
+            raise RuntimeError(f"per-action IQL expected {len(batch)} valid Q samples, got {valid_q_samples}")
 
         if v_losses:
             v_loss = torch.stack([item.reshape(()) for item in v_losses]).mean()
@@ -281,6 +321,8 @@ def iql_update_policy(
             "q_grad_norm": float(q_grad_norm.detach().cpu().item()),
             "actor_grad_norm": float(actor_grad_norm.detach().cpu().item()),
             "q_target_mean": float(targets.mean().detach().cpu().item()),
+            "valid_q_samples": float(valid_q_samples),
+            "valid_q_sample_ratio": float(valid_q_samples / max(1, len(batch))),
         }
     return metrics
 

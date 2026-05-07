@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import itertools
 import math
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .env_adapter import LASDMEnvAdapter
 from .instance_directory import ServiceInstanceDirectory
@@ -69,33 +68,13 @@ class DynamicTopology:
 class TopologyBuilder:
     """Extracts a dynamic aerial-ground topology from AirFogSim snapshots."""
 
-    DEFAULT_RANGES_M = {
-        "v2v": 300.0,
-        "v2u": 650.0,
-        "u2v": 650.0,
-        "v2i": 500.0,
-        "i2v": 500.0,
-        "u2i": 1000.0,
-        "i2u": 1000.0,
-        "u2u": 900.0,
-        "i2i": 2500.0,
-        "i2c": float("inf"),
-        "c2i": float("inf"),
-    }
-
     def __init__(
         self,
         env_adapter: Optional[LASDMEnvAdapter] = None,
         directory: Optional[ServiceInstanceDirectory] = None,
-        max_link_distance_m: Optional[float] = None,
-        link_ranges_m: Optional[Mapping[str, float]] = None,
     ):
         self.env_adapter = env_adapter or LASDMEnvAdapter(directory=directory)
         self.directory = directory
-        self.max_link_distance_m = max_link_distance_m
-        self.link_ranges_m = dict(self.DEFAULT_RANGES_M)
-        if link_ranges_m:
-            self.link_ranges_m.update({str(key).lower(): float(value) for key, value in link_ranges_m.items()})
 
     def build(self, env: Any, current_time: Optional[float] = None) -> DynamicTopology:
         now = _resolve_time(env, current_time)
@@ -147,6 +126,8 @@ class TopologyBuilder:
         result = {region: set() for region in regions}
         node_region = {node_id: node.region_id for node_id, node in topology.nodes.items()}
         for edge in topology.edges:
+            if edge.rate_mbps <= 0.0 or edge.reliability <= 0.0:
+                continue
             a = node_region.get(edge.src)
             b = node_region.get(edge.dst)
             if not a or not b or a == b:
@@ -157,23 +138,67 @@ class TopologyBuilder:
 
     def _infer_edges(self, nodes: Mapping[str, TopologyNode], raw_links: Mapping[str, Any]) -> List[TopologyEdge]:
         edges: List[TopologyEdge] = []
-        for src, dst in itertools.permutations(sorted(nodes), 2):
+        measured_links = raw_links.get("measured_links", [])
+        if measured_links is None:
+            measured_links = []
+        if not isinstance(measured_links, Sequence) or isinstance(measured_links, (str, bytes)):
+            raise ValueError("links.measured_links must be a sequence of measured link records")
+        for raw in measured_links:
+            if not isinstance(raw, Mapping):
+                raise ValueError("measured link records must be mappings")
+            src = str(raw.get("src", "") or "")
+            dst = str(raw.get("dst", "") or "")
+            if src not in nodes or dst not in nodes:
+                continue
             src_node = nodes[src]
             dst_node = nodes[dst]
-            link_type = _link_type(src_node.node_type, dst_node.node_type)
+            link_type = str(raw.get("link_type") or _link_type(src_node.node_type, dst_node.node_type)).lower()
             if link_type == "none":
                 continue
             distance = _distance(src_node.position, dst_node.position)
-            nominal_range = self.max_link_distance_m if self.max_link_distance_m is not None else self.link_ranges_m.get(link_type, 0.0)
-            rate = self._estimate_rate_mbps(link_type, distance, raw_links)
-            latency = self._estimate_latency_s(link_type, distance, rate)
-            if nominal_range and not math.isinf(nominal_range):
-                range_ratio = distance / max(1e-9, nominal_range)
+            is_wireless = bool(raw.get("is_wireless", _is_wireless_link_type(link_type)))
+            if is_wireless:
+                rate = _float(raw.get("rate_mbps_sum", raw.get("rate_mbps")), 0.0)
+                transmitted_mbit = _transmitted_mbit(raw)
+                active_count = int(_float(raw.get("task_count"), 0.0))
+                if active_count <= 0 or rate <= 0.0 or transmitted_mbit <= 0.0:
+                    continue
+                latency = transmitted_mbit / rate
+                reliability = 1.0
+                metadata = {
+                    "measured": True,
+                    "metric_source": "airfogsim_last_tick_wireless",
+                    "transmitted_mbit": transmitted_mbit,
+                    "allocated_rb_count": int(_float(raw.get("allocated_rb_count"), 0.0)),
+                    "task_count": active_count,
+                    "success_count": int(_float(raw.get("success_count"), 0.0)),
+                    "failure_count": int(_float(raw.get("failure_count"), 0.0)),
+                    "simulation_interval_s": _float(raw.get("simulation_interval_s"), 0.0),
+                }
             else:
-                range_ratio = 0.0
-            out_of_nominal_range = bool(range_ratio > 1.0)
-            distance_risk = max(0.0, min(1.0, range_ratio - 1.0))
-            reliability = max(0.05, min(1.0, 1.0 - latency / 10.0 - 0.6 * distance_risk))
+                rate = _float(raw.get("capacity_mbps", raw.get("rate_mbps")), 0.0)
+                queue_before = _float(raw.get("queue_bytes_before"), 0.0)
+                transmitted_bytes = _float(raw.get("transmitted_bytes"), 0.0)
+                active_count = int(_float(raw.get("active_flow_count"), 0.0))
+                if active_count <= 0:
+                    continue
+                capacity_bytes_per_s = rate * 1e6 / 8.0
+                queue_delay_s = queue_before / capacity_bytes_per_s if capacity_bytes_per_s > 0.0 else 0.0
+                latency = _float(raw.get("prop_ms"), 0.0) / 1000.0 + queue_delay_s
+                reliability = 1.0 if rate > 0.0 and transmitted_bytes > 0.0 else 0.0
+                link_type = _link_type(src_node.node_type, dst_node.node_type)
+                if link_type == "none":
+                    link_type = str(raw.get("link_type") or "wired").lower()
+                metadata = {
+                    "measured": True,
+                    "metric_source": "airfogsim_last_tick_wired",
+                    "queue_bytes_before": queue_before,
+                    "queue_bytes_after": _float(raw.get("queue_bytes_after"), 0.0),
+                    "queue_delay_s": queue_delay_s,
+                    "transmitted_bytes": transmitted_bytes,
+                    "active_flow_count": active_count,
+                    "simulation_interval_s": _float(raw.get("simulation_interval_s"), 0.0),
+                }
             edges.append(
                 TopologyEdge(
                     src=src,
@@ -183,42 +208,11 @@ class TopologyBuilder:
                     rate_mbps=rate,
                     latency_s=latency,
                     reliability=reliability,
-                    is_wireless=not link_type.endswith("2c") and not link_type.startswith("c2"),
-                    metadata={
-                        "nominal_range_m": nominal_range,
-                        "range_ratio": range_ratio,
-                        "out_of_nominal_range": out_of_nominal_range,
-                        "distance_risk": distance_risk,
-                    },
+                    is_wireless=is_wireless,
+                    metadata=metadata,
                 )
             )
         return edges
-
-    def _estimate_rate_mbps(self, link_type: str, distance_m: float, raw_links: Mapping[str, Any]) -> float:
-        base = {
-            "v2v": 20.0,
-            "v2u": 35.0,
-            "u2v": 35.0,
-            "v2i": 50.0,
-            "i2v": 50.0,
-            "u2i": 80.0,
-            "i2u": 80.0,
-            "u2u": 60.0,
-            "i2i": 200.0,
-            "i2c": 1000.0,
-            "c2i": 1000.0,
-        }.get(link_type, 10.0)
-        if math.isinf(distance_m):
-            return base
-        attenuation = 1.0 / (1.0 + max(0.0, distance_m) / 500.0)
-        return max(0.1, base * attenuation)
-
-    def _estimate_latency_s(self, link_type: str, distance_m: float, rate_mbps: float) -> float:
-        propagation = 0.0 if math.isinf(distance_m) else distance_m / 3e8
-        queue = 0.001 if rate_mbps >= 100 else 0.005
-        if link_type in {"i2c", "c2i"}:
-            queue += 0.02
-        return float(propagation + queue)
 
     def _services_by_node(self) -> Dict[str, List[str]]:
         result: Dict[str, List[str]] = {}
@@ -248,6 +242,24 @@ def _position_tuple(position: Any) -> Tuple[float, float, float]:
 
 def _distance(a: Tuple[float, float, float], b: Tuple[float, float, float]) -> float:
     return math.sqrt(sum((float(x) - float(y)) ** 2 for x, y in zip(a, b)))
+
+
+def _float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _transmitted_mbit(raw: Mapping[str, Any]) -> float:
+    if raw.get("transmitted_mbit") is not None:
+        return _float(raw.get("transmitted_mbit"), 0.0)
+    return _float(raw.get("transmitted_bytes"), 0.0) * 8e-6
+
+
+def _is_wireless_link_type(link_type: str) -> bool:
+    value = str(link_type).lower()
+    return not value.endswith("2c") and not value.startswith("c2") and value != "wired"
 
 
 def _link_type(src_type: str, dst_type: str) -> str:

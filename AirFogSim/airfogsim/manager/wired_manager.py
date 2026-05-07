@@ -9,6 +9,8 @@ class WiredNetworkManager:
         self._queues = {}
         # 待传流: {task_id: {'src': str, 'dst': str, 'path': list, 'remaining_bytes': float}}
         self._flows = {}
+        self.last_step_link_metrics = []
+        self.last_step_transmitted_bytes = 0.0
         self._init_topology()
 
     def _init_topology(self):
@@ -29,6 +31,8 @@ class WiredNetworkManager:
         self._flows = {}
         for key in self._queues:
             self._queues[key] = 0
+        self.last_step_link_metrics = []
+        self.last_step_transmitted_bytes = 0.0
 
     def hasLink(self, src, dst):
         """检查两节点间是否有直连有线链路"""
@@ -49,6 +53,8 @@ class WiredNetworkManager:
     def step(self, simulation_interval_s):
         """执行一步传输，返回 {task_id: transmitted_bytes}"""
         results = {}
+        link_metrics = []
+        total_transmitted = 0.0
         # 按链路分组
         link_flows = {}
         for task_id, flow in self._flows.items():
@@ -61,9 +67,12 @@ class WiredNetworkManager:
         for link, task_ids in link_flows.items():
             if link not in self._links:
                 continue
-            capacity_bytes_per_s = self._links[link]['capacity_mbps'] * 1e6 / 8
+            queue_before = float(self._queues.get(link, 0.0) or 0.0)
+            capacity_mbps = float(self._links[link]['capacity_mbps'])
+            capacity_bytes_per_s = capacity_mbps * 1e6 / 8
             total_capacity = capacity_bytes_per_s * simulation_interval_s
             per_flow_capacity = total_capacity / len(task_ids)
+            link_transmitted = 0.0
 
             for task_id in task_ids:
                 flow = self._flows[task_id]
@@ -71,12 +80,31 @@ class WiredNetworkManager:
                 flow['remaining_bytes'] -= transmitted
                 self._queues[link] = max(0, self._queues[link] - transmitted)
                 results[task_id] = transmitted
+                link_transmitted += transmitted
+            total_transmitted += link_transmitted
+            link_metrics.append(
+                {
+                    'src': str(link[0]),
+                    'dst': str(link[1]),
+                    'link_type': 'wired',
+                    'capacity_mbps': capacity_mbps,
+                    'rate_mbps': capacity_mbps,
+                    'prop_ms': float(self._links[link].get('prop_ms', 0.0) or 0.0),
+                    'queue_bytes_before': queue_before,
+                    'queue_bytes_after': float(self._queues.get(link, 0.0) or 0.0),
+                    'transmitted_bytes': float(link_transmitted),
+                    'simulation_interval_s': float(simulation_interval_s),
+                    'active_flow_count': len(task_ids),
+                }
+            )
 
         # 移除已完成的流
         done_tasks = [tid for tid, flow in self._flows.items() if flow['remaining_bytes'] <= 0]
         for tid in done_tasks:
             del self._flows[tid]
 
+        self.last_step_link_metrics = sorted(link_metrics, key=lambda item: (item['src'], item['dst']))
+        self.last_step_transmitted_bytes = float(total_transmitted)
         return results
 
     def getFlowRemaining(self, task_id):

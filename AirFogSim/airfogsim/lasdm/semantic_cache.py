@@ -73,7 +73,7 @@ class EmbeddingCache:
 
 @dataclass
 class SemanticAdvertisement:
-    """Compressed service advertisement exchanged among regional agents."""
+    """Full semantic service advertisement exchanged among regional agents."""
 
     source_agent_id: str
     instance_id: str
@@ -84,8 +84,7 @@ class SemanticAdvertisement:
     capabilities: Tuple[str, ...]
     input_semantic: str
     output_semantic: str
-    compressed_embedding: List[int]
-    compression: Dict[str, Any]
+    semantic_embedding: List[float]
     created_at_s: float
     ttl_s: float
     version: str = "v1"

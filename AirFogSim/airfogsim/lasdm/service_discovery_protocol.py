@@ -393,7 +393,7 @@ class DistributedServiceDiscoveryProtocol:
                     "exchange_ttl_s": ttl_s,
                     "exchange_radius_hops": int(getattr(exchange_cfg, "radius_hops", 1)),
                     "exchange_top_k": int(exchange_cfg.top_k_per_agent),
-                    "semantic_compressed_dim": int(exchange_cfg.compressed_dim),
+                    "semantic_embedding_dim": int(exchange_cfg.embedding_dim),
                 }
             )
 

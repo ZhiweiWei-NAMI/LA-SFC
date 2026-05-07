@@ -212,7 +212,7 @@ def main() -> None:
                                 "arrival_horizon_s": scenario.get("arrival_horizon_s", ""),
                                 "generated_sfc_count": int(metrics.get("submitted", 0) or 0),
                                 "exchange_ttl_s": scenario.get("exchange_ttl_s", ""),
-                                "compressed_dim": config.get("semantic_exchange", {}).get("compressed_dim", ""),
+                                "semantic_embedding_dim": config.get("semantic_exchange", {}).get("embedding_dim", ""),
                                 **last,
                                 **_flat_metrics(metrics),
                             }

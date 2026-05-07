@@ -91,7 +91,7 @@ for path in (AIRFOGSIM_ROOT, METHOD_ROOT):
     if path not in sys.path:
         sys.path.insert(0, path)
 
-from airfogsim.lasdm.graph_observation import flatten_observation
+from airfogsim.lasdm.graph_observation import BASE_CANDIDATE_FEATURE_DIM, flatten_observation
 from airfogsim.lasdm.env_adapter import LASDMEnvAdapter
 from airfogsim.lasdm.instance_directory import ServiceInstance, ServiceInstanceDirectory
 from airfogsim.lasdm.manager import LASDMManager
@@ -185,9 +185,9 @@ def main() -> None:
             policy = MASACPolicy(
                 **policy_kwargs,
                 q_lr=float(marl_cfg.get("masac_q_lr", marl_cfg.get("ippo_lr", 3e-4)) or 3e-4),
-                alpha=float(marl_cfg.get("masac_alpha", 0.05) or 0.05),
+                alpha=float(marl_cfg.get("masac_alpha", 0.20) or 0.20),
                 auto_alpha=bool(marl_cfg.get("masac_auto_alpha", False)),
-                alpha_lr=float(marl_cfg.get("masac_alpha_lr", marl_cfg.get("masac_q_lr", 3e-4)) or 3e-4),
+                alpha_lr=float(marl_cfg.get("masac_alpha_lr", 3e-4) or 3e-4),
                 target_entropy=None if target_entropy_raw in (None, "") else float(target_entropy_raw),
                 target_entropy_scale=float(marl_cfg.get("masac_target_entropy_scale", 0.90) or 0.90),
                 alpha_min=float(marl_cfg.get("masac_alpha_min", 0.005) or 0.005),
@@ -208,8 +208,10 @@ def main() -> None:
                 update_interval=int(marl_cfg.get("masac_update_interval", 1) or 1),
                 actor_update_interval=int(marl_cfg.get("masac_actor_update_interval", 2) or 2),
                 updates_per_env_step=int(marl_cfg.get("masac_updates_per_env_step", 1) or 1),
-                max_grad_norm=float(marl_cfg.get("masac_max_grad_norm", 1.0) or 1.0),
+                max_grad_norm=float(marl_cfg.get("masac_max_grad_norm", 10.0) or 10.0),
                 reward_scale=float(marl_cfg.get("masac_reward_scale", 1.0) or 1.0),
+                reward_normalization=bool(marl_cfg.get("masac_reward_normalization", True)),
+                reward_clip=float(marl_cfg.get("masac_reward_clip", 5.0) or 5.0),
                 replay_sample_strategy=str(marl_cfg.get("masac_replay_sample_strategy", "uniform") or "uniform"),
                 seed=args.seed,
             )
@@ -261,7 +263,7 @@ def main() -> None:
                 replay_capacity=int(marl_cfg.get("iql_replay_capacity", marl_cfg.get("masac_replay_capacity", 20000)) or 20000),
                 offline_updates=int(marl_cfg.get("iql_offline_updates", 0) or 0),
                 updates_per_transition=float(marl_cfg.get("iql_updates_per_transition", 1.0) or 1.0),
-                max_grad_norm=float(marl_cfg.get("iql_max_grad_norm", marl_cfg.get("masac_max_grad_norm", 1.0)) or 1.0),
+                max_grad_norm=float(marl_cfg.get("iql_max_grad_norm", marl_cfg.get("masac_max_grad_norm", 10.0)) or 10.0),
                 reward_scale=float(marl_cfg.get("iql_reward_scale", marl_cfg.get("masac_reward_scale", 1.0)) or 1.0),
                 seed=args.seed,
             )
@@ -329,9 +331,8 @@ def build_offline_env(
         semantic_exchange_fixed_delay_s=float(exchange_cfg.get("fixed_delay_s", 0.10)),
         semantic_exchange_per_hop_delay_s=float(exchange_cfg.get("per_hop_delay_s", 0.02)),
         semantic_exchange_top_k_per_agent=int(exchange_cfg.get("top_k_per_agent", 32)),
-        semantic_exchange_compressed_dim=int(exchange_cfg.get("compressed_dim", 64)),
-        semantic_exchange_quantization_bits=int(exchange_cfg.get("quantization_bits", 8)),
-        semantic_encoder_backend=str(exchange_cfg.get("encoder_backend", "hash")),
+        semantic_exchange_embedding_dim=int(exchange_cfg.get("embedding_dim", 384)),
+        semantic_encoder_backend=str(exchange_cfg.get("encoder_backend", "sbert")),
         semantic_encoder_model_name=str(exchange_cfg.get("sbert_model_name", "sentence-transformers/all-MiniLM-L6-v2")),
         semantic_encoder_hash_dim=int(exchange_cfg.get("hash_dim", 384)),
         semantic_encoder_batch_size=int(exchange_cfg.get("encoder_batch_size", 64)),
@@ -341,7 +342,7 @@ def build_offline_env(
         runtime_ticks_per_marl_step=int(marl_cfg.get("runtime_ticks_per_marl_step", 1)),
         runtime_max_ticks_after_action=int(marl_cfg.get("runtime_max_ticks_after_action", 25)),
         runtime_stop_when_progress=bool(marl_cfg.get("runtime_stop_when_progress", True)),
-        route_hop_floor_s=float(marl_cfg.get("route_hop_floor_s", 1.0) or 1.0),
+        route_hop_floor_s=float(marl_cfg.get("route_hop_floor_s", 0.10) or 0.10),
         global_candidate_catalog=bool(marl_cfg.get("global_candidate_catalog", False)),
         region_agents=tuple(str(item) for item in topology_cfg.get("region_agents", []) or []),
         sequential_capacity_enabled=bool(marl_cfg.get("sequential_capacity_enabled", True)),
@@ -407,19 +408,45 @@ def _build_reward_fn(marl_cfg: Mapping[str, Any]) -> SFCReward:
     allowed = set(SFCRewardConfig.__dataclass_fields__)
     values = {}
     for key, value in reward_cfg.items():
-        if key in allowed:
-            values[key] = bool(value) if key == "scenario_normalized_dense" else float(value)
+        if key not in allowed:
+            raise ValueError(f"Unknown reward config key: {key}")
+        values[key] = bool(value) if key == "scenario_normalized_dense" else float(value)
     return SFCReward(SFCRewardConfig(**values))
 
 
 def _observation_candidate_feature_dim(observations: Mapping[str, Mapping[str, Any]]) -> Optional[int]:
     for observation in observations.values():
         for candidate_set in observation.get("candidate_sets", []) or []:
-            features = candidate_set.get("candidate_features")
-            shape = getattr(features, "shape", None)
-            if shape is not None and len(shape) == 2 and int(shape[1]) > 0:
-                return int(shape[1])
+            width = _candidate_feature_width(candidate_set.get("candidate_features"))
+            if width is not None:
+                return width
     return None
+
+
+def _configured_candidate_feature_dim(config: Mapping[str, Any]) -> int:
+    semantic_cfg = dict(config.get("semantic_exchange", {}) or {})
+    embedding_dim = int(semantic_cfg.get("embedding_dim", 0) or 0)
+    if embedding_dim <= 0:
+        raise ValueError("semantic_exchange.embedding_dim must be set to build learned policy candidate features.")
+    return int(BASE_CANDIDATE_FEATURE_DIM + embedding_dim)
+
+
+def _candidate_feature_width(features: Any) -> Optional[int]:
+    shape = getattr(features, "shape", None)
+    if shape is not None:
+        if len(shape) != 2:
+            raise ValueError(f"candidate_features must be 2-D, got shape {tuple(shape)}")
+        width = int(shape[1])
+        return width if width > 0 and int(shape[0]) > 0 else None
+    if not features:
+        return None
+    first = features[0]
+    if not hasattr(first, "__len__") or isinstance(first, (str, bytes)):
+        raise ValueError("candidate_features must be a 2-D numeric sequence")
+    width = len(first)
+    if width <= 0:
+        return None
+    return int(width)
 
 
 def _actor_policy_kwargs(
@@ -430,10 +457,13 @@ def _actor_policy_kwargs(
     marl_cfg = dict(config.get("marl", {}) or {})
     obs_dim = max(len(flatten_observation(obs)) for obs in observations.values()) if observations else 1
     critic_agents = int(marl_cfg.get("ippo_critic_agent_count", len(observations) or 4) or 4)
+    candidate_feature_dim = _observation_candidate_feature_dim(observations)
+    if candidate_feature_dim is None:
+        candidate_feature_dim = _configured_candidate_feature_dim(config)
     return {
         "observation_dim": obs_dim,
         "max_candidates": int(marl_cfg.get("max_candidates", 16) or 16),
-        "candidate_feature_dim": _observation_candidate_feature_dim(observations) or 31,
+        "candidate_feature_dim": candidate_feature_dim,
         "hidden_dim": int(marl_cfg.get("ippo_hidden_dim", 256) or 256),
         "mlp_depth": int(marl_cfg.get("ippo_mlp_depth", 3) or 3),
         "gnn_layers": int(marl_cfg.get("ippo_gnn_layers", 3) or 3),
@@ -460,6 +490,9 @@ def _actor_policy_kwargs(
         ),
         "learnable_logit_blend": bool(marl_cfg.get("ippo_learnable_logit_blend", False)),
         "action_prior_enabled": bool(marl_cfg.get("ippo_action_prior_enabled", True)),
+        "semantic_projection_dim": int(marl_cfg.get("semantic_projection_dim", 8) or 8),
+        "cross_agent_attention_enabled": bool(marl_cfg.get("cross_agent_attention_enabled", True)),
+        "cross_agent_attention_heads": int(marl_cfg.get("cross_agent_attention_heads", 4) or 4),
         "device": str(marl_cfg.get("ippo_device", "") or "") or None,
     }
 
@@ -528,9 +561,9 @@ def _materialize_offline_config(
         exchange_cfg["ttl_s"] = float(scenario["exchange_ttl_s"])
     if scenario.get("exchange_radius_hops") is not None:
         exchange_cfg["radius_hops"] = int(scenario["exchange_radius_hops"])
-    compressed_dim = scenario.get("compressed_dim", scenario.get("semantic_compressed_dim"))
-    if compressed_dim is not None:
-        exchange_cfg["compressed_dim"] = int(compressed_dim)
+    embedding_dim = scenario.get("embedding_dim", scenario.get("semantic_embedding_dim"))
+    if embedding_dim is not None:
+        exchange_cfg["embedding_dim"] = int(embedding_dim)
     if scenario.get("exchange_top_k") is not None:
         exchange_cfg["top_k_per_agent"] = int(scenario["exchange_top_k"])
     run_config["semantic_exchange"] = exchange_cfg
@@ -1476,11 +1509,11 @@ def inject_semantic_topology_decoys(
         service_templates.setdefault(str(item.get("service_id")), item)
 
     decoy_specs = [
-        ("hard_negative_mismatch", "mismatch", int(decoy_cfg.get("hard_negative_mismatch", decoy_cfg.get("semantic_low_topology_good", 0)) or 0)),
-        ("borderline_weak", "weak", int(decoy_cfg.get("borderline_weak", decoy_cfg.get("semantic_medium_topology_good", 0)) or 0)),
-        ("remote_exact", "exact", int(decoy_cfg.get("remote_exact", decoy_cfg.get("semantic_high_topology_bad", 0)) or 0)),
+        ("hard_negative_mismatch", "mismatch", int(decoy_cfg.get("hard_negative_mismatch", 0) or 0)),
+        ("borderline_weak", "weak", int(decoy_cfg.get("borderline_weak", 0) or 0)),
+        ("remote_exact", "exact", int(decoy_cfg.get("remote_exact", 0) or 0)),
         ("remote_compatible", "compatible", int(decoy_cfg.get("remote_compatible", 0) or 0)),
-        ("stale_clone_exact", "exact", int(decoy_cfg.get("stale_clone_exact", decoy_cfg.get("stale_remote_candidates", 0)) or 0)),
+        ("stale_clone_exact", "exact", int(decoy_cfg.get("stale_clone_exact", 0) or 0)),
     ]
     for service_id, template in sorted(service_templates.items()):
         for decoy_kind, variant_type, count in decoy_specs:

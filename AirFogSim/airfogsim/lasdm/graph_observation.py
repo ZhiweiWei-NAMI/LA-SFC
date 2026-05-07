@@ -12,6 +12,7 @@ from .topology_builder import DynamicTopology, TopologyEdge, TopologyNode
 
 NODE_TYPES = ("vehicle", "uav", "rsu", "cloud_server", "unknown")
 LINK_TYPES = ("v2v", "v2u", "u2v", "v2i", "i2v", "u2i", "i2u", "u2u", "i2i", "i2c", "c2i", "other")
+BASE_CANDIDATE_FEATURE_DIM = 31
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,7 @@ class GraphObservationConfig:
     include_topology_features: bool = True
     include_temporal_features: bool = True
     include_semantic_features: bool = True
+    semantic_embedding_dim: int = 384
 
 
 class GraphObservationBuilder:
@@ -102,7 +104,7 @@ class GraphObservationBuilder:
 
     @property
     def candidate_feature_dim(self) -> int:
-        return 31
+        return BASE_CANDIDATE_FEATURE_DIM + max(0, int(self.config.semantic_embedding_dim))
 
     def node_features(self, node: TopologyNode, agent_id: str) -> np.ndarray:
         one_hot = _one_hot(node.node_type, NODE_TYPES)
@@ -148,9 +150,8 @@ class GraphObservationBuilder:
         mobility_risk = min(1.0, float(metadata.get("mobility_risk", 0.0) or 0.0)) if temporal_enabled else 0.0
         cold_start_s = min(1.0, float(metadata.get("cold_start_s", 0.0) or 0.0) / 5.0) if topology_enabled else 0.0
         semantic_mismatch = max(0.0, 1.0 - semantic_score) if self.config.include_semantic_features else 0.0
-        utility_key = "utility_prior" if self.config.include_semantic_features else "runtime_prior_no_semantic"
-        utility_value = float(metadata.get(utility_key, 0.0) or 0.0)
-        utility_prior = max(-1.0, min(1.0, utility_value)) if topology_enabled else 0.0
+        quality_value = float(metadata.get("semantic_cumulative_quality_if_selected", semantic_score) or 0.0)
+        semantic_quality = max(0.0, min(1.0, quality_value)) if self.config.include_semantic_features else 0.0
         deadline_scale_s = max(1.0, float(metadata.get("function_budget_s", 20.0) or 20.0))
         deadline_slack = (
             max(-1.0, min(1.0, float(metadata.get("deadline_slack_s", 0.0) or 0.0) / deadline_scale_s))
@@ -162,9 +163,9 @@ class GraphObservationBuilder:
             if topology_enabled
             else 0.0
         )
-        expected_penalty = min(
+        stale_latency_penalty = min(
             1.0,
-            float(metadata.get("expected_runtime_penalty_s", 0.0) or 0.0) / max(1e-9, self.config.expected_penalty_scale_s),
+            float(metadata.get("stale_latency_penalty_s", 0.0) or 0.0) / max(1e-9, self.config.expected_penalty_scale_s),
         ) if topology_enabled else 0.0
         estimated_compute = (
             min(1.0, float(metadata.get("estimated_compute_s", 0.0) or 0.0) / max(1e-9, self.config.compute_scale_s))
@@ -203,7 +204,7 @@ class GraphObservationBuilder:
             else 0.0
         )
         node_type = str(candidate.node_type)
-        return np.asarray(
+        base_features = np.asarray(
             [
                 semantic_score,
                 staleness,
@@ -223,10 +224,10 @@ class GraphObservationBuilder:
                 min(1.0, float(metadata.get("route_available", 1.0) or 0.0)) if topology_enabled else 0.0,
                 cold_start_s,
                 semantic_mismatch,
-                utility_prior,
+                semantic_quality,
                 deadline_slack,
                 route_tx_time,
-                expected_penalty,
+                stale_latency_penalty,
                 estimated_compute,
                 deadline_violation,
                 expected_rb_wait,
@@ -239,6 +240,12 @@ class GraphObservationBuilder:
             ],
             dtype=np.float32,
         )
+        semantic_dim = max(0, int(self.config.semantic_embedding_dim))
+        if self.config.include_semantic_features:
+            semantic_embedding = _semantic_embedding(candidate.semantic_embedding, semantic_dim)
+        else:
+            semantic_embedding = np.zeros((semantic_dim,), dtype=np.float32)
+        return np.concatenate([base_features, semantic_embedding], axis=0).astype(np.float32)
 
     def _encode_candidate_set(self, item: Mapping[str, Any]) -> Dict[str, Any]:
         candidates = self._ordered_candidates(item.get("candidates", []))
@@ -336,6 +343,16 @@ def _feature_summary(features: np.ndarray, mask: np.ndarray) -> np.ndarray:
         ],
         axis=0,
     ).astype(np.float32)
+
+
+def _semantic_embedding(value: Sequence[float], expected_dim: int) -> np.ndarray:
+    expected = max(0, int(expected_dim))
+    if expected <= 0:
+        return np.zeros((0,), dtype=np.float32)
+    vector = np.asarray(list(value or ()), dtype=np.float32).reshape(-1)
+    if vector.size != expected:
+        raise ValueError(f"semantic_embedding dimension mismatch: expected {expected}, got {vector.size}")
+    return vector.astype(np.float32)
 
 
 def _one_hot(value: str, choices: Sequence[str], default_value: str = "unknown") -> np.ndarray:

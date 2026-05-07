@@ -74,6 +74,7 @@ def main() -> int:
     parser.add_argument("--idle-gpu-max-used-mib", type=int, default=2048)
     parser.add_argument("--idle-gpu-max-util", type=int, default=10)
     parser.add_argument("--gpu-mib-per-process", type=int, default=4096)
+    parser.add_argument("--idle-gpu-processes-per-gpu", type=int, default=4)
     args = parser.parse_args()
 
     root = Path(args.root)
@@ -96,6 +97,7 @@ def main() -> int:
         max_used_mib=int(args.idle_gpu_max_used_mib),
         max_util=int(args.idle_gpu_max_util),
         mib_per_process=int(args.gpu_mib_per_process),
+        processes_per_gpu=int(args.idle_gpu_processes_per_gpu),
         required_slots=min(seed_concurrency, len(requested_jobs)),
     )
     if cuda_devices:
@@ -283,6 +285,7 @@ def select_cuda_devices(
     max_used_mib: int,
     max_util: int,
     mib_per_process: int,
+    processes_per_gpu: int,
     required_slots: int,
 ) -> list[str]:
     value = str(spec or "").strip()
@@ -317,7 +320,8 @@ def select_cuda_devices(
             continue
         if used_mib <= max(0, int(max_used_mib)) and util <= max(0, int(max_util)):
             free_mib = max(0, total_mib - used_mib)
-            slots = max(0, free_mib // max(1, int(mib_per_process)))
+            memory_slots = max(0, free_mib // max(1, int(mib_per_process)))
+            slots = min(max(1, int(processes_per_gpu)), memory_slots)
             if slots > 0:
                 candidates.append((index, slots))
     if not candidates:
@@ -486,7 +490,7 @@ if variant in {"mappo_ctde", "iql_offline"}:
                 replay_capacity=int(marl_cfg.get("iql_replay_capacity", marl_cfg.get("masac_replay_capacity", 20000)) or 20000),
                 offline_updates=int(marl_cfg.get("iql_offline_updates", 0) or 0),
                 updates_per_transition=float(marl_cfg.get("iql_updates_per_transition", 1.0) or 1.0),
-                max_grad_norm=float(marl_cfg.get("iql_max_grad_norm", marl_cfg.get("masac_max_grad_norm", 1.0)) or 1.0),
+                max_grad_norm=float(marl_cfg.get("iql_max_grad_norm", marl_cfg.get("masac_max_grad_norm", 10.0)) or 10.0),
                 reward_scale=float(marl_cfg.get("iql_reward_scale", marl_cfg.get("masac_reward_scale", 1.0)) or 1.0),
                 diagnostics_interval=int(marl_cfg.get("iql_diagnostics_interval", 1) or 1),
                 seed=seed,
