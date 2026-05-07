@@ -219,6 +219,8 @@ class SemanticTopologyMARLEnv:
         now = self._time()
         previous_summary = dict(self.manager.summary())
         previous_gs2l_progress = _gs2l_chain_progress_snapshot(self.runtime_bridge, self.manager.chains)
+        previous_completed_nodes = _gs2l_completed_nodes_snapshot(self.runtime_bridge)
+        previous_failed_task_ids = set(getattr(self.runtime_bridge, "processed_failed_tasks", set()) or set())
         previous_done_tasks = len(getattr(self.runtime_bridge, "processed_done_tasks", set()) or set())
         previous_failed_tasks = len(getattr(self.runtime_bridge, "processed_failed_tasks", set()) or set())
         submitted_before_action = self._submit_due_chains(now)
@@ -299,6 +301,12 @@ class SemanticTopologyMARLEnv:
         reward_value = self.reward_fn(previous_summary, self.manager.summary(), aux)
         rewards = {agent_id: reward_value for agent_id in self.agent_ids}
         terminal_events = _chain_terminal_events(previous_chain_status, self.manager.chains, self.reward_fn)
+        stage_events = _gs2l_stage_events(
+            previous_completed_nodes,
+            previous_failed_task_ids,
+            self.runtime_bridge,
+            self.manager.chains,
+        )
         done = self.done()
         info = {
             "time_s": next_now,
@@ -309,6 +317,7 @@ class SemanticTopologyMARLEnv:
             "runtime_report": runtime_report,
             "reward_aux": aux,
             "terminal_events": terminal_events,
+            "stage_events": stage_events,
             "message_overhead": self.discovery_protocol.exchange.overhead_summary(),
             "arrival_queue": {
                 "pending": len(self._pending_chain_ids),
@@ -1406,6 +1415,8 @@ def _transition_info_summary(info: Mapping[str, Any]) -> Dict[str, Any]:
             "sequential_replanning_count": len(runtime_report.get("sequential_replanning", []) or []),
         },
         "reward_aux": reward_aux,
+        "terminal_events": info.get("terminal_events", []),
+        "stage_events": info.get("stage_events", []),
         "message_overhead": info.get("message_overhead", {}),
     }
     return _jsonable(payload)
@@ -1580,6 +1591,53 @@ def _gs2l_chain_progress_snapshot(
         completed = set(completed_by_chain.get(sfc_id, set()) or set())
         progress[str(sfc_id)] = len(completed.intersection(order)) / max(1, len(order))
     return progress
+
+
+def _gs2l_completed_nodes_snapshot(bridge: LASDMRuntimeBridge) -> Dict[str, set[str]]:
+    return {
+        str(sfc_id): {str(node_id) for node_id in (nodes or set())}
+        for sfc_id, nodes in (getattr(bridge, "completed_nodes", {}) or {}).items()
+    }
+
+
+def _gs2l_stage_events(
+    previous_completed_nodes: Mapping[str, set[str]],
+    previous_failed_task_ids: set[str],
+    bridge: LASDMRuntimeBridge,
+    chains: Mapping[str, LASDMServiceChain],
+) -> List[Dict[str, Any]]:
+    events: List[Dict[str, Any]] = []
+    current_completed = _gs2l_completed_nodes_snapshot(bridge)
+    for sfc_id, completed in current_completed.items():
+        previous = set(previous_completed_nodes.get(str(sfc_id), set()) or set())
+        chain = chains.get(str(sfc_id))
+        stage_count = len(list(chain.topological_order())) if chain is not None else 1
+        for sfc_node_id in sorted(set(completed) - previous):
+            events.append(
+                {
+                    "sfc_id": str(sfc_id),
+                    "sfc_node_id": str(sfc_node_id),
+                    "status": "succeeded",
+                    "stage_count": int(max(1, stage_count)),
+                }
+            )
+    current_failed = {str(item) for item in (getattr(bridge, "processed_failed_tasks", set()) or set())}
+    for task_id in sorted(current_failed - {str(item) for item in previous_failed_task_ids}):
+        sfc_id = str((getattr(bridge, "task_to_sfc", {}) or {}).get(task_id, "") or "")
+        sfc_node_id = str((getattr(bridge, "task_to_sfc_node", {}) or {}).get(task_id, "") or "")
+        if not sfc_id or not sfc_node_id:
+            continue
+        chain = chains.get(sfc_id)
+        stage_count = len(list(chain.topological_order())) if chain is not None else 1
+        events.append(
+            {
+                "sfc_id": sfc_id,
+                "sfc_node_id": sfc_node_id,
+                "status": "failed",
+                "stage_count": int(max(1, stage_count)),
+            }
+        )
+    return events
 
 
 def _gs2l_progress_aux(

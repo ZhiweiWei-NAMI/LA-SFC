@@ -10,8 +10,16 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .marl_env import SemanticTopologyMARLEnv
-from .marl_policy import BaseMARLPolicy, MASACPolicy
-from .marl_reward import SFCReward, SFCRewardConfig, compute_candidate_action_reward
+from .marl_policy import (
+    BaseMARLPolicy,
+    MASACPolicy,
+    _available_slots_after_plan,
+    _candidate_remaining_deadline,
+    _chain_deadline_budget,
+    _consume_deadline_budget,
+    _source_metric,
+)
+from .marl_reward import SFCReward, SFCRewardConfig, compute_candidate_action_reward, compute_gs2l_stage_action_credit
 
 
 @dataclass
@@ -45,10 +53,17 @@ class SACTransition:
     sfc_node_id: str
     action_payload: Mapping[str, Any]
     selected_instance_id: str
+    selected_candidate: Mapping[str, Any]
     dense_reward: float
+    stage_credit: float
     terminal_credit: float
     decision_key: str
+    source_node_id: str
+    planned_node_load_snapshot: Mapping[str, int]
+    remaining_deadline_s: Optional[float]
+    total_deadline_s: Optional[float]
     next_action_filter: Mapping[str, str] = field(default_factory=dict)
+    next_action_context: Mapping[str, Any] = field(default_factory=dict)
     episode: int = 0
     scenario: str = ""
     source: str = "policy"
@@ -65,8 +80,27 @@ class SACTransition:
     def add_terminal_credit(self, value: float) -> Tuple[float, float]:
         old_reward = float(self.reward)
         self.terminal_credit = float(self.terminal_credit) + float(value)
-        self.reward = float(self.dense_reward) + float(self.terminal_credit)
+        self.reward = float(self.dense_reward) + float(self.stage_credit) + float(self.terminal_credit)
         return old_reward, float(self.reward)
+
+    def add_stage_credit(self, value: float) -> Tuple[float, float]:
+        old_reward = float(self.reward)
+        self.stage_credit = float(self.stage_credit) + float(value)
+        self.reward = float(self.dense_reward) + float(self.stage_credit) + float(self.terminal_credit)
+        return old_reward, float(self.reward)
+
+    def action_context(self) -> Dict[str, Any]:
+        return {
+            "agent_id": str(self.agent_id),
+            "sfc_id": str(self.sfc_id),
+            "sfc_node_id": str(self.sfc_node_id),
+            "selected_instance_id": str(self.selected_instance_id),
+            "source_node_id": str(self.source_node_id),
+            "planned_node_load_snapshot": dict(self.planned_node_load_snapshot),
+            "remaining_deadline_s": self.remaining_deadline_s,
+            "total_deadline_s": self.total_deadline_s,
+            "selected_candidate": dict(self.selected_candidate),
+        }
 
 
 class RunningRewardNormalizer:
@@ -124,6 +158,10 @@ class ReplayBuffer:
             raise ValueError("SACTransition must represent exactly one placement action")
         if not transition.decision_key:
             raise ValueError("SACTransition.decision_key is required")
+        if not transition.source_node_id:
+            raise ValueError("SACTransition.source_node_id is required")
+        if not isinstance(transition.planned_node_load_snapshot, Mapping):
+            raise ValueError("SACTransition.planned_node_load_snapshot must be a mapping")
         self._items.append(transition)
         self.total_added += 1
         transition.transition_id = int(self.total_added)
@@ -190,6 +228,7 @@ def iter_placement_actions(actions: Mapping[str, Any]):
 def build_per_action_transitions(
     observations: Mapping[str, Mapping[str, Any]],
     actions: Mapping[str, Any],
+    action_contexts: Mapping[str, Mapping[str, Any]],
     next_observations: Mapping[str, Mapping[str, Any]],
     done: bool,
     episode: int,
@@ -205,9 +244,21 @@ def build_per_action_transitions(
         if key not in lookup:
             raise ValueError(f"selected action does not match an observed candidate: {key}")
         candidate, candidate_set = lookup[key]
-        dense_reward = compute_candidate_action_reward(candidate, reward_config)
-        action = {agent_id: {sfc_id: {sfc_node_id: dict(action_payload)}}}
         decision_key = f"{agent_id}:{sfc_id}:{sfc_node_id}"
+        context = dict((action_contexts or {}).get(decision_key, {}) or {})
+        if not context:
+            raise ValueError(f"missing action-time context for {decision_key}")
+        if str(context.get("selected_instance_id", "") or "") != str(instance_id):
+            raise ValueError(
+                f"action-time context selected_instance_id mismatch for {decision_key}: "
+                f"{context.get('selected_instance_id')!r} != {instance_id!r}"
+            )
+        selected_candidate = dict(context.get("selected_candidate", {}) or {})
+        if str(selected_candidate.get("instance_id", "") or "") != str(instance_id):
+            raise ValueError(f"action-time selected_candidate missing or mismatched for {decision_key}")
+        dense_reward = compute_candidate_action_reward(selected_candidate, reward_config)
+        action = {agent_id: {sfc_id: {sfc_node_id: dict(action_payload)}}}
+        next_filter = _next_decision_filter(next_observations, agent_id, sfc_id, candidate_set)
         transitions.append(
             SACTransition(
                 observations=observations,
@@ -220,10 +271,20 @@ def build_per_action_transitions(
                 sfc_node_id=sfc_node_id,
                 action_payload=dict(action_payload),
                 selected_instance_id=instance_id,
+                selected_candidate=selected_candidate,
                 dense_reward=float(dense_reward),
+                stage_credit=0.0,
                 terminal_credit=0.0,
                 decision_key=decision_key,
-                next_action_filter=_next_decision_filter(next_observations, agent_id, sfc_id, candidate_set),
+                source_node_id=str(context.get("source_node_id", "") or ""),
+                planned_node_load_snapshot={
+                    str(node_id): int(count)
+                    for node_id, count in dict(context.get("planned_node_load_snapshot", {}) or {}).items()
+                },
+                remaining_deadline_s=_optional_float(context.get("remaining_deadline_s")),
+                total_deadline_s=_optional_float(context.get("total_deadline_s")),
+                next_action_filter=next_filter,
+                next_action_context=_next_decision_context(next_observations, next_filter) if next_filter else {},
                 episode=int(episode),
                 scenario=str(scenario or ""),
                 source=str(source or "policy"),
@@ -245,13 +306,16 @@ def add_per_action_transitions(
     replay: ReplayBuffer,
     transitions: Sequence[SACTransition],
     last_transition_by_chain: Dict[str, SACTransition],
+    last_transition_by_decision: Optional[Dict[str, SACTransition]] = None,
     reward_normalizer: Optional[RunningRewardNormalizer] = None,
 ) -> None:
     for transition in transitions:
         replay.add(transition)
         last_transition_by_chain[str(transition.sfc_id)] = transition
+        if last_transition_by_decision is not None:
+            last_transition_by_decision[str(transition.decision_key)] = transition
         if reward_normalizer is not None:
-            reward_normalizer.update(float(transition.reward))
+            reward_normalizer.update(float(transition.dense_reward))
             transition.normalized_reward_tracked = True
 
 
@@ -282,6 +346,44 @@ def apply_terminal_credits(
     }
 
 
+def apply_stage_credits(
+    stage_events: Sequence[Mapping[str, Any]],
+    last_transition_by_decision: Mapping[str, SACTransition],
+    replay: ReplayBuffer,
+    reward_config: SFCRewardConfig,
+) -> Dict[str, float]:
+    credits: List[float] = []
+    orphan_count = 0
+    for event in stage_events or []:
+        sfc_id = str(event.get("sfc_id", "") or "")
+        sfc_node_id = str(event.get("sfc_node_id", "") or "")
+        if not sfc_id or not sfc_node_id:
+            continue
+        matching = [
+            transition
+            for transition in last_transition_by_decision.values()
+            if str(transition.sfc_id) == sfc_id and str(transition.sfc_node_id) == sfc_node_id
+        ]
+        if not matching:
+            orphan_count += 1
+            continue
+        transition = matching[-1]
+        if not replay.contains(transition):
+            orphan_count += 1
+            continue
+        credit = compute_gs2l_stage_action_credit(transition.selected_candidate, event, reward_config)
+        if credit == 0.0:
+            continue
+        transition.add_stage_credit(credit)
+        credits.append(float(credit))
+    return {
+        "stage_credit_mean": _mean_float(credits),
+        "stage_credit_min": float(min(credits) if credits else 0.0),
+        "stage_credit_max": float(max(credits) if credits else 0.0),
+        "orphan_stage_credit_count": float(orphan_count),
+    }
+
+
 def reward_config_from_env(env: SemanticTopologyMARLEnv) -> SFCRewardConfig:
     reward_fn = getattr(env, "reward_fn", None)
     if not isinstance(reward_fn, SFCReward):
@@ -302,6 +404,158 @@ def _candidate_lookup_by_decision(
                 if instance_id:
                     lookup[(str(agent_id), sfc_id, sfc_node_id, instance_id)] = (candidate, candidate_set)
     return lookup
+
+
+def build_action_contexts_from_observations(
+    observations: Mapping[str, Mapping[str, Any]],
+    actions: Mapping[str, Any],
+) -> Dict[str, Dict[str, Any]]:
+    contexts: Dict[str, Dict[str, Any]] = {}
+    for agent_id, observation in (observations or {}).items():
+        grouped: Dict[str, List[Mapping[str, Any]]] = {}
+        for candidate_set in observation.get("candidate_sets", []) or []:
+            grouped.setdefault(str(candidate_set.get("sfc_id", "") or ""), []).append(candidate_set)
+        for sfc_id, candidate_sets in grouped.items():
+            ordered = sorted(candidate_sets, key=lambda item: int(item.get("sfc_node_index", 0) or 0))
+            current_source = str(ordered[0].get("source_node_id", "") or "") if ordered else ""
+            planned_node_load: Dict[str, int] = {}
+            remaining_deadline_s, total_deadline_s = _chain_deadline_budget(ordered)
+            for candidate_set in ordered:
+                sfc_node_id = str(candidate_set.get("sfc_node_id", "") or "")
+                payload = _action_payload(actions, str(agent_id), str(sfc_id), sfc_node_id)
+                instance_id = str(payload.get("instance_id", payload.get("service_instance_id", "")) or "") if payload else ""
+                context_source = str(current_source)
+                context_planned = dict(planned_node_load)
+                context_remaining = remaining_deadline_s
+                if instance_id:
+                    selected_candidate = _contextual_selected_candidate(
+                        candidate_set,
+                        instance_id,
+                        context_source,
+                        context_planned,
+                        context_remaining,
+                        total_deadline_s,
+                    )
+                    key = f"{agent_id}:{sfc_id}:{sfc_node_id}"
+                    contexts[key] = {
+                        "agent_id": str(agent_id),
+                        "sfc_id": str(sfc_id),
+                        "sfc_node_id": sfc_node_id,
+                        "selected_instance_id": instance_id,
+                        "source_node_id": context_source,
+                        "planned_node_load_snapshot": dict(context_planned),
+                        "remaining_deadline_s": context_remaining,
+                        "total_deadline_s": total_deadline_s,
+                        "selected_candidate": selected_candidate,
+                    }
+                    node_id = str(selected_candidate.get("node_id", "") or "")
+                    if node_id:
+                        current_source = node_id
+                        planned_node_load[node_id] = planned_node_load.get(node_id, 0) + 1
+                        remaining_deadline_s = _consume_deadline_budget(remaining_deadline_s, selected_candidate)
+    return contexts
+
+
+def _next_decision_context(
+    observations: Mapping[str, Mapping[str, Any]],
+    action_filter: Mapping[str, str],
+) -> Dict[str, Any]:
+    agent_id = str(action_filter.get("agent_id", "") or "")
+    sfc_id = str(action_filter.get("sfc_id", "") or "")
+    sfc_node_id = str(action_filter.get("sfc_node_id", "") or "")
+    observation = dict((observations or {}).get(agent_id, {}) or {})
+    candidate_sets = [
+        candidate_set
+        for candidate_set in observation.get("candidate_sets", []) or []
+        if str(candidate_set.get("sfc_id", "") or "") == sfc_id
+    ]
+    ordered = sorted(candidate_sets, key=lambda item: int(item.get("sfc_node_index", 0) or 0))
+    current_source = str(ordered[0].get("source_node_id", "") or "") if ordered else ""
+    remaining_deadline_s, total_deadline_s = _chain_deadline_budget(ordered)
+    for candidate_set in ordered:
+        if str(candidate_set.get("sfc_node_id", "") or "") != sfc_node_id:
+            continue
+        return {
+            "agent_id": agent_id,
+            "sfc_id": sfc_id,
+            "sfc_node_id": sfc_node_id,
+            "source_node_id": current_source,
+            "planned_node_load_snapshot": {},
+            "remaining_deadline_s": remaining_deadline_s,
+            "total_deadline_s": total_deadline_s,
+        }
+    raise ValueError(f"next action filter did not match a candidate set: {dict(action_filter)}")
+
+
+def _action_payload(actions: Mapping[str, Any], agent_id: str, sfc_id: str, sfc_node_id: str) -> Dict[str, Any]:
+    agent_payload = actions.get(agent_id, {}) if isinstance(actions, Mapping) else {}
+    if not isinstance(agent_payload, Mapping):
+        return {}
+    chain_payload = agent_payload.get(sfc_id, {})
+    if not isinstance(chain_payload, Mapping):
+        return {}
+    payload = chain_payload.get(sfc_node_id, {})
+    return dict(payload) if isinstance(payload, Mapping) else {}
+
+
+def _contextual_selected_candidate(
+    candidate_set: Mapping[str, Any],
+    instance_id: str,
+    source_node_id: str,
+    planned_node_load: Mapping[str, int],
+    remaining_deadline_s: Optional[float],
+    total_deadline_s: Optional[float],
+) -> Dict[str, Any]:
+    candidate = None
+    for item in candidate_set.get("raw_candidates", []) or []:
+        if str(item.get("instance_id", "") or "") == str(instance_id):
+            candidate = dict(item)
+            break
+    if candidate is None:
+        raise ValueError(
+            f"selected instance {instance_id!r} not found for "
+            f"{candidate_set.get('sfc_id')}:{candidate_set.get('sfc_node_id')}"
+        )
+    metadata = dict(candidate.get("metadata", {}) or {})
+    source = str(source_node_id or candidate_set.get("source_node_id", "") or "")
+    for field in (
+        "route_available",
+        "route_hops",
+        "utility_prior",
+        "deadline_slack_s",
+        "expected_runtime_penalty_s",
+        "route_tx_time_s",
+        "expected_rb_wait_s",
+        "wireless_pressure",
+        "wireless_hops",
+        "rb_slowdown",
+    ):
+        value = _source_metric(metadata, field, source, metadata.get(field))
+        if value not in (None, ""):
+            metadata[field] = float(value)
+    node_id = str(candidate.get("node_id", "") or "")
+    available_slots, available_ratio = _available_slots_after_plan(metadata, node_id, planned_node_load)
+    remaining_for_candidate = _candidate_remaining_deadline(metadata, source, remaining_deadline_s)
+    total_deadline = float(total_deadline_s or metadata.get("chain_deadline_s", 0.0) or 0.0)
+    metadata["actual_route_source_node_id"] = source
+    metadata["resource_available_slots"] = available_slots
+    metadata["resource_available_ratio"] = available_ratio
+    metadata["load_ratio"] = 1.0 - available_ratio
+    if remaining_for_candidate is not None:
+        metadata["chain_remaining_deadline_s"] = float(remaining_for_candidate)
+        metadata["remaining_deadline_ratio"] = (
+            max(0.0, min(1.0, float(remaining_for_candidate) / total_deadline))
+            if total_deadline > 0.0
+            else float(metadata.get("remaining_deadline_ratio", 1.0) or 1.0)
+        )
+    candidate["metadata"] = metadata
+    return candidate
+
+
+def _optional_float(value: Any) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    return float(value)
 
 
 def _next_decision_filter(
@@ -442,11 +696,13 @@ class MASACTrainer:
                 observations = env.reset()
                 total = 0.0
                 last_transition_by_chain: Dict[str, SACTransition] = {}
+                last_transition_by_decision: Dict[str, SACTransition] = {}
                 step_diagnostic_totals = {
                     "env_action_count": 0.0,
                     "replay_transitions_added": 0.0,
                     "no_action_steps_skipped": 0.0,
                     "orphan_terminal_credit_count": 0.0,
+                    "orphan_stage_credit_count": 0.0,
                 }
                 for step in range(int(max_steps)):
                     current_observations = observations
@@ -457,6 +713,7 @@ class MASACTrainer:
                     transitions, replay_step_metrics = build_per_action_transitions(
                         current_observations,
                         policy_step.actions,
+                        policy_step.decision_contexts,
                         observations,
                         bool(done or step + 1 >= int(max_steps)),
                         int(episode),
@@ -467,7 +724,14 @@ class MASACTrainer:
                         self.replay,
                         transitions,
                         last_transition_by_chain,
+                        last_transition_by_decision,
                         reward_normalizer=self.reward_normalizer,
+                    )
+                    stage_metrics = apply_stage_credits(
+                        info.get("stage_events", []) or [],
+                        last_transition_by_decision,
+                        self.replay,
+                        reward_config_from_env(env),
                     )
                     terminal_metrics = apply_terminal_credits(
                         info.get("terminal_events", []) or [],
@@ -475,7 +739,7 @@ class MASACTrainer:
                         self.replay,
                         reward_normalizer=self.reward_normalizer,
                     )
-                    for metrics_source in (replay_step_metrics, terminal_metrics):
+                    for metrics_source in (replay_step_metrics, stage_metrics, terminal_metrics):
                         for key in step_diagnostic_totals:
                             step_diagnostic_totals[key] += float(metrics_source.get(key, 0.0) or 0.0)
                     self.replay.mark_env_step()
@@ -503,6 +767,7 @@ class MASACTrainer:
                                 "replay_transitions_added": 0.0,
                                 "no_action_steps_skipped": 0.0,
                                 "orphan_terminal_credit_count": 0.0,
+                                "orphan_stage_credit_count": 0.0,
                             }
                             update_index += 1
                             diagnostics.append(
@@ -610,6 +875,7 @@ def masac_update_policy(
         target_items = []
         update_rewards = []
         dense_rewards = []
+        stage_credits = []
         terminal_credits = []
         reward_clip_positive = 0
         reward_clip_negative = 0
@@ -620,6 +886,7 @@ def masac_update_policy(
                 transition.observations,
                 transition.actions,
                 action_filter=action_filter,
+                action_context=transition.action_context(),
                 detach_encoder=False,
             )
             with torch.no_grad():
@@ -629,13 +896,14 @@ def masac_update_policy(
                         target=True,
                         detach_encoder=True,
                         action_filter=transition.next_action_filter,
+                        action_context=transition.next_action_context,
                     )
                 else:
                     next_value = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
                 done = 1.0 if transition.done else 0.0
                 if reward_transform is not None:
                     dense_component = float(reward_transform(float(transition.dense_reward)))
-                    update_reward = dense_component + float(transition.terminal_credit)
+                    update_reward = dense_component + float(transition.stage_credit) + float(transition.terminal_credit)
                 else:
                     update_reward = float(transition.reward)
                 normalizer_obj = getattr(reward_transform, "__self__", None) if reward_transform is not None else None
@@ -650,6 +918,7 @@ def masac_update_policy(
             target_items.append(target.reshape(()))
             update_rewards.append(update_reward)
             dense_rewards.append(float(transition.dense_reward))
+            stage_credits.append(float(transition.stage_credit))
             terminal_credits.append(float(transition.terminal_credit))
             selected_actions += int(selected.get("action_count", 0) or 0)
         valid_q_samples = len(q1_items)
@@ -675,6 +944,7 @@ def masac_update_policy(
                 actor_loss, entropy, target_entropy, count = policy.masac_actor_loss(
                     transition.observations,
                     action_filter=transition.action_filter(),
+                    action_context=transition.action_context(),
                 )
                 if int(count) <= 0:
                     raise RuntimeError(f"per-action MASAC actor found no decision slot for {transition.decision_key}")
@@ -727,6 +997,9 @@ def masac_update_policy(
             "dense_reward_mean": _mean_float(dense_rewards),
             "dense_reward_min": float(min(dense_rewards) if dense_rewards else 0.0),
             "dense_reward_max": float(max(dense_rewards) if dense_rewards else 0.0),
+            "stage_credit_mean": _mean_float(stage_credits),
+            "stage_credit_min": float(min(stage_credits) if stage_credits else 0.0),
+            "stage_credit_max": float(max(stage_credits) if stage_credits else 0.0),
             "terminal_credit_mean": _mean_float(terminal_credits),
             "terminal_credit_min": float(min(terminal_credits) if terminal_credits else 0.0),
             "terminal_credit_max": float(max(terminal_credits) if terminal_credits else 0.0),

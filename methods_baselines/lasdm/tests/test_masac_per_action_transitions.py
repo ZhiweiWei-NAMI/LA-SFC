@@ -20,7 +20,9 @@ from airfogsim.lasdm.marl_trainer import (  # noqa: E402
     ReplayBuffer,
     RunningRewardNormalizer,
     add_per_action_transitions,
+    apply_stage_credits,
     apply_terminal_credits,
+    build_action_contexts_from_observations,
     build_per_action_transitions,
 )
 
@@ -98,9 +100,11 @@ def _actions() -> dict:
 class MASACPerActionTransitionTests(unittest.TestCase):
     def test_three_placement_actions_generate_three_transitions(self):
         observations = {"agent_a": _observation()}
+        actions = _actions()
         transitions, metrics = build_per_action_transitions(
             observations,
-            _actions(),
+            actions,
+            build_action_contexts_from_observations(observations, actions),
             observations,
             False,
             0,
@@ -114,9 +118,36 @@ class MASACPerActionTransitionTests(unittest.TestCase):
         self.assertEqual(transitions[1].action_filter(), {"agent_id": "agent_a", "sfc_id": "sfc0", "sfc_node_id": "node1"})
         self.assertEqual(transitions[0].next_action_filter, {"agent_id": "agent_a", "sfc_id": "sfc0", "sfc_node_id": "node1"})
 
+    def test_second_stage_context_uses_previous_selected_host(self):
+        observation = _observation()
+        node1_candidate = observation["candidate_sets"][1]["raw_candidates"][0]
+        node1_candidate["metadata"] = {
+            **node1_candidate["metadata"],
+            "route_available_by_source": {"src": 0.0, "inst0_node": 1.0},
+            "route_hops_by_source": {"src": 9.0, "inst0_node": 1.0},
+        }
+        observations = {"agent_a": observation}
+        actions = _actions()
+        contexts = build_action_contexts_from_observations(observations, actions)
+        transitions, _metrics = build_per_action_transitions(
+            observations,
+            actions,
+            contexts,
+            observations,
+            False,
+            0,
+            "unit",
+            SFCRewardConfig(),
+        )
+
+        self.assertEqual(transitions[1].source_node_id, "inst0_node")
+        self.assertEqual(transitions[1].selected_candidate["metadata"]["route_available"], 1.0)
+        self.assertEqual(transitions[1].selected_candidate["metadata"]["route_hops"], 1.0)
+
     def test_zero_action_step_adds_no_transition(self):
         transitions, metrics = build_per_action_transitions(
             {"agent_a": _observation()},
+            {},
             {},
             {"agent_a": _observation()},
             False,
@@ -138,9 +169,11 @@ class MASACPerActionTransitionTests(unittest.TestCase):
 
     def test_terminal_credit_updates_last_chain_action_and_normalizer(self):
         observations = {"agent_a": _observation()}
+        actions = _actions()
         transitions, _metrics = build_per_action_transitions(
             observations,
-            _actions(),
+            actions,
+            build_action_contexts_from_observations(observations, actions),
             observations,
             False,
             0,
@@ -165,11 +198,42 @@ class MASACPerActionTransitionTests(unittest.TestCase):
         self.assertAlmostEqual(transitions[1].reward, old_dense + 10.0)
         self.assertAlmostEqual(transitions[0].terminal_credit, 0.0)
 
-    def test_masac_q_and_actor_are_filtered_to_one_slot(self):
+    def test_stage_credit_updates_matching_function_transition(self):
         observations = {"agent_a": _observation()}
+        actions = {"agent_a": {"sfc0": {"node0": {"instance_id": "inst0", "compute_level": 1.0, "bandwidth_level": 1.0}}}}
         transitions, _metrics = build_per_action_transitions(
             observations,
-            {"agent_a": {"sfc0": {"node0": {"instance_id": "inst0", "compute_level": 1.0, "bandwidth_level": 1.0}}}},
+            actions,
+            build_action_contexts_from_observations(observations, actions),
+            observations,
+            False,
+            0,
+            "unit",
+            SFCRewardConfig(),
+        )
+        replay = ReplayBuffer(capacity=8, seed=1)
+        last_by_chain = {}
+        last_by_decision = {}
+        add_per_action_transitions(replay, transitions, last_by_chain, last_by_decision)
+        dense = transitions[0].dense_reward
+        metrics = apply_stage_credits(
+            [{"sfc_id": "sfc0", "sfc_node_id": "node0", "status": "succeeded", "stage_count": 3}],
+            last_by_decision,
+            replay,
+            SFCRewardConfig(),
+        )
+
+        self.assertEqual(metrics["orphan_stage_credit_count"], 0.0)
+        self.assertGreater(transitions[0].stage_credit, 0.0)
+        self.assertAlmostEqual(transitions[0].reward, dense + transitions[0].stage_credit)
+
+    def test_masac_q_and_actor_are_filtered_to_one_slot(self):
+        observations = {"agent_a": _observation()}
+        actions = {"agent_a": {"sfc0": {"node0": {"instance_id": "inst0", "compute_level": 1.0, "bandwidth_level": 1.0}}}}
+        transitions, _metrics = build_per_action_transitions(
+            observations,
+            actions,
+            build_action_contexts_from_observations(observations, actions),
             observations,
             False,
             0,
@@ -194,15 +258,17 @@ class MASACPerActionTransitionTests(unittest.TestCase):
         )
 
         with self.assertRaises(ValueError):
-            policy.masac_selected_q_values(observations, transitions[0].actions, action_filter={})
+            policy.masac_selected_q_values(observations, transitions[0].actions, action_filter={}, action_context={})
         selected = policy.masac_selected_q_values(
             observations,
             transitions[0].actions,
             action_filter=transitions[0].action_filter(),
+            action_context=transitions[0].action_context(),
         )
         actor_loss, entropy, target_entropy, count = policy.masac_actor_loss(
             observations,
             action_filter=transitions[0].action_filter(),
+            action_context=transitions[0].action_context(),
         )
 
         self.assertEqual(selected["action_count"], 1)

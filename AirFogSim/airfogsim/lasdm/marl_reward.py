@@ -199,6 +199,42 @@ def compute_candidate_action_reward(candidate: Mapping[str, Any], config: SFCRew
     return float(reward)
 
 
+def compute_gs2l_stage_action_credit(
+    candidate: Mapping[str, Any],
+    stage_event: Mapping[str, Any],
+    config: SFCRewardConfig,
+) -> float:
+    metadata = dict(candidate.get("metadata", {}) or {})
+    stage_count = max(1.0, _to_float(stage_event.get("stage_count"), 1.0))
+    stage_value = float(config.gs2l_bandwidth_price) + float(config.gs2l_resource_price)
+    status = str(stage_event.get("status", "") or "")
+    if status == "succeeded":
+        progress_delta = 1.0 / stage_count
+        quality = _mean(
+            [
+                _to_float(metadata.get("route_available"), _to_float(candidate.get("route_available"), 0.0)),
+                _to_float(metadata.get("resource_available_ratio"), 0.0),
+                _to_float(metadata.get("remaining_deadline_ratio"), 0.0),
+                _to_float(
+                    metadata.get("semantic_cumulative_quality_if_selected"),
+                    _to_float(candidate.get("semantic_score"), _to_float(metadata.get("semantic_score"), 0.0)),
+                ),
+            ]
+        )
+        quality = max(0.0, min(1.0, quality))
+        quality_scale = 1.0 + max(0.0, float(config.gs2l_quality_weight)) * quality
+        reward = float(config.gs2l_stage_progress) * progress_delta * stage_value * quality_scale
+        reward += float(config.gs2l_stage_success) * stage_value * quality
+    elif status in {"failed", "timed_out"}:
+        reward = -float(config.gs2l_stage_failure_discount) * stage_value * stage_count
+    else:
+        return 0.0
+    clip = max(0.0, float(config.gs2l_clip))
+    if clip > 0.0:
+        reward = max(-clip, min(clip, reward))
+    return float(reward)
+
+
 def reward_aux_from_observations(observations: Mapping[str, Mapping[str, Any]], overhead_bytes: float = 0.0) -> Dict[str, float]:
     top_scores = []
     stale_ratios = []

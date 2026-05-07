@@ -13,7 +13,9 @@ from .marl_trainer import (
     SACTransition,
     TrainingMetrics,
     add_per_action_transitions,
+    apply_stage_credits,
     apply_terminal_credits,
+    build_action_contexts_from_observations,
     build_per_action_transitions,
     reward_config_from_env,
     write_reward_curve,
@@ -68,18 +70,22 @@ class IQLTrainer:
                 observations = env.reset()
                 total = 0.0
                 last_transition_by_chain: Dict[str, SACTransition] = {}
+                last_transition_by_decision: Dict[str, SACTransition] = {}
                 replay_added = 0
                 no_action_steps = 0
+                orphan_stage_credits = 0
                 orphan_terminal_credits = 0
                 for step in range(int(max_steps)):
                     current = observations
                     actions = self.behavior_policy.act(current, deterministic=True)
+                    action_contexts = build_action_contexts_from_observations(current, actions)
                     observations, rewards, done, info = env.step(actions)
                     mean_reward = sum(rewards.values()) / max(1, len(rewards))
                     total += mean_reward
                     transitions, transition_metrics = build_per_action_transitions(
                         current,
                         actions,
+                        action_contexts,
                         observations,
                         bool(done or step + 1 >= int(max_steps)),
                         int(episode),
@@ -87,7 +93,13 @@ class IQLTrainer:
                         reward_config_from_env(env),
                         source="offline_behavior",
                     )
-                    add_per_action_transitions(self.replay, transitions, last_transition_by_chain)
+                    add_per_action_transitions(self.replay, transitions, last_transition_by_chain, last_transition_by_decision)
+                    stage_metrics = apply_stage_credits(
+                        info.get("stage_events", []) or [],
+                        last_transition_by_decision,
+                        self.replay,
+                        reward_config_from_env(env),
+                    )
                     terminal_metrics = apply_terminal_credits(
                         info.get("terminal_events", []) or [],
                         last_transition_by_chain,
@@ -95,6 +107,7 @@ class IQLTrainer:
                     )
                     replay_added += int(transition_metrics.get("replay_transitions_added", 0.0) or 0.0)
                     no_action_steps += int(transition_metrics.get("no_action_steps_skipped", 0.0) or 0.0)
+                    orphan_stage_credits += int(stage_metrics.get("orphan_stage_credit_count", 0.0) or 0.0)
                     orphan_terminal_credits += int(terminal_metrics.get("orphan_terminal_credit_count", 0.0) or 0.0)
                     summary = info.get("summary", {})
                     behavior_rows.append(
@@ -122,6 +135,7 @@ class IQLTrainer:
                     "replay_size": len(self.replay),
                     "replay_transitions_added": replay_added,
                     "no_action_steps_skipped": no_action_steps,
+                    "orphan_stage_credit_count": orphan_stage_credits,
                     "orphan_terminal_credit_count": orphan_terminal_credits,
                 }
             )
@@ -230,6 +244,7 @@ def iql_update_policy(
                 target=False,
                 detach_encoder=True,
                 action_filter=action_filter,
+                action_context=transition.action_context(),
             ):
                 q1, q2 = policy._masac_joint_q_values(
                     item["global_context"],
@@ -248,11 +263,21 @@ def iql_update_policy(
                 transition.observations,
                 transition.actions,
                 action_filter=action_filter,
+                action_context=transition.action_context(),
                 detach_encoder=True,
             )
             with torch.no_grad():
                 next_filter = transition.next_action_filter if transition.next_action_filter else None
-                next_v = policy.iql_state_value(transition.next_observations, detach_encoder=True, action_filter=next_filter) if next_filter else torch.tensor(0.0, dtype=torch.float32, device=policy.device)
+                next_v = (
+                    policy.iql_state_value(
+                        transition.next_observations,
+                        detach_encoder=True,
+                        action_filter=next_filter,
+                        action_context=transition.next_action_context,
+                    )
+                    if next_filter
+                    else torch.tensor(0.0, dtype=torch.float32, device=policy.device)
+                )
                 done = 1.0 if transition.done else 0.0
                 target = float(reward_scale) * float(transition.reward) + float(gamma) * (1.0 - done) * next_v
             q1_items.append(selected["q1"])
@@ -260,10 +285,20 @@ def iql_update_policy(
             target_items.append(target.reshape(()))
             valid_q_samples += 1
 
-            evaluation = policy.evaluate_actions(transition.observations, transition.actions, action_filter=action_filter)
+            evaluation = policy.evaluate_actions(
+                transition.observations,
+                transition.actions,
+                action_filter=action_filter,
+                action_context=transition.action_context(),
+            )
             if evaluation is not None:
                 with torch.no_grad():
-                    v_current = policy.iql_state_value(transition.observations, detach_encoder=True, action_filter=action_filter)
+                    v_current = policy.iql_state_value(
+                        transition.observations,
+                        detach_encoder=True,
+                        action_filter=action_filter,
+                        action_context=transition.action_context(),
+                    )
                     q_selected = torch.minimum(selected["q1"], selected["q2"]).detach()
                     advantage = q_selected - v_current.detach()
                     weight = torch.exp(advantage / max(1e-6, float(policy.beta))).clamp(max=100.0)

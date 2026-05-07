@@ -777,6 +777,7 @@ class PolicyStep:
     actions: Dict[str, Dict[str, Dict[str, str]]]
     log_probs: Dict[str, float]
     values: Dict[str, float]
+    decision_contexts: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     log_prob_tensors: List[Any] = field(default_factory=list)
     value_tensors: List[Any] = field(default_factory=list)
     entropy_tensors: List[Any] = field(default_factory=list)
@@ -1377,6 +1378,7 @@ class CandidateActorPolicy(BaseMARLPolicy):
         actions: Dict[str, Dict[str, Dict[str, str]]] = {}
         log_probs: Dict[str, float] = {}
         values: Dict[str, float] = {}
+        decision_contexts: Dict[str, Dict[str, Any]] = {}
         log_prob_tensors: List[Any] = []
         value_tensors: List[Any] = []
         entropy_tensors: List[Any] = []
@@ -1413,11 +1415,14 @@ class CandidateActorPolicy(BaseMARLPolicy):
                     planned_node_load: Dict[str, int] = {}
                     remaining_deadline_s, total_deadline_s = _chain_deadline_budget([item[1] for item in items])
                     for set_idx, candidate_set in sorted(items, key=lambda item: int(item[1].get("sfc_node_index", 0) or 0)):
+                        context_source = str(current_source)
+                        context_planned_node_load = dict(planned_node_load)
+                        context_remaining_deadline_s = remaining_deadline_s
                         contextual = self._contextual_candidate_set(
                             candidate_set,
-                            current_source,
-                            planned_node_load,
-                            remaining_deadline_s=remaining_deadline_s,
+                            context_source,
+                            context_planned_node_load,
+                            remaining_deadline_s=context_remaining_deadline_s,
                             total_deadline_s=total_deadline_s,
                         )
                         ids = list(contextual.get("candidate_ids", []) or [])
@@ -1470,12 +1475,30 @@ class CandidateActorPolicy(BaseMARLPolicy):
                         log_probs[f"{agent_id}:{set_idx}"] = lp
                         agent_action_count += 1
                         chosen_candidate = self._candidate_by_id(contextual, str(chosen))
-                        if chosen_candidate is not None:
-                            node_id = str(chosen_candidate.get("node_id", ""))
-                            if node_id:
-                                current_source = node_id
-                                planned_node_load[node_id] = planned_node_load.get(node_id, 0) + 1
-                                remaining_deadline_s = _consume_deadline_budget(remaining_deadline_s, chosen_candidate)
+                        if chosen_candidate is None:
+                            raise RuntimeError(
+                                f"chosen candidate {chosen!r} missing from contextual action set "
+                                f"for {agent_id}:{contextual.get('sfc_id')}:{contextual.get('sfc_node_id')}"
+                            )
+                        decision_key = self._decision_key(agent_id, contextual.get("sfc_id"), contextual.get("sfc_node_id"))
+                        decision_contexts[decision_key] = {
+                            "agent_id": str(agent_id),
+                            "sfc_id": str(contextual.get("sfc_id")),
+                            "sfc_node_id": str(contextual.get("sfc_node_id")),
+                            "selected_instance_id": str(chosen),
+                            "source_node_id": context_source,
+                            "planned_node_load_snapshot": dict(context_planned_node_load),
+                            "remaining_deadline_s": (
+                                None if context_remaining_deadline_s is None else float(context_remaining_deadline_s)
+                            ),
+                            "total_deadline_s": None if total_deadline_s is None else float(total_deadline_s),
+                            "selected_candidate": dict(chosen_candidate),
+                        }
+                        node_id = str(chosen_candidate.get("node_id", ""))
+                        if node_id:
+                            current_source = node_id
+                            planned_node_load[node_id] = planned_node_load.get(node_id, 0) + 1
+                            remaining_deadline_s = _consume_deadline_budget(remaining_deadline_s, chosen_candidate)
                 if agent_action_count > 0:
                     centralized_action_count += agent_action_count
                     if value is not None:
@@ -1487,6 +1510,7 @@ class CandidateActorPolicy(BaseMARLPolicy):
             actions=actions,
             log_probs=log_probs,
             values=values,
+            decision_contexts=decision_contexts,
             log_prob_tensors=log_prob_tensors,
             value_tensors=value_tensors,
             entropy_tensors=entropy_tensors,
@@ -1497,6 +1521,7 @@ class CandidateActorPolicy(BaseMARLPolicy):
         observations: Mapping[str, Mapping[str, Any]],
         actions: Mapping[str, Any],
         action_filter: Optional[Mapping[str, str]] = None,
+        action_context: Optional[Mapping[str, Any]] = None,
     ) -> Optional[PolicyEvaluation]:
         log_prob_tensors: List[Any] = []
         value_tensors: List[Any] = []
@@ -1537,12 +1562,18 @@ class CandidateActorPolicy(BaseMARLPolicy):
                 planned_node_load: Dict[str, int] = {}
                 remaining_deadline_s, total_deadline_s = _chain_deadline_budget([item[1] for item in items])
                 for _set_idx, candidate_set in sorted(items, key=lambda item: int(item[1].get("sfc_node_index", 0) or 0)):
-                    contextual = self._contextual_candidate_set(
-                        candidate_set,
-                        current_source,
-                        planned_node_load,
-                        remaining_deadline_s=remaining_deadline_s,
-                        total_deadline_s=total_deadline_s,
+                    if filter_node and str(candidate_set.get("sfc_node_id", "") or "") != filter_node:
+                        continue
+                    contextual = (
+                        self._contextual_candidate_set_from_action_context(candidate_set, action_filter, action_context)
+                        if action_filter
+                        else self._contextual_candidate_set(
+                            candidate_set,
+                            current_source,
+                            planned_node_load,
+                            remaining_deadline_s=remaining_deadline_s,
+                            total_deadline_s=total_deadline_s,
+                        )
                     )
                     sfc_node_id = str(contextual.get("sfc_node_id", ""))
                     chosen_payload = self._chosen_action_payload(actions, str(agent_id), str(sfc_id), sfc_node_id)
@@ -1870,6 +1901,59 @@ class CandidateActorPolicy(BaseMARLPolicy):
             return None
         return chain_payload.get(sfc_node_id)
 
+    @staticmethod
+    def _decision_key(agent_id: Any, sfc_id: Any, sfc_node_id: Any) -> str:
+        return f"{str(agent_id)}:{str(sfc_id)}:{str(sfc_node_id)}"
+
+    @staticmethod
+    def _optional_float(value: Any) -> Optional[float]:
+        if value in (None, ""):
+            return None
+        return float(value)
+
+    def _action_context_components(
+        self,
+        action_filter: Mapping[str, str],
+        action_context: Optional[Mapping[str, Any]],
+    ) -> Tuple[str, Dict[str, int], Optional[float], Optional[float]]:
+        if not action_context:
+            raise ValueError(f"action_context is required for per-action filtered update: {dict(action_filter)}")
+        for key in ("agent_id", "sfc_id", "sfc_node_id"):
+            expected = str(action_filter.get(key, "") or "")
+            actual = str(action_context.get(key, "") or "")
+            if expected and actual and expected != actual:
+                raise ValueError(f"action_context {key} mismatch: expected {expected}, got {actual}")
+        if "source_node_id" not in action_context:
+            raise ValueError(f"action_context missing source_node_id for {dict(action_filter)}")
+        planned_raw = action_context.get("planned_node_load_snapshot", {})
+        if not isinstance(planned_raw, Mapping):
+            raise ValueError(f"planned_node_load_snapshot must be a mapping for {dict(action_filter)}")
+        planned = {str(key): int(value) for key, value in planned_raw.items()}
+        return (
+            str(action_context.get("source_node_id", "") or ""),
+            planned,
+            self._optional_float(action_context.get("remaining_deadline_s")),
+            self._optional_float(action_context.get("total_deadline_s")),
+        )
+
+    def _contextual_candidate_set_from_action_context(
+        self,
+        candidate_set: Mapping[str, Any],
+        action_filter: Mapping[str, str],
+        action_context: Optional[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        source, planned, remaining_deadline_s, total_deadline_s = self._action_context_components(
+            action_filter,
+            action_context,
+        )
+        return self._contextual_candidate_set(
+            candidate_set,
+            source,
+            planned,
+            remaining_deadline_s=remaining_deadline_s,
+            total_deadline_s=total_deadline_s,
+        )
+
     def _centralized_value_tensor(self, observations: Mapping[str, Mapping[str, Any]]) -> Any:
         if self.use_region_encoder:
             context_bundle = self._region_context_bundle(observations)
@@ -2109,6 +2193,7 @@ class MASACPolicy(CandidateActorPolicy):
         observations: Mapping[str, Mapping[str, Any]],
         actions: Mapping[str, Any],
         action_filter: Mapping[str, str],
+        action_context: Optional[Mapping[str, Any]],
         detach_encoder: bool = True,
     ) -> Dict[str, Any]:
         if not action_filter:
@@ -2133,12 +2218,10 @@ class MASACPolicy(CandidateActorPolicy):
                     continue
                 if str(candidate_set.get("sfc_node_id", "") or "") != filter_node:
                     continue
-                contextual = self._contextual_candidate_set(
+                contextual = self._contextual_candidate_set_from_action_context(
                     candidate_set,
-                    str(candidate_set.get("source_node_id", "") or ""),
-                    {},
-                    remaining_deadline_s=None,
-                    total_deadline_s=None,
+                    action_filter,
+                    action_context,
                 )
                 chosen_payload = self._chosen_action_payload(actions, agent_key, filter_sfc, filter_node)
                 chosen = _action_instance_id(chosen_payload)
@@ -2175,6 +2258,7 @@ class MASACPolicy(CandidateActorPolicy):
         target: bool = False,
         detach_encoder: bool = True,
         action_filter: Optional[Mapping[str, str]] = None,
+        action_context: Optional[Mapping[str, Any]] = None,
     ) -> Tuple[Any, Any, int]:
         values: List[Any] = []
         entropies: List[Any] = []
@@ -2184,6 +2268,7 @@ class MASACPolicy(CandidateActorPolicy):
             target=target,
             detach_encoder=detach_encoder,
             action_filter=action_filter,
+            action_context=action_context,
         ):
             joint = self._masac_joint_distribution(item)
             q1, q2 = self._masac_joint_q_values(
@@ -2209,6 +2294,7 @@ class MASACPolicy(CandidateActorPolicy):
         self,
         observations: Mapping[str, Mapping[str, Any]],
         action_filter: Optional[Mapping[str, str]] = None,
+        action_context: Optional[Mapping[str, Any]] = None,
     ) -> Tuple[Any, Any, Any, int]:
         losses: List[Any] = []
         entropies: List[Any] = []
@@ -2219,6 +2305,7 @@ class MASACPolicy(CandidateActorPolicy):
             target=False,
             detach_encoder=True,
             action_filter=action_filter,
+            action_context=action_context,
         ):
             joint = self._masac_joint_distribution(item)
             q1, q2 = self._masac_joint_q_values(
@@ -2258,6 +2345,7 @@ class MASACPolicy(CandidateActorPolicy):
         target: bool = False,
         detach_encoder: bool = False,
         action_filter: Optional[Mapping[str, str]] = None,
+        action_context: Optional[Mapping[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         items_out: List[Dict[str, Any]] = []
         bundle, global_context = self._masac_context_bundle(observations, detach_encoder=detach_encoder)
@@ -2281,15 +2369,19 @@ class MASACPolicy(CandidateActorPolicy):
                 planned_node_load: Dict[str, int] = {}
                 remaining_deadline_s, total_deadline_s = _chain_deadline_budget(candidate_sets)
                 for candidate_set in sorted(candidate_sets, key=lambda item: int(item.get("sfc_node_index", 0) or 0)):
-                    contextual = self._contextual_candidate_set(
-                        candidate_set,
-                        current_source,
-                        planned_node_load,
-                        remaining_deadline_s=remaining_deadline_s,
-                        total_deadline_s=total_deadline_s,
-                    )
-                    if filter_node and str(contextual.get("sfc_node_id", "") or "") != filter_node:
+                    if filter_node and str(candidate_set.get("sfc_node_id", "") or "") != filter_node:
                         continue
+                    contextual = (
+                        self._contextual_candidate_set_from_action_context(candidate_set, action_filter, action_context)
+                        if action_filter
+                        else self._contextual_candidate_set(
+                            candidate_set,
+                            current_source,
+                            planned_node_load,
+                            remaining_deadline_s=remaining_deadline_s,
+                            total_deadline_s=total_deadline_s,
+                        )
+                    )
                     ids = list(contextual.get("candidate_ids", []) or [])
                     mask_len = min(len(ids), self.max_candidates)
                     if mask_len <= 0:
@@ -2310,6 +2402,8 @@ class MASACPolicy(CandidateActorPolicy):
                             "contextual": contextual,
                         }
                     )
+                    if action_filter:
+                        continue
                     chosen_idx = int(self.torch.argmax(logits.detach()).item())
                     chosen_candidate = self._candidate_by_id(contextual, ids[chosen_idx])
                     if chosen_candidate is not None:

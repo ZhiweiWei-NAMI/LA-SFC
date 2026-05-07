@@ -21,6 +21,7 @@ from airfogsim.lasdm.marl_reward import SFCRewardConfig  # noqa: E402
 from airfogsim.lasdm.marl_trainer import (  # noqa: E402
     ReplayBuffer,
     RunningRewardNormalizer,
+    build_action_contexts_from_observations,
     build_per_action_transitions,
     masac_update_policy,
 )
@@ -170,6 +171,7 @@ class MASACSemanticStabilizationTests(unittest.TestCase):
         transitions, transition_metrics = build_per_action_transitions(
             observations,
             step.actions,
+            step.decision_contexts,
             observations,
             False,
             0,
@@ -205,6 +207,7 @@ class MASACSemanticStabilizationTests(unittest.TestCase):
             transitions, _metrics = build_per_action_transitions(
                 observations,
                 action,
+                build_action_contexts_from_observations(observations, action),
                 observations,
                 False,
                 index,

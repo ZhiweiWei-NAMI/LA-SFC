@@ -47,6 +47,7 @@ class IQLPolicy(MASACPolicy):
         observations: Mapping[str, Mapping[str, Any]],
         detach_encoder: bool = True,
         action_filter: Mapping[str, str] | None = None,
+        action_context: Mapping[str, Any] | None = None,
     ) -> Any:
         values = []
         for item in self._masac_candidate_items(
@@ -54,6 +55,7 @@ class IQLPolicy(MASACPolicy):
             target=False,
             detach_encoder=detach_encoder,
             action_filter=action_filter,
+            action_context=action_context,
         ):
             values.append(self.v_net(self.iql_v_input(item)).squeeze(-1))
         if not values:

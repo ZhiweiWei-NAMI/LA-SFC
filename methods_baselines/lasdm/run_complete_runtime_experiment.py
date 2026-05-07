@@ -33,6 +33,7 @@ from airfogsim.lasdm.marl_trainer import (
     RunningRewardNormalizer,
     TrainingMetrics,
     add_per_action_transitions,
+    apply_stage_credits,
     apply_terminal_credits,
     build_per_action_transitions,
     count_placement_actions,
@@ -517,11 +518,13 @@ def train_semantic_ippo_runtime(
                     )
                     total = 0.0
                     last_transition_by_chain: Dict[str, Any] = {}
+                    last_transition_by_decision: Dict[str, Any] = {}
                     step_diagnostic_totals = {
                         "env_action_count": 0.0,
                         "replay_transitions_added": 0.0,
                         "no_action_steps_skipped": 0.0,
                         "orphan_terminal_credit_count": 0.0,
+                        "orphan_stage_credit_count": 0.0,
                     }
                     for step in range(int(max_steps)):
                         current_observations = observations
@@ -552,6 +555,7 @@ def train_semantic_ippo_runtime(
                         transitions, replay_step_metrics = build_per_action_transitions(
                             current_observations,
                             actions,
+                            policy_step.decision_contexts,
                             observations,
                             bool(done or step + 1 >= int(max_steps)),
                             int(episode),
@@ -562,7 +566,14 @@ def train_semantic_ippo_runtime(
                             replay_buffer,
                             transitions,
                             last_transition_by_chain,
+                            last_transition_by_decision,
                             reward_normalizer=reward_normalizer,
+                        )
+                        stage_metrics = apply_stage_credits(
+                            info.get("stage_events", []) or [],
+                            last_transition_by_decision,
+                            replay_buffer,
+                            reward_config_from_env(env),
                         )
                         terminal_metrics = apply_terminal_credits(
                             info.get("terminal_events", []) or [],
@@ -570,7 +581,7 @@ def train_semantic_ippo_runtime(
                             replay_buffer,
                             reward_normalizer=reward_normalizer,
                         )
-                        for metrics_source in (replay_step_metrics, terminal_metrics):
+                        for metrics_source in (replay_step_metrics, stage_metrics, terminal_metrics):
                             for key in step_diagnostic_totals:
                                 step_diagnostic_totals[key] += float(metrics_source.get(key, 0.0) or 0.0)
                         replay_buffer.mark_env_step()
@@ -610,6 +621,7 @@ def train_semantic_ippo_runtime(
                                     "replay_transitions_added": 0.0,
                                     "no_action_steps_skipped": 0.0,
                                     "orphan_terminal_credit_count": 0.0,
+                                    "orphan_stage_credit_count": 0.0,
                                 }
                             _append_runtime_debug_event(
                                 debug_path,
