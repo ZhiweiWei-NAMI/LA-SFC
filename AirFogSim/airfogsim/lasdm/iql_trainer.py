@@ -6,94 +6,104 @@ from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from .iql_policy import IQLPolicy
 from .marl_env import SemanticTopologyMARLEnv
-from .marl_policy import BaseMARLPolicy, policy_from_name
+from .marl_reward import reward_config_from_env
 from .marl_trainer import (
-    HeuristicEvaluator,
     ReplayBuffer,
+    RunningRewardNormalizer,
     SACTransition,
     TrainingMetrics,
     add_per_action_transitions,
     apply_stage_credits,
     apply_terminal_credits,
-    build_action_contexts_from_observations,
     build_per_action_transitions,
-    reward_config_from_env,
     write_reward_curve,
 )
 
 
 class IQLTrainer:
-    """Offline IQL trainer over a fixed behavior-policy dataset."""
+    """Online replay-buffer IQL trainer aligned with the MASAC transition path."""
 
     def __init__(
         self,
         env: SemanticTopologyMARLEnv,
         policy: IQLPolicy,
-        behavior_policy: Optional[BaseMARLPolicy] = None,
         env_factory: Optional[Callable[[int], SemanticTopologyMARLEnv]] = None,
-        eval_env_factory: Optional[Callable[[], SemanticTopologyMARLEnv]] = None,
         close_env: Optional[Callable[[SemanticTopologyMARLEnv], None]] = None,
         gamma: float = 0.99,
         tau: float = 0.005,
         batch_size: int = 128,
         replay_capacity: int = 10000,
-        offline_updates: int = 0,
-        updates_per_transition: float = 1.0,
+        replay_warmup_steps: int = 64,
+        update_interval: int = 1,
+        updates_per_env_step: int = 1,
         max_grad_norm: float = 1.0,
         reward_scale: float = 1.0,
-        diagnostics_interval: int = 1,
+        reward_normalization: bool = True,
+        reward_clip: float = 5.0,
+        replay_sample_strategy: str = "uniform",
         seed: int = 0,
     ):
         self.env = env
         self.env_factory = env_factory
-        self.eval_env_factory = eval_env_factory
         self.close_env = close_env
         self.policy = policy
-        self.behavior_policy = behavior_policy or policy_from_name("utility_prior_with_exchange", seed=seed)
         self.gamma = float(gamma)
         self.tau = float(tau)
         self.batch_size = int(batch_size)
-        self.offline_updates = int(offline_updates)
-        self.updates_per_transition = float(updates_per_transition)
+        self.replay_warmup_steps = int(replay_warmup_steps)
+        self.update_interval = max(1, int(update_interval))
+        self.updates_per_env_step = int(updates_per_env_step)
         self.max_grad_norm = float(max_grad_norm)
         self.reward_scale = float(reward_scale)
-        self.diagnostics_interval = max(1, int(diagnostics_interval))
+        self.reward_normalizer = RunningRewardNormalizer(clip=reward_clip) if bool(reward_normalization) else None
+        self.replay_sample_strategy = str(replay_sample_strategy or "uniform")
         self.replay = ReplayBuffer(replay_capacity, seed=seed)
 
     def train(self, episodes: int = 10, max_steps: int = 100, output_dir: Optional[str] = None) -> List[TrainingMetrics]:
-        behavior_rows: List[TrainingMetrics] = []
+        rows: List[TrainingMetrics] = []
         diagnostics: List[Dict[str, Any]] = []
+        update_index = 0
+        target = Path(output_dir) if output_dir is not None else None
         for episode in range(int(episodes)):
-            env = self._behavior_env(episode)
+            env = self._episode_env(episode)
             try:
                 scenario_name = str(getattr(getattr(env, "config", None), "scenario_name", "") or "")
                 observations = env.reset()
                 total = 0.0
                 last_transition_by_chain: Dict[str, SACTransition] = {}
                 last_transition_by_decision: Dict[str, SACTransition] = {}
-                replay_added = 0
-                no_action_steps = 0
-                orphan_stage_credits = 0
-                orphan_terminal_credits = 0
+                step_diagnostic_totals = {
+                    "env_action_count": 0.0,
+                    "replay_transitions_added": 0.0,
+                    "no_action_steps_skipped": 0.0,
+                    "orphan_terminal_credit_count": 0.0,
+                    "orphan_stage_credit_count": 0.0,
+                }
                 for step in range(int(max_steps)):
                     current = observations
-                    actions = self.behavior_policy.act(current, deterministic=True)
-                    action_contexts = build_action_contexts_from_observations(current, actions)
+                    policy_step = self.policy.act_with_logprobs(current, deterministic=False, track_grad=False)
+                    actions = policy_step.actions
                     observations, rewards, done, info = env.step(actions)
                     mean_reward = sum(rewards.values()) / max(1, len(rewards))
                     total += mean_reward
                     transitions, transition_metrics = build_per_action_transitions(
                         current,
                         actions,
-                        action_contexts,
+                        policy_step.decision_contexts,
                         observations,
                         bool(done or step + 1 >= int(max_steps)),
                         int(episode),
                         scenario_name,
                         reward_config_from_env(env),
-                        source="offline_behavior",
+                        source="iql_online",
                     )
-                    add_per_action_transitions(self.replay, transitions, last_transition_by_chain, last_transition_by_decision)
+                    add_per_action_transitions(
+                        self.replay,
+                        transitions,
+                        last_transition_by_chain,
+                        last_transition_by_decision,
+                        reward_normalizer=self.reward_normalizer,
+                    )
                     stage_metrics = apply_stage_credits(
                         info.get("stage_events", []) or [],
                         last_transition_by_decision,
@@ -104,13 +114,51 @@ class IQLTrainer:
                         info.get("terminal_events", []) or [],
                         last_transition_by_chain,
                         self.replay,
+                        reward_normalizer=self.reward_normalizer,
                     )
-                    replay_added += int(transition_metrics.get("replay_transitions_added", 0.0) or 0.0)
-                    no_action_steps += int(transition_metrics.get("no_action_steps_skipped", 0.0) or 0.0)
-                    orphan_stage_credits += int(stage_metrics.get("orphan_stage_credit_count", 0.0) or 0.0)
-                    orphan_terminal_credits += int(terminal_metrics.get("orphan_terminal_credit_count", 0.0) or 0.0)
+                    for metrics_source in (transition_metrics, stage_metrics, terminal_metrics):
+                        for key in step_diagnostic_totals:
+                            step_diagnostic_totals[key] += float(metrics_source.get(key, 0.0) or 0.0)
+                    self.replay.mark_env_step()
+                    if self.replay.should_update(self.replay_warmup_steps, self.update_interval):
+                        metrics = iql_update_policy(
+                            self.policy,
+                            self.replay,
+                            batch_size=self.batch_size,
+                            updates=self.updates_per_env_step,
+                            gamma=self.gamma,
+                            tau=self.tau,
+                            max_grad_norm=self.max_grad_norm,
+                            reward_scale=self.reward_scale,
+                            reward_transform=self.reward_normalizer.transform if self.reward_normalizer is not None else None,
+                            sample_strategy=self.replay_sample_strategy,
+                        )
+                        if metrics:
+                            if self.reward_normalizer is not None:
+                                metrics = {**metrics, **self.reward_normalizer.snapshot()}
+                            metrics = {**metrics, **step_diagnostic_totals}
+                            step_diagnostic_totals = {
+                                "env_action_count": 0.0,
+                                "replay_transitions_added": 0.0,
+                                "no_action_steps_skipped": 0.0,
+                                "orphan_terminal_credit_count": 0.0,
+                                "orphan_stage_credit_count": 0.0,
+                            }
+                            update_index += 1
+                            diagnostics.append(
+                                {
+                                    "episode": int(episode),
+                                    "step": int(step),
+                                    "scenario": scenario_name,
+                                    "update_index": update_index,
+                                    "replay_size": len(self.replay),
+                                    "replay_total_added": self.replay.total_added,
+                                    "batch_size": self.batch_size,
+                                    **metrics,
+                                }
+                            )
                     summary = info.get("summary", {})
-                    behavior_rows.append(
+                    rows.append(
                         TrainingMetrics(
                             episode=episode,
                             step=step,
@@ -125,84 +173,30 @@ class IQLTrainer:
                     )
                     if done:
                         break
+                if target is not None and episode + 1 == int(episodes):
+                    target.mkdir(parents=True, exist_ok=True)
+                    env.write_traces(str(target))
             finally:
                 self._close_episode_env(env)
-            diagnostics.append(
-                {
-                    "phase": "dataset",
-                    "episode": int(episode),
-                    "scenario": scenario_name,
-                    "replay_size": len(self.replay),
-                    "replay_transitions_added": replay_added,
-                    "no_action_steps_skipped": no_action_steps,
-                    "orphan_stage_credit_count": orphan_stage_credits,
-                    "orphan_terminal_credit_count": orphan_terminal_credits,
-                }
-            )
-            if output_dir is not None:
-                target = Path(output_dir)
+            if target is not None:
                 target.mkdir(parents=True, exist_ok=True)
-                write_reward_curve(target / "iql_behavior_reward_curve.csv", behavior_rows)
-        update_count = self.offline_updates
-        if update_count <= 0:
-            update_count = max(1, int(round(len(self.replay) * self.updates_per_transition)))
+                write_reward_curve(target / "reward_curve.csv", rows)
+                _write_diagnostics(target / "iql_diagnostics.csv", diagnostics)
         if output_dir is not None:
             target = Path(output_dir)
             target.mkdir(parents=True, exist_ok=True)
-            _write_diagnostics(target / "iql_diagnostics.csv", diagnostics)
-        for update_index in range(update_count):
-            metrics = iql_update_policy(
-                self.policy,
-                self.replay,
-                batch_size=self.batch_size,
-                updates=1,
-                gamma=self.gamma,
-                tau=self.tau,
-                max_grad_norm=self.max_grad_norm,
-                reward_scale=self.reward_scale,
-            )
-            if metrics:
-                diagnostics.append({"phase": "offline_update", "update_index": update_index + 1, "replay_size": len(self.replay), **metrics})
-            if output_dir is not None and (
-                (update_index + 1) % self.diagnostics_interval == 0 or update_index + 1 == update_count
-            ):
-                _write_diagnostics(Path(output_dir) / "iql_diagnostics.csv", diagnostics)
-        eval_env = self._eval_env()
-        try:
-            eval_rows = HeuristicEvaluator(eval_env, self.policy).run(episodes=1, max_steps=max_steps)
-            if output_dir is not None:
-                Path(output_dir).mkdir(parents=True, exist_ok=True)
-                eval_env.write_traces(str(output_dir))
-        finally:
-            self._close_eval_env(eval_env)
-        if output_dir is not None:
-            target = Path(output_dir)
-            target.mkdir(parents=True, exist_ok=True)
-            write_reward_curve(target / "iql_behavior_reward_curve.csv", behavior_rows)
-            write_reward_curve(target / "iql_eval_reward_curve.csv", eval_rows)
-            write_reward_curve(target / "reward_curve.csv", behavior_rows)
+            write_reward_curve(target / "reward_curve.csv", rows)
             _write_diagnostics(target / "iql_diagnostics.csv", diagnostics)
             self.policy.torch.save(self.policy.iql_state_dict(), target / "iql_policy.pt")
-        return eval_rows
+        return rows
 
-    def _behavior_env(self, episode: int) -> SemanticTopologyMARLEnv:
+    def _episode_env(self, episode: int) -> SemanticTopologyMARLEnv:
         if self.env_factory is None:
             return self.env
         return self.env_factory(int(episode))
 
-    def _eval_env(self) -> SemanticTopologyMARLEnv:
-        if self.eval_env_factory is not None:
-            return self.eval_env_factory()
-        if self.env_factory is not None:
-            return self.env_factory(900000)
-        return self.env
-
     def _close_episode_env(self, env: SemanticTopologyMARLEnv) -> None:
         if self.env_factory is not None and self.close_env is not None:
-            self.close_env(env)
-
-    def _close_eval_env(self, env: SemanticTopologyMARLEnv) -> None:
-        if (self.env_factory is not None or self.eval_env_factory is not None) and self.close_env is not None:
             self.close_env(env)
 
 
@@ -222,13 +216,15 @@ def iql_update_policy(
     tau: float = 0.005,
     max_grad_norm: float = 1.0,
     reward_scale: float = 1.0,
+    reward_transform: Optional[Callable[[float], float]] = None,
+    sample_strategy: str = "uniform",
 ) -> Dict[str, float]:
     if len(replay) <= 0:
         return {}
     torch = policy.torch
     metrics: Dict[str, float] = {}
     for _ in range(max(1, int(updates))):
-        batch = replay.sample(batch_size)
+        batch = replay.sample(batch_size, strategy=sample_strategy)
         v_losses = []
         q1_items = []
         q2_items = []
@@ -236,6 +232,12 @@ def iql_update_policy(
         actor_losses = []
         weights = []
         valid_q_samples = 0
+        update_rewards: List[float] = []
+        dense_rewards: List[float] = []
+        stage_credits: List[float] = []
+        terminal_credits: List[float] = []
+        reward_clip_positive = 0
+        reward_clip_negative = 0
 
         for transition in batch:
             action_filter = transition.action_filter()
@@ -279,11 +281,26 @@ def iql_update_policy(
                     else torch.tensor(0.0, dtype=torch.float32, device=policy.device)
                 )
                 done = 1.0 if transition.done else 0.0
-                target = float(reward_scale) * float(transition.reward) + float(gamma) * (1.0 - done) * next_v
+                if reward_transform is not None:
+                    dense_component = float(reward_transform(float(transition.dense_reward)))
+                    update_reward = dense_component + float(transition.stage_credit) + float(transition.terminal_credit)
+                else:
+                    update_reward = float(transition.reward)
+                normalizer_obj = getattr(reward_transform, "__self__", None) if reward_transform is not None else None
+                clip_value = float(getattr(normalizer_obj, "clip", 0.0) or 0.0)
+                if clip_value > 0.0 and update_reward >= clip_value:
+                    reward_clip_positive += 1
+                if clip_value > 0.0 and update_reward <= -clip_value:
+                    reward_clip_negative += 1
+                target = float(reward_scale) * update_reward + float(gamma) * (1.0 - done) * next_v
             q1_items.append(selected["q1"])
             q2_items.append(selected["q2"])
             target_items.append(target.reshape(()))
             valid_q_samples += 1
+            update_rewards.append(update_reward)
+            dense_rewards.append(float(transition.dense_reward))
+            stage_credits.append(float(transition.stage_credit))
+            terminal_credits.append(float(transition.terminal_credit))
 
             evaluation = policy.evaluate_actions(
                 transition.observations,
@@ -358,8 +375,24 @@ def iql_update_policy(
             "q_target_mean": float(targets.mean().detach().cpu().item()),
             "valid_q_samples": float(valid_q_samples),
             "valid_q_sample_ratio": float(valid_q_samples / max(1, len(batch))),
+            "update_reward_mean": _mean(update_rewards),
+            "dense_reward_mean": _mean(dense_rewards),
+            "dense_reward_min": min(dense_rewards) if dense_rewards else 0.0,
+            "dense_reward_max": max(dense_rewards) if dense_rewards else 0.0,
+            "stage_credit_mean": _mean(stage_credits),
+            "stage_credit_min": min(stage_credits) if stage_credits else 0.0,
+            "stage_credit_max": max(stage_credits) if stage_credits else 0.0,
+            "terminal_credit_mean": _mean(terminal_credits),
+            "terminal_credit_min": min(terminal_credits) if terminal_credits else 0.0,
+            "terminal_credit_max": max(terminal_credits) if terminal_credits else 0.0,
+            "reward_clip_positive_ratio": float(reward_clip_positive / max(1, len(batch))),
+            "reward_clip_negative_ratio": float(reward_clip_negative / max(1, len(batch))),
         }
     return metrics
+
+
+def _mean(values: List[float]) -> float:
+    return float(sum(values) / max(1, len(values)))
 
 
 def _actor_parameters(policy: IQLPolicy) -> List[Any]:

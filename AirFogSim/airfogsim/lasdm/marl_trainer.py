@@ -19,7 +19,12 @@ from .marl_policy import (
     _consume_deadline_budget,
     _source_metric,
 )
-from .marl_reward import SFCReward, SFCRewardConfig, compute_candidate_action_reward, compute_gs2l_stage_action_credit
+from .marl_reward import (
+    SFCRewardConfig,
+    compute_candidate_action_reward,
+    compute_gs2l_stage_action_credit,
+    reward_config_from_env,
+)
 
 
 @dataclass
@@ -382,13 +387,6 @@ def apply_stage_credits(
         "stage_credit_max": float(max(credits) if credits else 0.0),
         "orphan_stage_credit_count": float(orphan_count),
     }
-
-
-def reward_config_from_env(env: SemanticTopologyMARLEnv) -> SFCRewardConfig:
-    reward_fn = getattr(env, "reward_fn", None)
-    if not isinstance(reward_fn, SFCReward):
-        raise TypeError("per-action MASAC reward requires env.reward_fn to be SFCReward")
-    return reward_fn.config
 
 
 def _candidate_lookup_by_decision(

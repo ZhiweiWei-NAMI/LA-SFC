@@ -45,6 +45,10 @@ DEFAULT_NONLEARNING_BASELINES = (
 )
 DEFAULT_LEARNING_EVAL_BASELINES = (*DEFAULT_LEARNING_VARIANTS, *OPTIONAL_MARL_COMPARISON_VARIANTS)
 CHECKPOINT_NAMES = ("masac_policy.pt", "mappo_policy.pt", "iql_policy.pt")
+TRAINING_OUTPUT_VARIANT_ALIASES = {
+    "marl_topology_no_semantic": "marl_no_semantic",
+    "marl_no_topology": "marl_semantic_no_topology",
+}
 
 
 def main() -> int:
@@ -178,18 +182,30 @@ def render_training(root: Path, expected_episodes: int, process_rows: Sequence[M
                 pid = safe_int(item.get("pid"))
                 if variant and seed and pid is not None:
                     pid_by_variant[(variant, seed)] = pid
+                    output_variant = TRAINING_OUTPUT_VARIANT_ALIASES.get(variant, variant)
+                    pid_by_variant[(output_variant, seed)] = pid
 
     for variant, seed in training_targets(root):
         seed_dir = training_seed_dir(root, variant, seed)
-        progress_path = first_existing(seed_dir / "train_progress.csv", seed_dir / "reward_curve.csv")
+        progress_path = first_existing(
+            seed_dir / "train_progress.csv",
+            seed_dir / "reward_curve.csv",
+            seed_dir / "iql_behavior_reward_curve.csv",
+        )
         selection_path = seed_dir / "checkpoint_selection.csv"
         summary_path = seed_dir / "train_summary.json"
+        diagnostics_path = first_existing(
+            seed_dir / "sac_diagnostics.csv",
+            seed_dir / "mappo_diagnostics.csv",
+            seed_dir / "iql_diagnostics.csv",
+        )
         rows.append(training_row(
             variant,
             seed,
             progress_path,
             selection_path,
             summary_path,
+            diagnostics_path,
             expected_episodes,
             pid_by_variant.get((variant, seed)),
             process_rows,
@@ -206,6 +222,7 @@ def render_training(root: Path, expected_episodes: int, process_rows: Sequence[M
         "last_task",
         "last_reward",
         "best",
+        "w10(alpha/ent)",
         "w10(sfc/task/r)",
         "avg(sfc/task/r)",
     ]
@@ -225,6 +242,7 @@ def training_row(
     progress_path: Path,
     selection_path: Path,
     summary_path: Path,
+    diagnostics_path: Path,
     expected_episodes: int,
     pid: int | None,
     process_rows: Sequence[Mapping[str, str]],
@@ -265,6 +283,7 @@ def training_row(
         fmt_float(row_task_success(latest)),
         fmt_float(row_reward(latest)),
         best,
+        recent_control_metrics(diagnostics_path, expected_episodes, tail_count=10),
         metric_triplet(filtered or rows, tail_count=10),
         metric_triplet(filtered or rows, tail_count=None),
     ]
@@ -323,6 +342,39 @@ def metric_triplet(rows: Sequence[Mapping[str, str]], tail_count: int | None) ->
     if not success_values and not task_values and not reward_values:
         return "-"
     return f"{fmt_mean(success_values)}/{fmt_mean(task_values)}/{fmt_mean(reward_values)}"
+
+
+def recent_control_metrics(path: Path, expected_episodes: int, tail_count: int = 10) -> str:
+    rows = read_csv_rows(path)
+    if not rows:
+        return "-"
+    keyed_rows: list[tuple[int | None, Mapping[str, str]]] = []
+    for row in rows:
+        episode = safe_int(row.get("episode"))
+        if episode is not None and episode >= expected_episodes:
+            continue
+        keyed_rows.append((episode, row))
+    if not keyed_rows:
+        return "-"
+    episode_keys = sorted({episode for episode, _row in keyed_rows if episode is not None})
+    if episode_keys:
+        selected = set(episode_keys[-max(1, int(tail_count)):])
+        tail = [row for episode, row in keyed_rows if episode in selected]
+    else:
+        tail = [row for _episode, row in keyed_rows[-max(1, int(tail_count)):]]
+    alpha_values = [value for row in tail if (value := safe_float(row.get("alpha"))) is not None]
+    entropy_values = []
+    for row in tail:
+        value = safe_float(row.get("entropy"))
+        if value is None:
+            continue
+        actor_updated = safe_float(row.get("actor_updated"))
+        if actor_updated is not None and actor_updated <= 0.0 and abs(value) <= 1e-12:
+            continue
+        entropy_values.append(value)
+    if not alpha_values and not entropy_values:
+        return "-"
+    return f"{fmt_mean(alpha_values)}/{fmt_mean(entropy_values)}"
 
 
 def render_eval_suite(

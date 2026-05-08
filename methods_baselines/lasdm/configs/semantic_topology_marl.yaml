@@ -329,7 +329,7 @@ marl:
   ippo_prior_logit_scale_init: 0.2
   ippo_critic_agent_count: 4
   ippo_device: cuda
-  semantic_projection_dim: 8
+  semantic_projection_dim: 64
   cross_agent_attention_enabled: true
   cross_agent_attention_heads: 4
   ippo_lr: 0.005
@@ -354,6 +354,16 @@ marl:
   masac_reward_normalization: true
   masac_reward_clip: 5.0
   masac_replay_sample_strategy: scenario_balanced
+  iql_batch_size: 256
+  iql_replay_capacity: 10000
+  iql_replay_warmup_steps: 1024
+  iql_update_interval: 50
+  iql_updates_per_env_step: 1
+  iql_max_grad_norm: 10.0
+  iql_reward_scale: 1.0
+  iql_reward_normalization: true
+  iql_reward_clip: 5.0
+  iql_replay_sample_strategy: scenario_balanced
   masac_training_scenario_sampling: balanced
   ippo_checkpoint_selection_interval: 0
   ippo_eval_checkpoint_strategy: exact_seed

@@ -90,7 +90,7 @@ marl:
   ippo_prior_logit_scale_init: 0.0
   ippo_critic_agent_count: 4
   ippo_device: cuda
-  semantic_projection_dim: 8
+  semantic_projection_dim: 64
   cross_agent_attention_enabled: true
   cross_agent_attention_heads: 4
   ippo_utility_prior_logit_weight: 0.0
@@ -108,7 +108,7 @@ marl:
     - fraction: 0.40
       scenarios: [train_fig_task_nodes_20, train_fig_task_nodes_40, train_fig_task_nodes_60, train_fig_task_nodes_80]
   masac_gamma: 0.90
-  masac_alpha: 0.20
+  masac_alpha: 0.05
   masac_auto_alpha: true
   masac_alpha_lr: 0.0003
   masac_target_entropy_scale: 0.98
@@ -117,7 +117,7 @@ marl:
   masac_tau: 0.01
   masac_q_lr: 0.005
   masac_q_mlp_depth: 3
-  masac_batch_size: 256
+  masac_batch_size: 512
   masac_replay_capacity: 10000
   masac_replay_warmup_steps: 1024
   masac_update_interval: 50
@@ -128,11 +128,16 @@ marl:
   masac_reward_normalization: true
   masac_reward_clip: 5.0
   masac_replay_sample_strategy: scenario_balanced
-  iql_batch_size: 8
-  iql_offline_updates: 80
-  iql_updates_per_transition: 0.0
-  iql_diagnostics_interval: 1
-  iql_behavior_policy: topology_greedy
+  iql_batch_size: 256
+  iql_replay_capacity: 10000
+  iql_replay_warmup_steps: 1024
+  iql_update_interval: 50
+  iql_updates_per_env_step: 1
+  iql_max_grad_norm: 10.0
+  iql_reward_scale: 1.0
+  iql_reward_normalization: true
+  iql_reward_clip: 5.0
+  iql_replay_sample_strategy: scenario_balanced
   ippo_lr: 0.005
   topology_greedy_load_penalty: 0.50
   topology_greedy_topology_risk_penalty: 1.40

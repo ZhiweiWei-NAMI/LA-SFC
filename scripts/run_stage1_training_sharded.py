@@ -466,7 +466,6 @@ if variant in {"mappo_ctde", "iql_offline"}:
         else:
             from airfogsim.lasdm.iql_policy import IQLPolicy
             from airfogsim.lasdm.iql_trainer import IQLTrainer
-            from airfogsim.lasdm.marl_policy import policy_from_name
 
             policy = IQLPolicy(
                 **policy_kwargs,
@@ -476,23 +475,23 @@ if variant in {"mappo_ctde", "iql_offline"}:
                 v_lr=float(marl_cfg.get("iql_v_lr", marl_cfg.get("masac_q_lr", marl_cfg.get("ippo_lr", 3e-4))) or 3e-4),
                 tau=float(marl_cfg.get("iql_tau", marl_cfg.get("masac_tau", 0.005)) or 0.005),
             )
-            behavior_policy = policy_from_name(str(marl_cfg.get("iql_behavior_policy", "utility_prior_with_exchange")), seed=seed)
             trainer = IQLTrainer(
                 env,
                 policy,
-                behavior_policy=behavior_policy,
                 env_factory=fresh_env,
-                eval_env_factory=lambda: fresh_env(900000),
                 close_env=close_semantic_env,
                 gamma=float(marl_cfg.get("iql_gamma", marl_cfg.get("masac_gamma", 0.99)) or 0.99),
                 tau=float(marl_cfg.get("iql_tau", marl_cfg.get("masac_tau", 0.005)) or 0.005),
-                batch_size=int(marl_cfg.get("iql_batch_size", marl_cfg.get("masac_batch_size", 128)) or 128),
-                replay_capacity=int(marl_cfg.get("iql_replay_capacity", marl_cfg.get("masac_replay_capacity", 20000)) or 20000),
-                offline_updates=int(marl_cfg.get("iql_offline_updates", 0) or 0),
-                updates_per_transition=float(marl_cfg.get("iql_updates_per_transition", 1.0) or 1.0),
+                batch_size=int(marl_cfg.get("iql_batch_size", marl_cfg.get("masac_batch_size", 256)) or 256),
+                replay_capacity=int(marl_cfg.get("iql_replay_capacity", marl_cfg.get("masac_replay_capacity", 10000)) or 10000),
+                replay_warmup_steps=int(marl_cfg.get("iql_replay_warmup_steps", marl_cfg.get("masac_replay_warmup_steps", 1024)) or 1024),
+                update_interval=int(marl_cfg.get("iql_update_interval", marl_cfg.get("masac_update_interval", 50)) or 50),
+                updates_per_env_step=int(marl_cfg.get("iql_updates_per_env_step", marl_cfg.get("masac_updates_per_env_step", 1)) or 1),
                 max_grad_norm=float(marl_cfg.get("iql_max_grad_norm", marl_cfg.get("masac_max_grad_norm", 10.0)) or 10.0),
                 reward_scale=float(marl_cfg.get("iql_reward_scale", marl_cfg.get("masac_reward_scale", 1.0)) or 1.0),
-                diagnostics_interval=int(marl_cfg.get("iql_diagnostics_interval", 1) or 1),
+                reward_normalization=bool(marl_cfg.get("iql_reward_normalization", marl_cfg.get("masac_reward_normalization", True))),
+                reward_clip=float(marl_cfg.get("iql_reward_clip", marl_cfg.get("masac_reward_clip", 5.0)) or 5.0),
+                replay_sample_strategy=str(marl_cfg.get("iql_replay_sample_strategy", marl_cfg.get("masac_replay_sample_strategy", "uniform")) or "uniform"),
                 seed=seed,
             )
             rows = trainer.train(episodes=episodes, max_steps=max_steps, output_dir=str(output_dir))

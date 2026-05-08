@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import math
 import random
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -823,7 +824,7 @@ class CandidateActorPolicy(BaseMARLPolicy):
         prior_logit_scale: float = 1.0,
         learnable_logit_blend: bool = False,
         action_prior_enabled: bool = True,
-        semantic_projection_dim: int = 8,
+        semantic_projection_dim: int = 64,
         cross_agent_attention_enabled: bool = True,
         cross_agent_attention_heads: int = 4,
     ):
@@ -843,7 +844,7 @@ class CandidateActorPolicy(BaseMARLPolicy):
         self.semantic_projection_dim = max(0, int(semantic_projection_dim))
         if self.semantic_embedding_dim <= 0:
             self.semantic_projection_dim = 0
-        self.candidate_feature_dim = BASE_CANDIDATE_FEATURE_DIM - 1 + self.semantic_projection_dim
+        self.candidate_feature_dim = BASE_CANDIDATE_FEATURE_DIM + self.semantic_projection_dim
         self.route_unavailable_penalty = abs(float(route_unavailable_penalty))
         self.utility_prior_logit_weight = float(utility_prior_logit_weight)
         self.include_semantic_features = bool(include_semantic_features)
@@ -1021,12 +1022,11 @@ class CandidateActorPolicy(BaseMARLPolicy):
                         f"candidate feature dimension mismatch: expected {self.raw_candidate_dim}, got {raw_features.shape[-1]}"
                     )
                 base = raw_features[:, :BASE_CANDIDATE_FEATURE_DIM]
-                non_semantic = base[:, 1:BASE_CANDIDATE_FEATURE_DIM]
                 if self.semantic_projector is None:
-                    return non_semantic
+                    return base
                 semantic = raw_features[:, BASE_CANDIDATE_FEATURE_DIM:self.raw_candidate_dim]
                 projected = self.semantic_projector(semantic)
-                return torch.cat([non_semantic, projected], dim=-1)
+                return torch.cat([base, projected], dim=-1)
 
             def cross_agent_contexts(self, agent_ids, contexts, neighbor_ids_by_agent):
                 import torch
@@ -1523,6 +1523,13 @@ class CandidateActorPolicy(BaseMARLPolicy):
         action_filter: Optional[Mapping[str, str]] = None,
         action_context: Optional[Mapping[str, Any]] = None,
     ) -> Optional[PolicyEvaluation]:
+        if action_filter is None:
+            warnings.warn(
+                "evaluate_actions(action_filter=None) uses observation-reconstructed action context and is deprecated; "
+                "learning updates must pass action_filter with the recorded per-action decision context.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         log_prob_tensors: List[Any] = []
         value_tensors: List[Any] = []
         entropy_tensors: List[Any] = []

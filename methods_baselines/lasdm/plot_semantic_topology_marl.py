@@ -21,7 +21,7 @@ METHOD_LABELS = {
     "local_semantic_runtime_greedy": "Local Semantic\n+ Runtime Greedy",
     "nsga2_semantic_qos": "NSGA-II\nSemantic-QoS",
     "mappo_ctde": "MAPPO-CTDE",
-    "iql_offline": "IQL\n(Offline)",
+    "iql_offline": "IQL\n(Replay)",
     "topology_greedy": "Topology Greedy\n+ Exchange",
     "marl_no_semantic": "MARL-noSem",
     "marl_semantic_no_topology": "MARL-sem",

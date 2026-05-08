@@ -152,7 +152,7 @@ class MASACSemanticStabilizationTests(unittest.TestCase):
             lr=1e-3,
             q_lr=1e-3,
             device="cpu",
-            semantic_projection_dim=8,
+            semantic_projection_dim=64,
             cross_agent_attention_enabled=True,
             cross_agent_attention_heads=4,
             centralized_critic=True,
@@ -181,7 +181,8 @@ class MASACSemanticStabilizationTests(unittest.TestCase):
         replay.add(transitions[0])
         metrics = masac_update_policy(policy, replay, batch_size=1, updates=1)
 
-        self.assertEqual(projected.shape[-1], 38)
+        self.assertEqual(projected.shape[-1], BASE_CANDIDATE_FEATURE_DIM + 64)
+        self.assertAlmostEqual(float(projected[0, 0].detach().cpu().item()), 0.8, places=6)
         self.assertEqual(set(context_bundle), {"agent_a", "agent_b"})
         self.assertIn("agent_a", step.actions)
         self.assertEqual(transition_metrics["replay_transitions_added"], 2.0)

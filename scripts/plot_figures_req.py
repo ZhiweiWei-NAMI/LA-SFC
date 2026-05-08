@@ -22,7 +22,7 @@ METHOD_LABELS = {
     "local_semantic_runtime_greedy": "Local Semantic Runtime",
     "nsga2_semantic_qos": "NSGA-II Semantic-QoS",
     "mappo_ctde": "MAPPO-CTDE",
-    "iql_offline": "IQL (Offline)",
+    "iql_offline": "IQL (Replay)",
     "cross_region_auction": "Cross-Region Auction",
     "intra_region_only": "Intra-Region Only",
     "marl_no_semantic": "w/o Semantic",

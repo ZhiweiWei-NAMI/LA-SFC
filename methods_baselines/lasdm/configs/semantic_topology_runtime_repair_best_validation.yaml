@@ -86,7 +86,7 @@ marl:
   ippo_prior_l2_coef: 0.001
   ippo_critic_agent_count: 4
   ippo_device: cuda
-  semantic_projection_dim: 8
+  semantic_projection_dim: 64
   cross_agent_attention_enabled: true
   cross_agent_attention_heads: 4
   ippo_utility_prior_logit_weight: 2.5

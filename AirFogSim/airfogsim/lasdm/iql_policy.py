@@ -6,7 +6,7 @@ from .marl_policy import MASACPolicy, RESOURCE_LEVEL_VALUES
 
 
 class IQLPolicy(MASACPolicy):
-    """Offline IQL baseline using the MASAC actor surface plus an expectile V network."""
+    """Replay-buffer IQL baseline using the MASAC actor surface plus an expectile V network."""
 
     def __init__(
         self,
@@ -66,7 +66,7 @@ class IQLPolicy(MASACPolicy):
         state = self.sac_state_dict()
         state.update(
             {
-                "algorithm": "iql_offline_candidate_resource",
+                "algorithm": "iql_replay_candidate_resource",
                 "resource_levels": list(RESOURCE_LEVEL_VALUES),
                 "v_net": self.v_net.state_dict(),
                 "expectile": float(self.expectile),

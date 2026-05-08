@@ -53,6 +53,13 @@ class SFCReward:
         return compute_sfc_reward(previous_summary, current_summary, aux or {}, self.config)
 
 
+def reward_config_from_env(env: Any) -> SFCRewardConfig:
+    reward_fn = getattr(env, "reward_fn", None)
+    if not isinstance(reward_fn, SFCReward):
+        raise TypeError("per-action learning requires env.reward_fn to be SFCReward")
+    return reward_fn.config
+
+
 def compute_sfc_reward(
     previous_summary: Mapping[str, Any],
     current_summary: Mapping[str, Any],

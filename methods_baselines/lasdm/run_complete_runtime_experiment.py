@@ -28,6 +28,7 @@ from airfogsim.lasdm.benchmark_adapter import run_lasdm_benchmark_suite
 from airfogsim.lasdm.env_adapter import LASDMEnvAdapter
 from airfogsim.lasdm.graph_observation import BASE_CANDIDATE_FEATURE_DIM, flatten_observation
 from airfogsim.lasdm.marl_policy import IPPOPolicy, MASACPolicy, policy_from_name
+from airfogsim.lasdm.marl_reward import reward_config_from_env
 from airfogsim.lasdm.marl_trainer import (
     ReplayBuffer,
     RunningRewardNormalizer,
@@ -38,7 +39,6 @@ from airfogsim.lasdm.marl_trainer import (
     build_per_action_transitions,
     count_placement_actions,
     masac_update_policy,
-    reward_config_from_env,
     write_reward_curve,
 )
 from airfogsim.lasdm.runtime_bridge import LASDMRuntimeBridge
@@ -497,7 +497,7 @@ def train_semantic_ippo_runtime(
                     policy = MASACPolicy(
                         **_ippo_policy_kwargs(policy_config, obs_dim, max_candidates, seed, observations=observations),
                         q_lr=float(marl_cfg.get("masac_q_lr", marl_cfg.get("ippo_lr", 3e-4)) or 3e-4),
-                            alpha=float(marl_cfg.get("masac_alpha", 0.20) or 0.20),
+                        alpha=float(marl_cfg.get("masac_alpha", 0.20) or 0.20),
                         auto_alpha=sac_auto_alpha,
                         alpha_lr=sac_alpha_lr,
                         target_entropy=sac_target_entropy,
@@ -516,141 +516,141 @@ def train_semantic_ippo_runtime(
                         obs_dim=int(obs_dim),
                         max_candidates=int(max_candidates),
                     )
-                    total = 0.0
-                    last_transition_by_chain: Dict[str, Any] = {}
-                    last_transition_by_decision: Dict[str, Any] = {}
-                    step_diagnostic_totals = {
-                        "env_action_count": 0.0,
-                        "replay_transitions_added": 0.0,
-                        "no_action_steps_skipped": 0.0,
-                        "orphan_terminal_credit_count": 0.0,
-                        "orphan_stage_credit_count": 0.0,
-                    }
-                    for step in range(int(max_steps)):
-                        current_observations = observations
+                total = 0.0
+                last_transition_by_chain: Dict[str, Any] = {}
+                last_transition_by_decision: Dict[str, Any] = {}
+                step_diagnostic_totals = {
+                    "env_action_count": 0.0,
+                    "replay_transitions_added": 0.0,
+                    "no_action_steps_skipped": 0.0,
+                    "orphan_terminal_credit_count": 0.0,
+                    "orphan_stage_credit_count": 0.0,
+                }
+                for step in range(int(max_steps)):
+                    current_observations = observations
+                    _append_runtime_debug_event(
+                        debug_path,
+                        "step_policy_start",
+                        baseline=baseline,
+                        seed=int(seed),
+                        episode=int(episode),
+                        step=int(step),
+                        replay_size=len(replay_buffer),
+                    )
+                    policy_step = policy.act_with_logprobs(current_observations, deterministic=False, track_grad=False)
+                    actions = policy_step.actions
+                    action_count = count_placement_actions(actions)
+                    _append_runtime_debug_event(
+                        debug_path,
+                        "step_env_start",
+                        baseline=baseline,
+                        seed=int(seed),
+                        episode=int(episode),
+                        step=int(step),
+                        action_count=int(action_count),
+                    )
+                    observations, rewards, done, info = env.step(actions)
+                    mean_reward = sum(rewards.values()) / max(1, len(rewards))
+                    total += mean_reward
+                    transitions, replay_step_metrics = build_per_action_transitions(
+                        current_observations,
+                        actions,
+                        policy_step.decision_contexts,
+                        observations,
+                        bool(done or step + 1 >= int(max_steps)),
+                        int(episode),
+                        str(scenario.get("name", "default")),
+                        reward_config_from_env(env),
+                    )
+                    add_per_action_transitions(
+                        replay_buffer,
+                        transitions,
+                        last_transition_by_chain,
+                        last_transition_by_decision,
+                        reward_normalizer=reward_normalizer,
+                    )
+                    stage_metrics = apply_stage_credits(
+                        info.get("stage_events", []) or [],
+                        last_transition_by_decision,
+                        replay_buffer,
+                        reward_config_from_env(env),
+                    )
+                    terminal_metrics = apply_terminal_credits(
+                        info.get("terminal_events", []) or [],
+                        last_transition_by_chain,
+                        replay_buffer,
+                        reward_normalizer=reward_normalizer,
+                    )
+                    for metrics_source in (replay_step_metrics, stage_metrics, terminal_metrics):
+                        for key in step_diagnostic_totals:
+                            step_diagnostic_totals[key] += float(metrics_source.get(key, 0.0) or 0.0)
+                    replay_buffer.mark_env_step()
+                    if replay_buffer.should_update(sac_replay_warmup_steps, sac_update_interval):
+                        next_update_index = sac_update_index + 1
                         _append_runtime_debug_event(
                             debug_path,
-                            "step_policy_start",
+                            "sac_update_start",
                             baseline=baseline,
                             seed=int(seed),
                             episode=int(episode),
                             step=int(step),
                             replay_size=len(replay_buffer),
+                            replay_total_added=int(replay_buffer.total_added),
+                            update_index=int(next_update_index),
+                            update_actor=bool(next_update_index % sac_actor_update_interval == 0),
                         )
-                        policy_step = policy.act_with_logprobs(current_observations, deterministic=False, track_grad=False)
-                        actions = policy_step.actions
-                        action_count = count_placement_actions(actions)
+                        metrics = masac_update_policy(
+                            policy,
+                            replay_buffer,
+                            batch_size=sac_batch_size,
+                            updates=sac_updates_per_env_step,
+                            gamma=float(marl_cfg.get("masac_gamma", 0.99) or 0.99),
+                            tau=sac_tau,
+                            max_grad_norm=max_grad_norm,
+                            reward_scale=sac_reward_scale,
+                            reward_transform=reward_normalizer.transform if reward_normalizer is not None else None,
+                            sample_strategy=sac_replay_sample_strategy,
+                            update_actor=bool(next_update_index % sac_actor_update_interval == 0),
+                        )
+                        if metrics and reward_normalizer is not None:
+                            metrics = {**metrics, **reward_normalizer.snapshot()}
+                        if metrics:
+                            metrics = {**metrics, **step_diagnostic_totals}
+                            step_diagnostic_totals = {
+                                "env_action_count": 0.0,
+                                "replay_transitions_added": 0.0,
+                                "no_action_steps_skipped": 0.0,
+                                "orphan_terminal_credit_count": 0.0,
+                                "orphan_stage_credit_count": 0.0,
+                            }
                         _append_runtime_debug_event(
                             debug_path,
-                            "step_env_start",
+                            "sac_update_end",
                             baseline=baseline,
                             seed=int(seed),
                             episode=int(episode),
                             step=int(step),
-                            action_count=int(action_count),
+                            replay_size=len(replay_buffer),
+                            replay_total_added=int(replay_buffer.total_added),
+                            update_index=int(next_update_index),
+                            metric_count=len(metrics or {}),
                         )
-                        observations, rewards, done, info = env.step(actions)
-                        mean_reward = sum(rewards.values()) / max(1, len(rewards))
-                        total += mean_reward
-                        transitions, replay_step_metrics = build_per_action_transitions(
-                            current_observations,
-                            actions,
-                            policy_step.decision_contexts,
-                            observations,
-                            bool(done or step + 1 >= int(max_steps)),
-                            int(episode),
-                            str(scenario.get("name", "default")),
-                            reward_config_from_env(env),
-                        )
-                        add_per_action_transitions(
-                            replay_buffer,
-                            transitions,
-                            last_transition_by_chain,
-                            last_transition_by_decision,
-                            reward_normalizer=reward_normalizer,
-                        )
-                        stage_metrics = apply_stage_credits(
-                            info.get("stage_events", []) or [],
-                            last_transition_by_decision,
-                            replay_buffer,
-                            reward_config_from_env(env),
-                        )
-                        terminal_metrics = apply_terminal_credits(
-                            info.get("terminal_events", []) or [],
-                            last_transition_by_chain,
-                            replay_buffer,
-                            reward_normalizer=reward_normalizer,
-                        )
-                        for metrics_source in (replay_step_metrics, stage_metrics, terminal_metrics):
-                            for key in step_diagnostic_totals:
-                                step_diagnostic_totals[key] += float(metrics_source.get(key, 0.0) or 0.0)
-                        replay_buffer.mark_env_step()
-                        if replay_buffer.should_update(sac_replay_warmup_steps, sac_update_interval):
-                            next_update_index = sac_update_index + 1
-                            _append_runtime_debug_event(
-                                debug_path,
-                                "sac_update_start",
-                                baseline=baseline,
-                                seed=int(seed),
-                                episode=int(episode),
-                                step=int(step),
-                                replay_size=len(replay_buffer),
-                                replay_total_added=int(replay_buffer.total_added),
-                                update_index=int(next_update_index),
-                                update_actor=bool(next_update_index % sac_actor_update_interval == 0),
-                            )
-                            metrics = masac_update_policy(
-                                policy,
-                                replay_buffer,
-                                batch_size=sac_batch_size,
-                                updates=sac_updates_per_env_step,
-                                gamma=float(marl_cfg.get("masac_gamma", 0.99) or 0.99),
-                                tau=sac_tau,
-                                max_grad_norm=max_grad_norm,
-                                reward_scale=sac_reward_scale,
-                                reward_transform=reward_normalizer.transform if reward_normalizer is not None else None,
-                                sample_strategy=sac_replay_sample_strategy,
-                                update_actor=bool(next_update_index % sac_actor_update_interval == 0),
-                            )
-                            if metrics and reward_normalizer is not None:
-                                metrics = {**metrics, **reward_normalizer.snapshot()}
-                            if metrics:
-                                metrics = {**metrics, **step_diagnostic_totals}
-                                step_diagnostic_totals = {
-                                    "env_action_count": 0.0,
-                                    "replay_transitions_added": 0.0,
-                                    "no_action_steps_skipped": 0.0,
-                                    "orphan_terminal_credit_count": 0.0,
-                                    "orphan_stage_credit_count": 0.0,
+                        if metrics:
+                            sac_update_index += 1
+                            sac_diagnostic_rows.append(
+                                {
+                                    "episode": int(episode),
+                                    "step": int(step),
+                                    "seed": int(seed),
+                                    "baseline": baseline,
+                                    "update_index": sac_update_index,
+                                    "replay_size": len(replay_buffer),
+                                    "replay_total_added": int(replay_buffer.total_added),
+                                    "batch_size": sac_batch_size,
+                                    **metrics,
                                 }
-                            _append_runtime_debug_event(
-                                debug_path,
-                                "sac_update_end",
-                                baseline=baseline,
-                                seed=int(seed),
-                                episode=int(episode),
-                                step=int(step),
-                                replay_size=len(replay_buffer),
-                                replay_total_added=int(replay_buffer.total_added),
-                                update_index=int(next_update_index),
-                                metric_count=len(metrics or {}),
                             )
-                            if metrics:
-                                sac_update_index += 1
-                                sac_diagnostic_rows.append(
-                                    {
-                                        "episode": int(episode),
-                                        "step": int(step),
-                                        "seed": int(seed),
-                                        "baseline": baseline,
-                                        "update_index": sac_update_index,
-                                        "replay_size": len(replay_buffer),
-                                        "replay_total_added": int(replay_buffer.total_added),
-                                        "batch_size": sac_batch_size,
-                                        **metrics,
-                                    }
-                                )
-                                _write_csv_dynamic(seed_dir / "sac_diagnostics.csv", sac_diagnostic_rows)
+                            _write_csv_dynamic(seed_dir / "sac_diagnostics.csv", sac_diagnostic_rows)
                     summary_dict = dict(info.get("summary", {}) or {})
                     summary_dict.update(_runtime_task_summary_from_env(env))
                     episode_summary = dict(summary_dict)
@@ -1774,7 +1774,7 @@ def _ippo_policy_kwargs(
         ),
         "learnable_logit_blend": bool(marl_cfg.get("ippo_learnable_logit_blend", False)),
         "action_prior_enabled": bool(marl_cfg.get("ippo_action_prior_enabled", True)),
-        "semantic_projection_dim": int(marl_cfg.get("semantic_projection_dim", 8) or 8),
+        "semantic_projection_dim": int(marl_cfg.get("semantic_projection_dim", 64) or 64),
         "cross_agent_attention_enabled": bool(marl_cfg.get("cross_agent_attention_enabled", True)),
         "cross_agent_attention_heads": int(marl_cfg.get("cross_agent_attention_heads", 4) or 4),
         "device": device or None,
