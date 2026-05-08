@@ -18,8 +18,9 @@ from airfogsim.lasdm.distributed_catalog import CatalogCandidate  # noqa: E402
 from airfogsim.lasdm.graph_observation import GraphObservationBuilder, GraphObservationConfig  # noqa: E402
 from airfogsim.lasdm.semantic_link_matrix import SemanticLinkMatrix  # noqa: E402
 from airfogsim.lasdm.semantic_link_predictor import SemanticLinkScorer  # noqa: E402
-from evaluate_semantic_topology_marl import IPPO_BASELINE_CONFIG_UPDATES, _baseline_settings  # noqa: E402
 from train_semantic_topology_marl import (  # noqa: E402
+    IPPO_BASELINE_CONFIG_UPDATES,
+    _baseline_settings,
     _materialize_offline_config,
     _materialized_node_id,
     _materialized_service_instances,

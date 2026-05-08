@@ -62,7 +62,7 @@ def main() -> int:
     parser.add_argument("--poll-s", type=float, default=60.0)
     parser.add_argument(
         "--semantic-repair-config",
-        default="methods_baselines/lasdm/configs/semantic_topology_runtime_repair.yaml",
+        default="methods_baselines/lasdm/configs/semantic_topology_runtime_figures_aligned.yaml",
         help="Runtime semantic-topology override config used by each eval shard.",
     )
     parser.add_argument(
@@ -347,7 +347,7 @@ seed = int(sys.argv[1])
 out = Path(sys.argv[2])
 checkpoint_root = Path(sys.argv[3])
 baselines = json.loads(sys.argv[4])
-repair_config_path = sys.argv[5] if len(sys.argv) > 5 and sys.argv[5] else "methods_baselines/lasdm/configs/semantic_topology_runtime_repair.yaml"
+repair_config_path = sys.argv[5] if len(sys.argv) > 5 and sys.argv[5] else "methods_baselines/lasdm/configs/semantic_topology_runtime_figures_aligned.yaml"
 cfg = _load_semantic_config(
     "methods_baselines/lasdm/configs/semantic_topology_marl.yaml",
     repair_config_path,

@@ -23,8 +23,6 @@ for path in (AIRFOGSIM_ROOT, METHOD_ROOT, WORKSPACE_ROOT):
     if path not in sys.path:
         sys.path.insert(0, path)
 
-from airfogsim.lasdm.baselines import baseline_names
-from airfogsim.lasdm.benchmark_adapter import run_lasdm_benchmark_suite
 from airfogsim.lasdm.env_adapter import LASDMEnvAdapter
 from airfogsim.lasdm.graph_observation import BASE_CANDIDATE_FEATURE_DIM, flatten_observation
 from airfogsim.lasdm.marl_policy import IPPOPolicy, MASACPolicy, policy_from_name
@@ -44,22 +42,21 @@ from airfogsim.lasdm.marl_trainer import (
 from airfogsim.lasdm.runtime_bridge import LASDMRuntimeBridge
 from airfogsim.lasdm.topology_builder import TopologyBuilder
 
-from evaluate_semantic_topology_marl import (
-    DEFAULT_BASELINES,
+from semantic_runtime_guard import SemanticRuntimeGuardConfig, evaluate_guard, load_semantic_summary
+from train_semantic_topology_marl import (
+    DEFAULT_CONFIG as DEFAULT_SEMANTIC_CONFIG,
     DEFAULT_EVAL_BASELINES,
-    DEFAULT_TRAINED_BASELINES,
     canonical_ippo_baseline,
     checkpoint_subdir_for_baseline,
     is_ippo_checkpoint_baseline,
+    build_offline_env,
     _baseline_settings,
+    _deep_merge,
+    _load_yaml,
     _select_scenarios,
 )
-from semantic_runtime_guard import SemanticRuntimeGuardConfig, evaluate_guard, load_semantic_summary
-from train_semantic_topology_marl import DEFAULT_CONFIG as DEFAULT_SEMANTIC_CONFIG
-from train_semantic_topology_marl import build_offline_env, _load_yaml
 
 
-DEFAULT_LASDM_CONFIG = os.path.join(METHOD_ROOT, "configs", "lasdm_airfogsim.yaml")
 DEFAULT_OUTPUT_ROOT = os.path.join(WORKSPACE_ROOT, "experiment_artifacts", "raw_data", "complete_runtime_scheduler")
 DEFAULT_RUNTIME_SEMANTIC_BASELINES = list(DEFAULT_EVAL_BASELINES)
 TRAINED_CHECKPOINT_FILES = {
@@ -174,11 +171,9 @@ FUNCTION_TRACE_FIELDS = [
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run complete LASDM/Semantic-Topology AirFogSim runtime scheduler experiments.")
-    parser.add_argument("--lasdm-config", default=DEFAULT_LASDM_CONFIG)
     parser.add_argument("--semantic-config", default=DEFAULT_SEMANTIC_CONFIG)
     parser.add_argument("--semantic-repair-config", default=None)
     parser.add_argument("--output-root", default=DEFAULT_OUTPUT_ROOT)
-    parser.add_argument("--lasdm-baselines", nargs="+", default=sorted(baseline_names()))
     parser.add_argument("--semantic-baselines", nargs="+", default=DEFAULT_RUNTIME_SEMANTIC_BASELINES)
     parser.add_argument("--semantic-service-role-sweeps", nargs="+", default=["full_hybrid"])
     parser.add_argument("--train-seeds", nargs="+", type=int, default=None)
@@ -186,7 +181,6 @@ def main() -> None:
     parser.add_argument("--semantic-scenarios", nargs="+", default=None)
     parser.add_argument("--semantic-exchange-ttl-sweep", nargs="+", type=float, default=None)
     parser.add_argument("--semantic-exchange-radius-sweep", nargs="+", type=int, default=None)
-    parser.add_argument("--skip-lasdm-runtime", action="store_true")
     parser.add_argument("--skip-semantic-runtime", action="store_true")
     parser.add_argument("--skip-runtime-training", action="store_true")
     parser.add_argument("--semantic-guard", action="store_true")
@@ -231,7 +225,6 @@ def main() -> None:
     payload: Dict[str, Any] = {
         "started_at": _timestamp(),
         "output_root": str(output_root),
-        "lasdm_config": args.lasdm_config,
         "semantic_config": args.semantic_config,
         "semantic_repair_config": args.semantic_repair_config or "",
         "train_seeds": train_seeds,
@@ -283,19 +276,6 @@ def main() -> None:
             checkpoint_root,
             max_steps,
         )
-
-    if not args.skip_lasdm_runtime:
-        lasdm_output_root = output_root / "lasdm_runtime"
-        exit_code, lasdm_payload = run_lasdm_benchmark_suite(
-            config_path=args.lasdm_config,
-            baseline_override=args.lasdm_baselines,
-            seed_override=eval_seeds,
-            scenario_override=None,
-            output_root_override=str(lasdm_output_root),
-            mode_override="airfogsim",
-        )
-        payload["lasdm_runtime"] = lasdm_payload
-        payload["lasdm_runtime_exit_code"] = exit_code
 
     payload["finished_at"] = _timestamp()
     _write_json(output_root / "complete_runtime_manifest.json", payload)
@@ -953,7 +933,8 @@ def evaluate_semantic_runtime(
                         )
     _write_csv(output_root / "summary.csv", SUMMARY_FIELDS, rows)
     _write_aggregate_csv(output_root / "aggregate.csv", rows)
-    _write_combined_runtime_outputs(output_root, rows)
+    if _semantic_runtime_eval_trace_outputs_enabled(config):
+        _write_combined_runtime_outputs(output_root, rows)
     return {
         "completed": all(not row.get("error") for row in rows),
         "run_count": len(rows),
@@ -1151,10 +1132,17 @@ def _run_semantic_runtime_single(
             metrics["current_time"] = float(env._time())
         metrics.update(policy_metadata)
         metrics.update(_semantic_runtime_explainability_metrics(env))
-        env.write_traces(str(run_dir))
-        _write_policy_metadata(run_dir, policy_metadata, env)
+        if _semantic_runtime_eval_trace_outputs_enabled(config):
+            env.write_traces(str(run_dir))
+        _write_policy_metadata(
+            run_dir,
+            policy_metadata,
+            env,
+            write_transition_trace=_semantic_runtime_eval_trace_outputs_enabled(config),
+        )
         write_reward_curve(run_dir / "reward_curve.csv", reward_rows)
-        _write_runtime_trace_files(run_dir, "semantic_runtime_eval", baseline, scenario, role, seed, env)
+        if _semantic_runtime_eval_trace_outputs_enabled(config):
+            _write_runtime_trace_files(run_dir, "semantic_runtime_eval", baseline, scenario, role, seed, env)
     finally:
         _close_env(air_env)
     elapsed_ms = (time.perf_counter() - started) * 1000.0
@@ -1936,11 +1924,22 @@ def _write_runtime_trace_files(
     _write_csv_dynamic(run_dir / "runtime_task_lifecycle_trace.csv", getattr(env.runtime_bridge, "runtime_task_lifecycle_trace", []))
 
 
-def _write_policy_metadata(run_dir: Path, policy_metadata: Mapping[str, Any], env: Any) -> None:
+def _semantic_runtime_eval_trace_outputs_enabled(config: Mapping[str, Any]) -> bool:
+    runtime_repair = dict(config.get("runtime_repair", {}) or {})
+    return runtime_repair.get("eval_trace_outputs_enabled") is not False
+
+
+def _write_policy_metadata(
+    run_dir: Path,
+    policy_metadata: Mapping[str, Any],
+    env: Any,
+    *,
+    write_transition_trace: bool = True,
+) -> None:
     payload = dict(policy_metadata)
     payload["transition_trace_policy_metadata_injected"] = False
     transitions = getattr(env, "transition_trace", None)
-    if isinstance(transitions, list) and transitions:
+    if write_transition_trace and isinstance(transitions, list) and transitions:
         info = transitions[0].setdefault("info", {})
         if isinstance(info, dict):
             info["policy_metadata"] = dict(policy_metadata)
@@ -1953,17 +1952,17 @@ def _semantic_runtime_explainability_metrics(env: Any) -> Dict[str, Any]:
     function_rows = list(getattr(env.runtime_bridge, "function_execution_trace", []) or [])
     lifecycle_rows = list(getattr(env.runtime_bridge, "runtime_task_lifecycle_trace", []) or [])
     selected_nodes = [str(row.get("selected_node", "")) for row in function_rows if row.get("selected_node")]
-    selected_node_types: List[str] = []
-    selected_candidates: List[Mapping[str, Any]] = []
-    for transition in getattr(env, "transition_trace", []) or []:
-        info = dict(transition.get("info", {}) or {})
-        for decision in info.get("decisions", []) or []:
-            diagnostics = dict(decision.get("diagnostics", {}) or {})
-            for candidate in dict(diagnostics.get("selected_candidates", {}) or {}).values():
-                if isinstance(candidate, Mapping):
-                    selected_candidates.append(candidate)
-                    if candidate.get("node_type"):
-                        selected_node_types.append(str(candidate.get("node_type")))
+    candidate_detail_rows = list(getattr(env.discovery_protocol, "candidate_detail_trace", []) or [])
+    selected_candidates = [
+        row
+        for row in candidate_detail_rows
+        if isinstance(row, Mapping) and str(row.get("selected", "")).lower() in {"true", "1", "yes"}
+    ]
+    selected_node_types = [
+        str(candidate.get("node_type", ""))
+        for candidate in selected_candidates
+        if candidate.get("node_type")
+    ]
     if not selected_node_types and getattr(env, "env", None) is not None:
         for node_id in selected_nodes:
             try:
@@ -1977,15 +1976,16 @@ def _semantic_runtime_explainability_metrics(env: Any) -> Dict[str, Any]:
     semantic_scores = [_float_metric(candidate.get("semantic_score")) for candidate in selected_candidates]
     semantic_scores = [value for value in semantic_scores if value is not None]
     topology_risks = [
-        _float_metric(dict(candidate.get("metadata", {}) or {}).get("topology_risk"))
+        _float_metric(candidate.get("topology_risk"))
         for candidate in selected_candidates
     ]
     topology_risks = [value for value in topology_risks if value is not None]
     stale_selected = [
         1.0
         for candidate in selected_candidates
-        if float(candidate.get("staleness_s", 0.0) or 0.0) > 0.0
-        or str(dict(candidate.get("metadata", {}) or {}).get("semantic_group", "")) == "stale_clone_exact"
+        if str(candidate.get("stale", "")).lower() in {"true", "1", "yes"}
+        or float(candidate.get("staleness_s", 0.0) or 0.0) > 0.0
+        or str(candidate.get("semantic_group", "")) == "stale_clone_exact"
     ]
     phase_durations = _task_phase_durations(lifecycle_rows)
     encoder_manifest = {}
@@ -2241,16 +2241,6 @@ def _expand_semantic_exchange_sweep(
 def _token_float(value: float) -> str:
     text = f"{float(value):g}"
     return text.replace(".", "p")
-
-
-def _deep_merge(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> Dict[str, Any]:
-    merged = copy.deepcopy(dict(base))
-    for key, value in dict(overlay).items():
-        if isinstance(value, Mapping) and isinstance(merged.get(key), Mapping):
-            merged[key] = _deep_merge(merged[key], value)
-        else:
-            merged[key] = copy.deepcopy(value)
-    return merged
 
 
 def _scenario_by_name(config: Mapping[str, Any], name: str) -> Dict[str, Any]:

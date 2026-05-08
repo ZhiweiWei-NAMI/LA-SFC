@@ -1,0 +1,315 @@
+schema_version: lasdm.semantic_topology.runtime_unseen_sfc.v1
+
+# Figure-aligned V25 config.  The training distribution is deliberately narrow:
+# one contention/tradeoff scenario plus service-node and task-node count variants.
+# This matches plans/figures_req.md instead of training on unrelated scenario
+# families.  Evaluation sweeps are generated from semantic_runtime_contention_stress
+# by scripts/run_figures_req_eval.py.
+
+runtime_repair:
+  centralized_planner_success_guard:
+    enabled: true
+    baseline: centralized_planner
+    min_success_ratio: 0.45
+    calibration_scenario: semantic_runtime_contention_stress
+    seeds: [0, 1]
+  fail_fast_on_all_zero_success: true
+  export_raw_traces_required: true
+  early_result_guard:
+    enabled: false
+
+runtime:
+  warmup_steps: 5
+  max_steps: 100
+  step_interval_s: 0.1
+  airfogsim_config_overrides:
+    simulation:
+      max_simulation_time: 10
+      simulation_interval: 0.1
+      traffic_interval: 0.1
+    traffic:
+      traffic_interval: 0.1
+    authentication:
+      malicious_ratio: 0.0
+    task:
+      tti_threshold: 5.0
+      hard_ddl: 5.0
+    fog_profile:
+      vehicle:
+        cpu: 12
+        memory: 4096
+        storage: 4096
+      uav:
+        cpu: 10
+        memory: 4096
+        storage: 4096
+      rsu:
+        cpu: 60
+        memory: 16384
+        storage: 12000
+      cloud_server:
+        cpu: 80
+        memory: 32768
+        storage: 100000
+      cloud:
+        cpu: 80
+        memory: 32768
+        storage: 100000
+
+training:
+  episodes: 500
+  max_steps: 100
+  train_seeds: [0]
+  eval_seeds: [0]
+
+marl:
+  runtime_ticks_per_marl_step: 1
+  runtime_max_ticks_after_action: 1
+  runtime_stop_when_progress: true
+  route_hop_floor_s: 0.10
+  sequential_capacity_enabled: true
+  sequential_deadline_pruning_enabled: true
+  semantic_top_k: 64
+  max_candidates: 64
+  min_semantic_similarity: -1.0
+  auto_exchange: true
+  include_remote_candidates: true
+  include_semantic_features: true
+  include_topology_features: true
+  include_temporal_features: true
+  ippo_centralized_critic: true
+  ippo_use_region_encoder: true
+  ippo_hidden_dim: 256
+  ippo_mlp_depth: 3
+  ippo_gnn_layers: 3
+  ippo_action_prior_enabled: false
+  ippo_learnable_prior: false
+  ippo_prior_l2_coef: 0.0
+  ippo_learnable_logit_blend: false
+  ippo_learned_logit_scale_init: 2.0
+  ippo_prior_logit_scale_init: 0.0
+  ippo_critic_agent_count: 4
+  ippo_device: cuda
+  semantic_projection_dim: 64
+  cross_agent_attention_enabled: true
+  cross_agent_attention_heads: 4
+  ippo_utility_prior_logit_weight: 0.0
+  ippo_route_unavailable_penalty: 20.0
+  ippo_behavior_clone_pretrain_episodes: 0
+  ippo_behavior_clone_finetune_steps_per_observation: 0
+  ippo_expert_policy: ""
+  masac_training_scenario_sampling: balanced
+  ippo_curriculum_enabled: true
+  ippo_curriculum:
+    - fraction: 0.20
+      scenarios: [semantic_runtime_contention_stress]
+    - fraction: 0.40
+      scenarios: [train_fig_service_nodes_20, train_fig_service_nodes_40, train_fig_service_nodes_60, train_fig_service_nodes_80]
+    - fraction: 0.40
+      scenarios: [train_fig_task_nodes_20, train_fig_task_nodes_40, train_fig_task_nodes_60, train_fig_task_nodes_80]
+  masac_gamma: 0.90
+  masac_alpha: 0.05
+  masac_auto_alpha: true
+  masac_alpha_lr: 0.0003
+  masac_target_entropy_scale: 0.98
+  masac_alpha_min: 0.005
+  masac_alpha_max: 0.25
+  masac_tau: 0.01
+  masac_q_lr: 0.005
+  masac_q_mlp_depth: 3
+  masac_batch_size: 512
+  masac_replay_capacity: 10000
+  masac_replay_warmup_steps: 1024
+  masac_update_interval: 50
+  masac_actor_update_interval: 2
+  masac_updates_per_env_step: 1
+  masac_max_grad_norm: 10.0
+  masac_reward_scale: 1.0
+  masac_reward_normalization: true
+  masac_reward_clip: 5.0
+  masac_replay_sample_strategy: scenario_balanced
+  iql_batch_size: 256
+  iql_replay_capacity: 10000
+  iql_replay_warmup_steps: 1024
+  iql_update_interval: 50
+  iql_updates_per_env_step: 1
+  iql_max_grad_norm: 10.0
+  iql_reward_scale: 1.0
+  iql_reward_normalization: true
+  iql_reward_clip: 5.0
+  iql_replay_sample_strategy: scenario_balanced
+  ippo_lr: 0.005
+  topology_greedy_load_penalty: 0.50
+  topology_greedy_topology_risk_penalty: 1.40
+  topology_greedy_mobility_risk_penalty: 1.80
+  topology_greedy_route_hops_penalty: 0.80
+  topology_greedy_route_tx_penalty: 0.35
+  topology_greedy_route_unavailable_penalty: 2.50
+  topology_greedy_cold_start_penalty: 0.20
+  topology_greedy_deadline_violation_penalty: 1.50
+  topology_greedy_runtime_penalty: 0.25
+  topology_greedy_semantic_mismatch_penalty: 1.50
+  topology_greedy_utility_prior_weight: 0.00
+  topology_greedy_stale_penalty: 0.35
+  reward:
+    scenario_normalized_dense: true
+    success: 10.0
+    timeout: -2.0
+    gs2l_stage_progress: 6.0
+    gs2l_stage_success: 0.8
+    gs2l_stage_failure_discount: 0.15
+    gs2l_bandwidth_price: 0.5
+    gs2l_resource_price: 1.0
+    gs2l_quality_weight: 0.5
+    gs2l_clip: 8.0
+    route_unavailable: -2.0
+    deadline_slack: 0.03
+    semantic_score: 0.15
+    semantic_cumulative: 0.15
+    utility_prior: 0.0
+    topology_risk: -0.20
+    mobility_risk: -0.15
+    cold_start: -0.03
+    runtime_penalty: -0.05
+    load_imbalance: -0.10
+    route_hops: -0.05
+    route_tx_time: -0.03
+    rb_wait: -0.03
+    wireless_pressure: -0.03
+    resource_available: 0.10
+    remaining_deadline: 0.10
+    dense_clip: 1.0
+  ippo_checkpoint_selection_interval: 0
+  ippo_checkpoint_selection_early_interval: 0
+  ippo_checkpoint_selection_early_until_episode: 0
+  ippo_eval_checkpoint_strategy: exact_seed
+  masac_eval_prefer_sac_for_proposed: false
+  masac_eval_min_proposed_sac_selected_count: 0
+  ippo_training_progress_guard_enabled: true
+  ippo_training_guard_min_episodes: 12
+  ippo_training_guard_recent_window: 3
+  ippo_training_guard_min_recent_max_success: 0.05
+
+semantic_exchange:
+  encoder_backend: sbert
+  sbert_model_name: sentence-transformers/all-MiniLM-L6-v2
+  encoder_device: cuda
+  encoder_batch_size: 64
+  ttl_s: 8.0
+  fixed_delay_s: 0.0
+  per_hop_delay_s: 0.0
+  top_k_per_agent: 64
+  embedding_dim: 384
+
+semantic_profiles:
+  config_root: methods_baselines/lasdm/configs/semantic_unseen_sfc
+  output_root: experiment_artifacts/raw_data/semantic_profiles_artifacts_unseen_sfc
+  export_artifacts_once: true
+
+semantic_topology_experiment:
+  service_pressure_model:
+    ddl_s: 5.0
+    episode_duration_s: 10.0
+    arrival_horizon_s: 5.0
+    per_task_node_arrival_interval_s: 10.0
+    service_node_counts: [20, 40, 60, 80]
+    common_task_node_count: 60
+    task_node_counts: [20, 40, 60, 80]
+    target_trend: stair-step increase rather than exact fixed percentages
+    rationale: fixed demand for the service-node sweep; scarce service nodes should be capacity-bound while dense service nodes should be visibly easier
+  task_classes: {}
+  scenarios:
+    - &contention_base
+      name: semantic_runtime_contention_stress
+      objective: figure-aligned core scenario where semantic-only, topology-only, and utility-only choices are each insufficient
+      task_nodes: {vehicle: 60, uav: 0}
+      service_nodes: {rsu: 4, vehicle: 42, uav: 13, cloud_server: 1}
+      source_node_types: [vehicle]
+      task_classes: {}
+      arrival_process: per_task_node_poisson
+      arrival_horizon_s: 5.0
+      per_task_node_arrival_interval_s: 10.0
+      load_multiplier: 1.0
+      trajectory_segment_sampling:
+        enabled: true
+        start_range_s: [0.0, 590.0]
+        hold_last: true
+      sfc_length_distribution: {2: 0.35, 3: 0.35, 4: 0.20, 5: 0.10}
+      request_type_distribution:
+        flood_rescue_mapping: 0.30
+        port_perimeter_safety: 0.30
+        precision_crop_stress_patrol: 0.25
+        pipeline_leak_inspection: 0.15
+      stratified_request_types: true
+      stratified_sfc_lengths: true
+      qos_deadline_s: 5.0
+      payload_mb_range: [0.03, 0.12]
+      service_cpu_scale: 0.10
+      output_ratio: 0.12
+      semantic_mismatch_penalty_s_per_unit: 0.35
+      mobile_service_load_ratio: 0.08
+      mobile_service_topology_risk: 0.10
+      mobile_service_mobility_risk: 0.08
+      infrastructure_service_load_ratio: 0.18
+      infrastructure_service_topology_risk: 0.08
+      infrastructure_service_mobility_risk: 0.04
+      semantic_deployment_distribution:
+        variant_weights:
+          default: {exact: 0.08, equivalent: 0.28, compatible: 0.44, weak: 0.16, mismatch: 0.04}
+          vehicle: {exact: 0.02, equivalent: 0.26, compatible: 0.50, weak: 0.18, mismatch: 0.04}
+          uav: {exact: 0.04, equivalent: 0.28, compatible: 0.48, weak: 0.16, mismatch: 0.04}
+          rsu: {exact: 0.10, equivalent: 0.34, compatible: 0.40, weak: 0.12, mismatch: 0.04}
+          cloud_server: {exact: 0.58, equivalent: 0.24, compatible: 0.14, weak: 0.03, mismatch: 0.01}
+        exact_service_scale:
+          fire_candidate_detection: 0.45
+          smoke_fire_fusion: 0.45
+          fire_event_verification: 0.45
+          identity_verification: 0.55
+          industrial_defect_detection: 0.55
+      local_catalog_visibility: 1.0
+      regional_skew_ratio: 4.0
+      exchange_ttl_s: 6.0
+      exchange_radius_hops: 3
+      exchange_top_k: 96
+      wireless_rb_budget: 16
+      wireless_contention_factor: 0.80
+      network_latency_multiplier: 1.00
+      candidate_decoys:
+        enabled: true
+        remote_exact: 3
+        remote_compatible: 3
+        borderline_weak: 3
+        hard_negative_mismatch: 2
+        stale_clone_exact: 2
+    - name: train_fig_service_nodes_20
+      <<: *contention_base
+      service_nodes: {rsu: 4, vehicle: 11, uav: 4, cloud_server: 1}
+      expected_trend_rank: 1
+    - name: train_fig_service_nodes_40
+      <<: *contention_base
+      service_nodes: {rsu: 4, vehicle: 26, uav: 9, cloud_server: 1}
+      expected_trend_rank: 2
+    - name: train_fig_service_nodes_60
+      <<: *contention_base
+      service_nodes: {rsu: 4, vehicle: 42, uav: 13, cloud_server: 1}
+      expected_trend_rank: 3
+    - name: train_fig_service_nodes_80
+      <<: *contention_base
+      service_nodes: {rsu: 4, vehicle: 56, uav: 19, cloud_server: 1}
+      expected_trend_rank: 4
+    - name: train_fig_task_nodes_20
+      <<: *contention_base
+      task_nodes: {vehicle: 20, uav: 0}
+    - name: train_fig_task_nodes_40
+      <<: *contention_base
+      task_nodes: {vehicle: 40, uav: 0}
+    - name: train_fig_task_nodes_60
+      <<: *contention_base
+      task_nodes: {vehicle: 60, uav: 0}
+    - name: train_fig_task_nodes_80
+      <<: *contention_base
+      task_nodes: {vehicle: 80, uav: 0}
+    - name: distributed_service_discovery_calibrated
+      <<: *contention_base
+      include_in_default: false
+      objective: TTL sweep base derived from the same figure-aligned contention scenario

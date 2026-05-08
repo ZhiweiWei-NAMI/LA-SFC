@@ -1,0 +1,130 @@
+schema_version: lasdm.semantic.schema.v21
+dataset_family: v21_static_semantic_profiles
+ascii_only: true
+
+request_type_enum:
+  - forest_fire_monitoring
+  - traffic_surveillance
+  - urban_security
+  - industrial_inspection
+
+service_type_enum:
+  - aerial_video_preprocessing
+  - thermal_frame_preprocessing
+  - multi_spectral_fusion_preprocessing
+  - fire_candidate_detection
+  - vehicle_detection_and_tracking
+  - person_detection_and_reid
+  - industrial_defect_detection
+  - smoke_fire_fusion
+  - multi_sensor_event_fusion
+  - trajectory_risk_assessment
+  - fire_event_verification
+  - identity_verification
+  - defect_classification
+  - emergency_alert_publish
+  - surveillance_event_archive
+  - inspection_report_generation
+
+semantic_variant_type_enum:
+  - exact
+  - equivalent
+  - compatible
+  - weak
+  - mismatch
+
+compatible_node_type_enum:
+  - uav
+  - vehicle
+  - rsu
+  - edge_server
+  - cloud_server
+
+required_fields:
+  - implementation_id
+  - service_type
+  - model_family
+  - model_version
+  - semantic_variant_type
+  - compatible_node_types
+  - semantic_profile.description
+  - semantic_profile.input_semantic
+  - semantic_profile.output_semantic
+  - domain.primary_domains
+  - domain.secondary_domains
+  - domain.unsuitable_domains
+  - capabilities
+  - performance_profile
+  - resource_profile
+
+field_contract:
+  implementation_id: >
+    Stable ASCII identifier. Use lowercase snake style with version suffix and
+    keep the value globally unique inside the dataset.
+  service_type: >
+    One value from service_type_enum. The implementation must stay inside that
+    abstract function class even when the semantic variant is weak or mismatch.
+  model_family: >
+    Short model or pipeline family name that explains the main algorithmic
+    approach, runtime stack, or fusion method.
+  model_version: >
+    Short version token such as v1, v2, or release names already normalized to
+    ASCII.
+  semantic_variant_type: >
+    exact means request aligned and domain tuned, equivalent means same intent
+    with different sensing or model assumptions, compatible means usable but not
+    preferred, weak means partially related with clear domain loss, and mismatch
+    means the function can execute but the business semantics are wrong.
+  compatible_node_types: >
+    List of node types where the implementation can plausibly run without
+    hidden runtime adaptation. Keep the list realistic for the resource profile.
+  semantic_profile.description: >
+    Natural language paragraph that explains what the implementation does, what
+    evidence it consumes, and what decision boundary it targets. Do not use
+    keyword concatenation.
+  semantic_profile.input_semantic: >
+    Natural language paragraph that explains the expected upstream payload,
+    sensing assumptions, and required preprocessing state.
+  semantic_profile.output_semantic: >
+    Natural language paragraph that explains the produced artifact, confidence
+    meaning, and the downstream consumer expectation.
+  domain.primary_domains: >
+    Main task or scene domains where the implementation is intended to operate.
+  domain.secondary_domains: >
+    Nearby domains where the implementation can still provide usable outputs.
+  domain.unsuitable_domains: >
+    Domains that should score poorly because the implementation assumptions are
+    violated.
+  capabilities: >
+    Short ASCII labels describing the main functional capabilities exposed by
+    the implementation.
+  performance_profile: >
+    Structured metrics with realistic latency and error tradeoffs. Include
+    typical_inference_time_ms, typical_accuracy_f1, false_positive_rate,
+    false_negative_rate, throughput_fps, and robustness_notes.
+  resource_profile: >
+    Structured resource constraints. Include min_compute_cpu, min_memory_mb,
+    min_storage_mb, recommended_accelerator, and model_size_mb.
+
+text_requirements:
+  paragraph_style: >
+    Every semantic_profile text field must read as a short paragraph with full
+    sentences and explicit subject matter. Fragments such as "rgb, smoke,
+    wildfire, edge" are invalid.
+  ascii_only: >
+    Restrict content to printable ASCII so the files stay portable across the
+    current toolchain.
+  no_placeholder_text: >
+    Avoid TODO, dummy, lorem ipsum, or synthetic marker phrases in the final
+    dataset.
+
+numeric_guidelines:
+  typical_inference_time_ms: "Positive integer or decimal in milliseconds."
+  typical_accuracy_f1: "Decimal in [0, 1]."
+  false_positive_rate: "Decimal in [0, 1]."
+  false_negative_rate: "Decimal in [0, 1]."
+  throughput_fps: "Positive integer or decimal."
+  min_compute_cpu: "Positive CPU requirement in logical core units."
+  min_memory_mb: "Positive integer memory requirement in MB."
+  min_storage_mb: "Positive integer storage requirement in MB."
+  model_size_mb: "Positive integer or decimal model footprint in MB."

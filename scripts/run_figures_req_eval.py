@@ -45,7 +45,12 @@ def main() -> int:
     parser.add_argument(
         "--suites",
         nargs="+",
-        default=["service_nodes", "task_nodes", "skew", "ttl", "ablation", "uav", "sfc_length", "speed", "centralized"],
+        default=["service_nodes", "task_nodes", "ablation", "skew", "ttl", "uav", "speed"],
+    )
+    parser.add_argument(
+        "--write-traces",
+        action="store_true",
+        help="Write per-run and combined runtime traces. Figures only need summary.csv, so this is off by default.",
     )
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
@@ -63,6 +68,7 @@ def main() -> int:
     cfg.setdefault("marl", {})["ippo_eval_checkpoint_strategy"] = "exact_seed"
     cfg.setdefault("runtime_repair", {}).setdefault("early_result_guard", {})["enabled"] = False
     cfg.setdefault("runtime_repair", {})["fail_fast_on_all_zero_success"] = False
+    cfg.setdefault("runtime_repair", {})["eval_trace_outputs_enabled"] = bool(args.write_traces)
 
     manifest: list[dict[str, Any]] = []
     for suite_name in args.suites:
@@ -142,7 +148,7 @@ def build_suite(cfg: Mapping[str, Any], name: str) -> tuple[list[dict[str, Any]]
             scenario_variant(
                 cfg,
                 "semantic_runtime_contention_stress",
-                f"fig3_skew_{str(ratio).replace('.', 'p')}",
+                f"fig4_skew_{str(ratio).replace('.', 'p')}",
                 service_nodes=service_node_counts(60),
                 task_nodes={"vehicle": COMMON_TASK_NODE_COUNT, "uav": 0},
                 regional_skew_ratio=float(ratio),
@@ -156,7 +162,7 @@ def build_suite(cfg: Mapping[str, Any], name: str) -> tuple[list[dict[str, Any]]
             scenario_variant(
                 cfg,
                 "distributed_service_discovery_calibrated",
-                f"fig6_ttl_{int(ttl)}",
+                f"fig5_ttl_{int(ttl)}",
                 exchange_ttl_s=float(ttl),
                 exchange_radius_hops=3,
             )
@@ -172,7 +178,7 @@ def build_suite(cfg: Mapping[str, Any], name: str) -> tuple[list[dict[str, Any]]
             "marl_no_temporal",
             "marl_no_cross_region",
         ]
-        scenarios = [scenario_variant(cfg, "semantic_runtime_contention_stress", "fig9_ablation_contention")]
+        scenarios = [scenario_variant(cfg, "semantic_runtime_contention_stress", "fig3_ablation_contention")]
         return scenarios, methods
     if suite == "uav":
         methods = ["proposed_semantic_topology_marl", "topology_greedy", "cross_region_auction"]
@@ -180,32 +186,12 @@ def build_suite(cfg: Mapping[str, Any], name: str) -> tuple[list[dict[str, Any]]
             scenario_variant(
                 cfg,
                 "semantic_runtime_contention_stress",
-                f"fig11_uav_{count}",
+                f"fig6_uav_{count}",
                 service_nodes={"rsu": 4, "vehicle": 10, "uav": count, "cloud_server": 1},
                 task_nodes={"vehicle": COMMON_TASK_NODE_COUNT, "uav": 0},
             )
             for count in [2, 4, 6, 8, 10, 12]
         ]
-        return scenarios, methods
-    if suite == "sfc_length":
-        methods = ["proposed_semantic_topology_marl", "topology_greedy"]
-        scenarios = []
-        for length in [3, 4]:
-            for count in [20, 60, 80]:
-                scenarios.append(
-                    scenario_variant(
-                        cfg,
-                        "semantic_runtime_contention_stress",
-                        f"fig12_sfc_length_{length}_task_nodes_{count}",
-                        service_nodes=service_node_counts(60),
-                        task_nodes={"vehicle": count, "uav": 0},
-                        sfc_length=length,
-                    )
-                )
-        return scenarios, methods
-    if suite == "centralized":
-        methods = ["centralized_planner", "proposed_semantic_topology_marl", "topology_greedy"]
-        scenarios = [scenario_variant(cfg, "semantic_runtime_contention_stress", "fig14_contention")]
         return scenarios, methods
     if suite == "speed":
         methods = ["proposed_semantic_topology_marl", "marl_no_temporal", "topology_greedy"]
@@ -213,7 +199,7 @@ def build_suite(cfg: Mapping[str, Any], name: str) -> tuple[list[dict[str, Any]]
             scenario_variant(
                 cfg,
                 "semantic_runtime_contention_stress",
-                f"fig13_speed_{speed}",
+                f"fig8_speed_{speed}",
                 speed_scale=float(speed) / 50.0,
                 vehicle_speed_kmh=float(speed),
             )

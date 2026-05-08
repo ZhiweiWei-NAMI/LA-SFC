@@ -1,0 +1,229 @@
+schema_version: lasdm.semantic.service_types.v21
+service_type_count: 16
+
+service_types:
+  - service_type: aerial_video_preprocessing
+    functional_domain: preprocessing
+    description: >
+      Normalize unstable aerial RGB video into a cleaner stream that later
+      perception models can consume with fewer motion and illumination artifacts.
+    typical_request_types: [forest_fire_monitoring, traffic_surveillance, urban_security]
+    compatible_node_types: [uav, rsu, edge_server]
+    expected_input_semantic: >
+      Raw or lightly compressed RGB aerial video captured from a moving
+      platform with vibration, exposure shifts, or haze.
+    expected_output_semantic: >
+      Stabilized and corrected RGB frames that preserve scene geometry for
+      downstream detection and tracking.
+
+  - service_type: thermal_frame_preprocessing
+    functional_domain: preprocessing
+    description: >
+      Convert noisy thermal frames into calibrated heat imagery with stable
+      contrast so downstream thermal reasoning can separate signal from sensor
+      noise.
+    typical_request_types: [forest_fire_monitoring, industrial_inspection]
+    compatible_node_types: [uav, rsu, edge_server]
+    expected_input_semantic: >
+      Raw infrared or long wave thermal frames with sensor drift, dead pixels,
+      and changing ambient temperature.
+    expected_output_semantic: >
+      Calibrated thermal imagery with corrected gain, cleaner gradients, and
+      preserved hot spot boundaries.
+
+  - service_type: multi_spectral_fusion_preprocessing
+    functional_domain: preprocessing
+    description: >
+      Align and combine RGB, thermal, or near infrared streams so later models
+      can reason over one fused scene instead of independent sensors.
+    typical_request_types: [forest_fire_monitoring, industrial_inspection]
+    compatible_node_types: [rsu, edge_server, cloud_server]
+    expected_input_semantic: >
+      Time synchronized multi sensor frames with known camera geometry or
+      metadata good enough for alignment.
+    expected_output_semantic: >
+      A fused scene representation where complementary cues are co-registered
+      and ready for joint inference.
+
+  - service_type: fire_candidate_detection
+    functional_domain: detection
+    description: >
+      Detect smoke or flame candidates in aerial or thermal imagery before a
+      second stage verifies whether the evidence is operationally meaningful.
+    typical_request_types: [forest_fire_monitoring]
+    compatible_node_types: [uav, rsu, edge_server, cloud_server]
+    expected_input_semantic: >
+      Preprocessed RGB, thermal, or fused imagery with enough spatial detail to
+      localize small hot spots or smoke plumes.
+    expected_output_semantic: >
+      Candidate regions, confidence values, and supporting cues that can feed a
+      fusion or verification stage.
+
+  - service_type: vehicle_detection_and_tracking
+    functional_domain: detection
+    description: >
+      Detect road vehicles and maintain short horizon tracks that capture lane
+      position, speed changes, and interaction with nearby traffic.
+    typical_request_types: [traffic_surveillance]
+    compatible_node_types: [uav, vehicle, rsu, edge_server, cloud_server]
+    expected_input_semantic: >
+      Stabilized roadway video or fused traffic imagery with enough frame rate
+      for multi object association.
+    expected_output_semantic: >
+      Vehicle boxes, stable identities, and trajectory states suitable for risk
+      assessment or archival.
+
+  - service_type: person_detection_and_reid
+    functional_domain: detection
+    description: >
+      Detect people and maintain identity consistent tracklets across viewpoint
+      changes so later stages can inspect suspicious behavior or confirm person
+      continuity.
+    typical_request_types: [urban_security]
+    compatible_node_types: [uav, rsu, edge_server, cloud_server]
+    expected_input_semantic: >
+      Stabilized urban surveillance imagery with visible pedestrians, crowd
+      motion, and moderate occlusion.
+    expected_output_semantic: >
+      Person boxes, track identifiers, and appearance embeddings that support
+      later identity verification.
+
+  - service_type: industrial_defect_detection
+    functional_domain: detection
+    description: >
+      Detect candidate material defects or abnormal thermal regions on assets
+      before a classifier assigns precise fault categories and severity.
+    typical_request_types: [industrial_inspection]
+    compatible_node_types: [uav, rsu, edge_server, cloud_server]
+    expected_input_semantic: >
+      Close range visual, thermal, or fused inspection imagery with enough
+      detail to isolate small cracks, corrosion, or hot spots.
+    expected_output_semantic: >
+      Defect candidates with localized evidence that can be graded by a
+      downstream classification stage.
+
+  - service_type: smoke_fire_fusion
+    functional_domain: fusion
+    description: >
+      Merge smoke cues and flame cues so a single transient artifact does not
+      trigger an alert without supporting evidence from a second signal.
+    typical_request_types: [forest_fire_monitoring]
+    compatible_node_types: [rsu, edge_server, cloud_server]
+    expected_input_semantic: >
+      Candidate fire detections, smoke observations, or temporal heat traces
+      that can be cross checked for consistency.
+    expected_output_semantic: >
+      A fused wildfire evidence record with joint confidence and explanation of
+      which cues supported the decision.
+
+  - service_type: multi_sensor_event_fusion
+    functional_domain: fusion
+    description: >
+      Combine outputs from multiple sensors or analytic stages into one event
+      hypothesis that reflects agreement, timing, and spatial consistency.
+    typical_request_types: [forest_fire_monitoring, industrial_inspection]
+    compatible_node_types: [rsu, edge_server, cloud_server]
+    expected_input_semantic: >
+      Heterogeneous detections or measurements with timestamps and enough
+      metadata to align them in time and space.
+    expected_output_semantic: >
+      Consolidated event evidence with cross sensor confidence and a cleaner
+      semantic summary for verification or reporting.
+
+  - service_type: trajectory_risk_assessment
+    functional_domain: fusion
+    description: >
+      Score whether a motion pattern indicates collision risk, intrusion, or
+      other abnormal behavior based on recent tracked trajectory history.
+    typical_request_types: [traffic_surveillance, urban_security]
+    compatible_node_types: [vehicle, rsu, edge_server, cloud_server]
+    expected_input_semantic: >
+      Track states with position, velocity, and interaction context over a
+      short temporal window.
+    expected_output_semantic: >
+      Risk scores, anomaly labels, and narrative reasons that a control or
+      alerting stage can act on.
+
+  - service_type: fire_event_verification
+    functional_domain: verification
+    description: >
+      Confirm whether a fire candidate should be treated as a real incident by
+      examining temporal persistence, context, and multi cue agreement.
+    typical_request_types: [forest_fire_monitoring]
+    compatible_node_types: [rsu, edge_server, cloud_server]
+    expected_input_semantic: >
+      Candidate wildfire evidence enriched with smoke, heat, or scene context
+      rather than isolated single frame detections.
+    expected_output_semantic: >
+      A verified or rejected fire event record with justification and a clear
+      confidence interpretation.
+
+  - service_type: identity_verification
+    functional_domain: verification
+    description: >
+      Verify whether a detected person matches a known identity or watchlist
+      reference using appearance continuity and biometric evidence.
+    typical_request_types: [urban_security]
+    compatible_node_types: [rsu, edge_server, cloud_server]
+    expected_input_semantic: >
+      Person crops, tracklets, and identity evidence with controlled enough
+      resolution for meaningful comparison.
+    expected_output_semantic: >
+      Identity match decisions, confidence scores, and explanations about which
+      evidence was trusted or rejected.
+
+  - service_type: defect_classification
+    functional_domain: verification
+    description: >
+      Assign a precise defect taxonomy and severity level to candidate faults so
+      maintenance teams can prioritize repair actions.
+    typical_request_types: [industrial_inspection]
+    compatible_node_types: [rsu, edge_server, cloud_server]
+    expected_input_semantic: >
+      Localized defect crops or fused defect evidence with enough resolution to
+      compare morphology, material context, or thermal spread.
+    expected_output_semantic: >
+      Structured defect labels, severity bands, and supporting rationale ready
+      for report generation.
+
+  - service_type: emergency_alert_publish
+    functional_domain: alerting
+    description: >
+      Convert verified events into a routed alert with the right urgency,
+      audience, and payload structure for field response.
+    typical_request_types: [forest_fire_monitoring, traffic_surveillance, urban_security]
+    compatible_node_types: [rsu, edge_server, cloud_server]
+    expected_input_semantic: >
+      A verified or high confidence event summary that already contains the
+      necessary location, time, and reason fields.
+    expected_output_semantic: >
+      An alert package with severity, recipients, and minimal supporting
+      context suitable for notification channels.
+
+  - service_type: surveillance_event_archive
+    functional_domain: archival
+    description: >
+      Preserve validated surveillance evidence in a searchable form so later
+      audits can reconstruct what happened without replaying full raw streams.
+    typical_request_types: [traffic_surveillance, urban_security]
+    compatible_node_types: [rsu, edge_server, cloud_server]
+    expected_input_semantic: >
+      Event summaries, clips, track metadata, or alert records that should be
+      compressed and indexed.
+    expected_output_semantic: >
+      Archive manifests, retrieval keys, and storage references that point to
+      the preserved evidence package.
+
+  - service_type: inspection_report_generation
+    functional_domain: reporting
+    description: >
+      Turn defect findings into a structured inspection report that condenses
+      evidence, severity, and recommended action for maintenance teams.
+    typical_request_types: [industrial_inspection]
+    compatible_node_types: [edge_server, cloud_server]
+    expected_input_semantic: >
+      Classified defect findings with asset metadata, timestamps, and evidence
+      references that can be summarized into human readable conclusions.
+    expected_output_semantic: >
+      A structured report artifact with defect table entries, severity summary,
+      and maintenance recommendations.

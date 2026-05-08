@@ -1,14 +1,5 @@
 # Claims Vs Evidence
 
-Latest paper-runtime suite:
-
-- Raw runtime data: `experiment_artifacts/raw_data/lasdm_paper_runtime_final/lasdm_airfogsim/20260427_164344_459807/`
-- Analysis artifacts: `analysis/runtime_final/`
-- Figures: `analysis/runtime_final/figures/`
-- Significance table: `analysis/runtime_final/significance_summary.csv`
-
-Scope: 3 core baselines (`nearest_edge`, `centralized_greedy`, `proposed`) x 5 scenarios (`normal`, `high_mobility`, `load_burst`, `link_fault`, `airspace_event`) x 10 seeds (`0..9`) = 150 real AirFogSim/SUMO runtime runs.
-
 Latest Semantic-Topology MARL runtime suite:
 
 - Main raw runtime data: `experiment_artifacts/raw_data/semantic_topology_paper_matrix_v3/semantic_runtime_eval/`

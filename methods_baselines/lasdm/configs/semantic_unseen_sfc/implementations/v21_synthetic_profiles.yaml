@@ -1,0 +1,3042 @@
+schema_version: lasdm.semantic.implementations.v21
+dataset_id: v21_unseen_sfc_profiles
+service_type_count: 16
+implementation_count: 80
+
+implementations:
+  - implementation_id: aerial_rgb_stabilizer_v2
+    service_type: aerial_video_preprocessing
+    model_family: opencv_gstreamer
+    model_version: v2
+    semantic_variant_type: exact
+    compatible_node_types: [uav, rsu, edge_server]
+    semantic_profile:
+      description: >
+        This pipeline stabilizes aerial RGB video for low altitude monitoring by
+        removing platform jitter, correcting exposure drift, and reducing light
+        haze before any detection stage sees the frames.
+      input_semantic: >
+        It expects raw RGB video from a moving UAV camera, including small roll
+        changes, motion blur, and compression noise typical of airborne links.
+      output_semantic: >
+        It returns frame aligned RGB clips with steadier geometry and cleaner
+        color balance so downstream detectors can compare objects across time.
+    domain:
+      primary_domains: [aerial, surveillance, rgb]
+      secondary_domains: [traffic, security, wildfire]
+      unsuitable_domains: [flatbed_scanning, document_ocr, medical_imaging]
+    capabilities: [video_stabilization, dehaze, exposure_correction, rgb_preprocess]
+    performance_profile:
+      typical_inference_time_ms: 14
+      typical_accuracy_f1: 0.94
+      false_positive_rate: 0.03
+      false_negative_rate: 0.04
+      throughput_fps: 36
+      robustness_notes: >
+        It is reliable on daylight aerial footage but loses quality when frames
+        are badly underexposed or when motion blur is already severe.
+    resource_profile:
+      min_compute_cpu: 2.0
+      min_memory_mb: 768
+      min_storage_mb: 256
+      recommended_accelerator: none
+      model_size_mb: 18
+
+  - implementation_id: aerial_hdr_restorer_v1
+    service_type: aerial_video_preprocessing
+    model_family: unet_restoration
+    model_version: v1
+    semantic_variant_type: equivalent
+    compatible_node_types: [rsu, edge_server]
+    semantic_profile:
+      description: >
+        This restoration model prepares aerial RGB video by lifting shadowed
+        regions and compressing bright sky highlights, which preserves small
+        scene details that standard stabilization pipelines often wash out.
+      input_semantic: >
+        It expects stabilized or near stabilized RGB aerial frames where the
+        main problem is dynamic range loss rather than strong platform motion.
+      output_semantic: >
+        It emits visually balanced RGB frames whose local contrast is more
+        uniform, allowing later detectors to keep weak object evidence.
+    domain:
+      primary_domains: [aerial, rgb, illumination_recovery]
+      secondary_domains: [traffic, urban_security]
+      unsuitable_domains: [thermal, scanned_pages, xray]
+    capabilities: [hdr_recovery, contrast_restoration, rgb_preprocess]
+    performance_profile:
+      typical_inference_time_ms: 26
+      typical_accuracy_f1: 0.91
+      false_positive_rate: 0.05
+      false_negative_rate: 0.06
+      throughput_fps: 18
+      robustness_notes: >
+        It helps in backlit scenes but is less stable than the exact pipeline on
+        hard UAV vibration or rapid yaw.
+    resource_profile:
+      min_compute_cpu: 3.0
+      min_memory_mb: 1536
+      min_storage_mb: 512
+      recommended_accelerator: gpu
+      model_size_mb: 42
+
+  - implementation_id: general_video_denoise_pipeline_v3
+    service_type: aerial_video_preprocessing
+    model_family: ffmpeg_filtergraph
+    model_version: v3
+    semantic_variant_type: compatible
+    compatible_node_types: [uav, rsu, edge_server]
+    semantic_profile:
+      description: >
+        This general video cleanup stack denoises, sharpens, and mildly smooths
+        compressed frames, which makes it usable for aerial workloads even
+        though it was not tuned around flight dynamics.
+      input_semantic: >
+        It expects noisy RGB video with visible codec artifacts and only modest
+        geometric instability in the source stream.
+      output_semantic: >
+        It produces cleaner RGB frames with fewer blocking artifacts, but it
+        does not guarantee strict frame to frame motion consistency.
+    domain:
+      primary_domains: [generic_video, rgb]
+      secondary_domains: [aerial, traffic, security]
+      unsuitable_domains: [thermal, document_rectification, microscopy]
+    capabilities: [video_denoise, artifact_reduction, rgb_preprocess]
+    performance_profile:
+      typical_inference_time_ms: 11
+      typical_accuracy_f1: 0.86
+      false_positive_rate: 0.07
+      false_negative_rate: 0.09
+      throughput_fps: 42
+      robustness_notes: >
+        It is fast and easy to deploy, but weak motion handling limits its
+        benefit on footage from aggressive UAV maneuvers.
+    resource_profile:
+      min_compute_cpu: 1.5
+      min_memory_mb: 512
+      min_storage_mb: 256
+      recommended_accelerator: none
+      model_size_mb: 9
+
+  - implementation_id: bodycam_video_cleaner_v1
+    service_type: aerial_video_preprocessing
+    model_family: mobile_enhance
+    model_version: v1
+    semantic_variant_type: weak
+    compatible_node_types: [uav, rsu]
+    semantic_profile:
+      description: >
+        This cleaner was built for chest mounted security cameras and can still
+        improve low altitude footage, but its motion assumptions follow human
+        walking patterns rather than airborne motion.
+      input_semantic: >
+        It expects short RGB clips with modest shake, near eye level viewpoints,
+        and relatively close foreground subjects.
+      output_semantic: >
+        It returns smoothed RGB video that looks cleaner to a person, yet it can
+        blur distant aerial targets that later models need to preserve.
+    domain:
+      primary_domains: [wearable_security, rgb]
+      secondary_domains: [urban_patrol, indoor_surveillance]
+      unsuitable_domains: [wildfire_aerial, thermal, industrial_macro]
+    capabilities: [video_cleanup, mild_stabilization, rgb_preprocess]
+    performance_profile:
+      typical_inference_time_ms: 9
+      typical_accuracy_f1: 0.78
+      false_positive_rate: 0.11
+      false_negative_rate: 0.14
+      throughput_fps: 44
+      robustness_notes: >
+        It runs cheaply but often oversmooths tiny aerial targets and does not
+        correct the perspective changes seen in UAV footage.
+    resource_profile:
+      min_compute_cpu: 1.0
+      min_memory_mb: 384
+      min_storage_mb: 128
+      recommended_accelerator: none
+      model_size_mb: 6
+
+  - implementation_id: document_scanner_rectifier_v1
+    service_type: aerial_video_preprocessing
+    model_family: ocr_preprocess
+    model_version: v1
+    semantic_variant_type: mismatch
+    compatible_node_types: [rsu, edge_server]
+    semantic_profile:
+      description: >
+        This rectifier tries to flatten perspective and maximize text contrast,
+        which is useful for scanned forms but semantically wrong for open scene
+        aerial video where objects must keep their real geometry.
+      input_semantic: >
+        It expects near planar images of documents with strong page borders and
+        stable backgrounds rather than outdoor moving scenes.
+      output_semantic: >
+        It emits aggressively warped frames that emphasize edges and corners,
+        destroying the spatial continuity needed for tracking or detection.
+    domain:
+      primary_domains: [document_ocr, planar_rectification]
+      secondary_domains: [receipt_capture]
+      unsuitable_domains: [aerial, traffic, urban_security, wildfire]
+    capabilities: [perspective_rectification, edge_boost, text_contrast]
+    performance_profile:
+      typical_inference_time_ms: 19
+      typical_accuracy_f1: 0.33
+      false_positive_rate: 0.32
+      false_negative_rate: 0.41
+      throughput_fps: 20
+      robustness_notes: >
+        It executes correctly as software, but its outputs are structurally
+        misleading for every downstream aerial analytics task in this dataset.
+    resource_profile:
+      min_compute_cpu: 2.0
+      min_memory_mb: 1024
+      min_storage_mb: 256
+      recommended_accelerator: none
+      model_size_mb: 14
+
+  - implementation_id: wildfire_thermal_nuc_v2
+    service_type: thermal_frame_preprocessing
+    model_family: thermal_calibration_net
+    model_version: v2
+    semantic_variant_type: exact
+    compatible_node_types: [uav, rsu, edge_server]
+    semantic_profile:
+      description: >
+        This thermal preprocessing stack corrects non uniformity, dead pixels,
+        and temperature drift in airborne infrared frames collected during
+        wildfire patrol and night monitoring.
+      input_semantic: >
+        It expects raw long wave infrared frames from an aerial thermal sensor,
+        including gain drift and hot pixel noise caused by changing ambient
+        temperature and platform vibration.
+      output_semantic: >
+        It returns calibrated heat imagery with stable contrast and preserved
+        hot spot boundaries so fire reasoning stages can trust the signal.
+    domain:
+      primary_domains: [thermal, wildfire, aerial]
+      secondary_domains: [night_monitoring, industrial_heat]
+      unsuitable_domains: [rgb_only, document_ocr, ultrasound]
+    capabilities: [thermal_calibration, dead_pixel_repair, heat_contrast]
+    performance_profile:
+      typical_inference_time_ms: 17
+      typical_accuracy_f1: 0.95
+      false_positive_rate: 0.03
+      false_negative_rate: 0.04
+      throughput_fps: 28
+      robustness_notes: >
+        It is stable under changing ambient conditions, but severe sensor bloom
+        around very large flames can still reduce boundary accuracy.
+    resource_profile:
+      min_compute_cpu: 2.0
+      min_memory_mb: 768
+      min_storage_mb: 256
+      recommended_accelerator: none
+      model_size_mb: 20
+
+  - implementation_id: thermal_contrast_enhancer_v1
+    service_type: thermal_frame_preprocessing
+    model_family: clahe_ir
+    model_version: v1
+    semantic_variant_type: equivalent
+    compatible_node_types: [uav, rsu]
+    semantic_profile:
+      description: >
+        This enhancer improves local thermal contrast and suppresses banding,
+        giving downstream models a cleaner view when the main problem is flat
+        dynamic range rather than severe calibration drift.
+      input_semantic: >
+        It expects thermal frames that are already roughly calibrated but still
+        lack contrast between background terrain and hot structures.
+      output_semantic: >
+        It emits high contrast thermal frames that highlight gradients and warm
+        contours, which is often enough for later segmentation or detection.
+    domain:
+      primary_domains: [thermal, contrast_recovery]
+      secondary_domains: [wildfire, industrial_inspection]
+      unsuitable_domains: [rgb, text_scan, lidar]
+    capabilities: [thermal_enhancement, contrast_equalization]
+    performance_profile:
+      typical_inference_time_ms: 10
+      typical_accuracy_f1: 0.89
+      false_positive_rate: 0.06
+      false_negative_rate: 0.07
+      throughput_fps: 40
+      robustness_notes: >
+        It is efficient on edge hardware but cannot correct deeper sensor drift
+        that accumulates during long flights.
+    resource_profile:
+      min_compute_cpu: 1.5
+      min_memory_mb: 512
+      min_storage_mb: 128
+      recommended_accelerator: none
+      model_size_mb: 8
+
+  - implementation_id: industrial_ir_cleanup_v3
+    service_type: thermal_frame_preprocessing
+    model_family: sensor_cleaning_rules
+    model_version: v3
+    semantic_variant_type: compatible
+    compatible_node_types: [rsu, edge_server]
+    semantic_profile:
+      description: >
+        This cleanup pipeline was built for fixed industrial infrared cameras,
+        but it can still prepare thermal frames for aerial inspection if the
+        motion between frames remains moderate.
+      input_semantic: >
+        It expects infrared frames with periodic noise and known sensor gain
+        settings, usually from mounted cameras observing steady equipment.
+      output_semantic: >
+        It produces cleaner heat maps and removes repeating noise patterns, but
+        it does not explicitly model airborne motion or rapid viewpoint change.
+    domain:
+      primary_domains: [industrial_thermal, infrared]
+      secondary_domains: [inspection, wildfire]
+      unsuitable_domains: [rgb, underwater, microscopy]
+    capabilities: [thermal_denoise, gain_cleanup, noise_filter]
+    performance_profile:
+      typical_inference_time_ms: 13
+      typical_accuracy_f1: 0.84
+      false_positive_rate: 0.08
+      false_negative_rate: 0.1
+      throughput_fps: 32
+      robustness_notes: >
+        It performs acceptably on calm aerial scans, but fast panning can leave
+        ghost artifacts that later detectors may misread.
+    resource_profile:
+      min_compute_cpu: 2.0
+      min_memory_mb: 768
+      min_storage_mb: 256
+      recommended_accelerator: none
+      model_size_mb: 11
+
+  - implementation_id: building_heatmap_smoother_v1
+    service_type: thermal_frame_preprocessing
+    model_family: heatmap_smoother
+    model_version: v1
+    semantic_variant_type: weak
+    compatible_node_types: [rsu, edge_server]
+    semantic_profile:
+      description: >
+        This smoother targets slow changing building heat maps and can reduce
+        flicker, but it assumes mostly static scenes and therefore softens small
+        moving hot spots that matter in wildfire patrol.
+      input_semantic: >
+        It expects thermal imagery from fixed building surveys with limited
+        motion, regular facades, and long dwell time on each target.
+      output_semantic: >
+        It returns visually calm thermal fields that favor broad temperature
+        trends over sharp event boundaries or tiny isolated anomalies.
+    domain:
+      primary_domains: [building_energy_audit, thermal]
+      secondary_domains: [facility_inspection]
+      unsuitable_domains: [wildfire_aerial, high_motion_thermal, rgb]
+    capabilities: [temporal_smoothing, thermal_cleanup]
+    performance_profile:
+      typical_inference_time_ms: 8
+      typical_accuracy_f1: 0.72
+      false_positive_rate: 0.11
+      false_negative_rate: 0.16
+      throughput_fps: 48
+      robustness_notes: >
+        It is cheap to run, but boundary smoothing causes missed early hot spots
+        when anomalies are small and moving.
+    resource_profile:
+      min_compute_cpu: 1.0
+      min_memory_mb: 384
+      min_storage_mb: 128
+      recommended_accelerator: none
+      model_size_mb: 5
+
+  - implementation_id: rgb_color_grader_v2
+    service_type: thermal_frame_preprocessing
+    model_family: color_grade_cnn
+    model_version: v2
+    semantic_variant_type: mismatch
+    compatible_node_types: [uav, rsu]
+    semantic_profile:
+      description: >
+        This model enhances visible color footage and has no thermal calibration
+        semantics, so using it on infrared inputs would only create misleading
+        pseudo color artifacts.
+      input_semantic: >
+        It expects standard RGB imagery with three visible channels and natural
+        color relationships rather than radiometric thermal measurements.
+      output_semantic: >
+        It emits color graded frames whose numeric values no longer correspond
+        to real temperature structure, which breaks downstream heat reasoning.
+    domain:
+      primary_domains: [rgb_enhancement, color_video]
+      secondary_domains: [consumer_video]
+      unsuitable_domains: [thermal, wildfire_heat, industrial_ir]
+    capabilities: [color_grading, rgb_enhancement]
+    performance_profile:
+      typical_inference_time_ms: 12
+      typical_accuracy_f1: 0.28
+      false_positive_rate: 0.37
+      false_negative_rate: 0.43
+      throughput_fps: 34
+      robustness_notes: >
+        It runs as a valid pipeline, but the produced images discard the thermal
+        semantics that the rest of the V21 stack depends on.
+    resource_profile:
+      min_compute_cpu: 1.5
+      min_memory_mb: 512
+      min_storage_mb: 128
+      recommended_accelerator: none
+      model_size_mb: 10
+
+  - implementation_id: aerial_rgb_thermal_aligner_v2
+    service_type: multi_spectral_fusion_preprocessing
+    model_family: homography_fusion
+    model_version: v2
+    semantic_variant_type: exact
+    compatible_node_types: [rsu, edge_server, cloud_server]
+    semantic_profile:
+      description: >
+        This fusion preprocessor aligns RGB and thermal streams from a shared
+        aerial platform, compensates for small mounting offsets, and builds a
+        fused scene tensor ready for joint reasoning.
+      input_semantic: >
+        It expects time synchronized RGB and thermal frames with camera pose
+        metadata or enough overlap for robust geometric registration.
+      output_semantic: >
+        It returns a co-registered multispectral representation where heat and
+        visible structure refer to the same scene points.
+    domain:
+      primary_domains: [multispectral, aerial, wildfire]
+      secondary_domains: [industrial_inspection, night_monitoring]
+      unsuitable_domains: [single_sensor_only, document_scan, audio]
+    capabilities: [sensor_alignment, rgb_thermal_fusion, registration]
+    performance_profile:
+      typical_inference_time_ms: 31
+      typical_accuracy_f1: 0.93
+      false_positive_rate: 0.04
+      false_negative_rate: 0.05
+      throughput_fps: 16
+      robustness_notes: >
+        It is accurate when timestamps are tight, but large sensor desync still
+        causes spatial drift around fast moving objects.
+    resource_profile:
+      min_compute_cpu: 4.0
+      min_memory_mb: 2048
+      min_storage_mb: 512
+      recommended_accelerator: gpu
+      model_size_mb: 48
+
+  - implementation_id: multispectral_patch_fuser_v1
+    service_type: multi_spectral_fusion_preprocessing
+    model_family: transformer_fuser
+    model_version: v1
+    semantic_variant_type: equivalent
+    compatible_node_types: [edge_server, cloud_server]
+    semantic_profile:
+      description: >
+        This patch based transformer learns to fuse visible, near infrared, and
+        thermal cues into a single representation, serving the same purpose as
+        classical alignment pipelines but with heavier compute.
+      input_semantic: >
+        It expects already cropped sensor patches or moderately aligned frames
+        where the model can learn cross channel correspondences.
+      output_semantic: >
+        It emits a fused feature image whose channels emphasize anomalies that
+        are weak in one modality but strong in another.
+    domain:
+      primary_domains: [multispectral, transformer_fusion]
+      secondary_domains: [wildfire, industrial_inspection]
+      unsuitable_domains: [low_memory_uav, single_rgb, text_images]
+    capabilities: [feature_fusion, multispectral_preprocess, anomaly_boost]
+    performance_profile:
+      typical_inference_time_ms: 54
+      typical_accuracy_f1: 0.91
+      false_positive_rate: 0.05
+      false_negative_rate: 0.06
+      throughput_fps: 9
+      robustness_notes: >
+        It preserves subtle cross modality cues well, but deployment is mostly
+        limited to stronger edge or cloud nodes.
+    resource_profile:
+      min_compute_cpu: 6.0
+      min_memory_mb: 4096
+      min_storage_mb: 1024
+      recommended_accelerator: gpu
+      model_size_mb: 86
+
+  - implementation_id: georegistered_sensor_stack_v3
+    service_type: multi_spectral_fusion_preprocessing
+    model_family: ros_sensor_stack
+    model_version: v3
+    semantic_variant_type: compatible
+    compatible_node_types: [rsu, edge_server]
+    semantic_profile:
+      description: >
+        This stack fuses heterogeneous sensors through timestamp and GPS based
+        registration, which makes it broadly usable when tight pixel alignment
+        is not required.
+      input_semantic: >
+        It expects sensor packets with reliable timing, approximate geolocation,
+        and scene overlap that is good enough for coarse alignment.
+      output_semantic: >
+        It returns a loosely fused observation package where each modality is
+        linked in time and space but not always pixel perfect.
+    domain:
+      primary_domains: [multisensor, georegistration]
+      secondary_domains: [traffic, security, inspection]
+      unsuitable_domains: [subpixel_defect_analysis, document_ocr]
+    capabilities: [timestamp_alignment, geo_registration, sensor_packaging]
+    performance_profile:
+      typical_inference_time_ms: 23
+      typical_accuracy_f1: 0.84
+      false_positive_rate: 0.08
+      false_negative_rate: 0.09
+      throughput_fps: 18
+      robustness_notes: >
+        It is operationally flexible, but coarse alignment reduces value for
+        pixel precise downstream reasoning.
+    resource_profile:
+      min_compute_cpu: 3.0
+      min_memory_mb: 1536
+      min_storage_mb: 512
+      recommended_accelerator: none
+      model_size_mb: 24
+
+  - implementation_id: dual_camera_parking_fusion_v1
+    service_type: multi_spectral_fusion_preprocessing
+    model_family: stereo_parking_fusion
+    model_version: v1
+    semantic_variant_type: weak
+    compatible_node_types: [rsu, edge_server]
+    semantic_profile:
+      description: >
+        This fusion pipeline was designed for fixed dual camera parking systems
+        and can combine two views, but its geometry assumptions break down when
+        sensors move together on an airborne platform.
+      input_semantic: >
+        It expects near static paired RGB cameras with constant baseline and a
+        narrow operating region such as a gate or parking aisle.
+      output_semantic: >
+        It produces a fused dual view frame that is convenient for local scene
+        monitoring, yet it does not preserve reliable airborne registration.
+    domain:
+      primary_domains: [parking_monitoring, dual_camera]
+      secondary_domains: [fixed_security]
+      unsuitable_domains: [aerial_multispectral, wildfire, thermal_registration]
+    capabilities: [dual_view_fusion, scene_pair_alignment]
+    performance_profile:
+      typical_inference_time_ms: 18
+      typical_accuracy_f1: 0.73
+      false_positive_rate: 0.12
+      false_negative_rate: 0.15
+      throughput_fps: 22
+      robustness_notes: >
+        It is acceptable only when motion is low and the view geometry remains
+        close to its fixed camera training setup.
+    resource_profile:
+      min_compute_cpu: 2.0
+      min_memory_mb: 1024
+      min_storage_mb: 256
+      recommended_accelerator: none
+      model_size_mb: 17
+
+  - implementation_id: single_stream_frame_cropper_v2
+    service_type: multi_spectral_fusion_preprocessing
+    model_family: crop_resize_pipeline
+    model_version: v2
+    semantic_variant_type: mismatch
+    compatible_node_types: [uav, rsu]
+    semantic_profile:
+      description: >
+        This pipeline only crops and resizes one stream, so it cannot express
+        any true fusion semantics even though it may run before a model.
+      input_semantic: >
+        It expects a single RGB stream and a crop template rather than multiple
+        synchronized sensors with complementary evidence.
+      output_semantic: >
+        It emits resized single modality frames that carry no cross sensor
+        alignment or fused representation for downstream consumers.
+    domain:
+      primary_domains: [single_stream_preprocess, rgb]
+      secondary_domains: [generic_video]
+      unsuitable_domains: [multispectral, thermal_rgb_fusion, industrial_fusion]
+    capabilities: [crop_resize, frame_normalization]
+    performance_profile:
+      typical_inference_time_ms: 6
+      typical_accuracy_f1: 0.24
+      false_positive_rate: 0.39
+      false_negative_rate: 0.46
+      throughput_fps: 60
+      robustness_notes: >
+        It is very fast, but its outputs miss the defining semantics of this
+        service type and therefore should score near the bottom.
+    resource_profile:
+      min_compute_cpu: 1.0
+      min_memory_mb: 256
+      min_storage_mb: 128
+      recommended_accelerator: none
+      model_size_mb: 4
+
+  - implementation_id: fire_rgb_yolov8_v3
+    service_type: fire_candidate_detection
+    model_family: yolov8
+    model_version: v3
+    semantic_variant_type: exact
+    compatible_node_types: [uav, rsu, edge_server]
+    semantic_profile:
+      description: >
+        This detector is tuned for aerial wildfire patrol and searches for both
+        compact flame regions and early smoke plumes in RGB frames before any
+        event verification logic is applied.
+      input_semantic: >
+        It expects stabilized daylight RGB aerial imagery with enough ground
+        detail to resolve small flame textures and drifting smoke structure.
+      output_semantic: >
+        It returns fire and smoke candidate boxes with confidence scores and
+        coarse plume direction cues for downstream fusion or verification.
+    domain:
+      primary_domains: [wildfire, aerial, rgb]
+      secondary_domains: [grassfire, hillside_monitoring]
+      unsuitable_domains: [indoor_flame, traffic, biometric]
+    capabilities: [fire_detection, smoke_detection, object_localization]
+    performance_profile:
+      typical_inference_time_ms: 37
+      typical_accuracy_f1: 0.93
+      false_positive_rate: 0.05
+      false_negative_rate: 0.06
+      throughput_fps: 21
+      robustness_notes: >
+        It is strong in daylight aerial scenes, but dense cloud shadow or heavy
+        smoke occlusion can still reduce recall.
+    resource_profile:
+      min_compute_cpu: 4.0
+      min_memory_mb: 2048
+      min_storage_mb: 512
+      recommended_accelerator: gpu
+      model_size_mb: 52
+
+  - implementation_id: wildfire_thermal_seg_v2
+    service_type: fire_candidate_detection
+    model_family: deeplabv3
+    model_version: v2
+    semantic_variant_type: equivalent
+    compatible_node_types: [rsu, edge_server, cloud_server]
+    semantic_profile:
+      description: >
+        This thermal segmentation model searches for persistent hot regions and
+        works as an equivalent fire candidate detector when visible cues are weak
+        or the mission runs at night.
+      input_semantic: >
+        It expects calibrated thermal frames whose pixel values still preserve
+        relative heat intensity around suspected flame regions.
+      output_semantic: >
+        It emits segmented hot regions with confidence and area estimates, which
+        can feed verification even without explicit smoke boxes.
+    domain:
+      primary_domains: [wildfire, thermal, night_monitoring]
+      secondary_domains: [industrial_heat, aerial]
+      unsuitable_domains: [rgb_only, urban_identity, traffic_tracking]
+    capabilities: [thermal_fire_segmentation, hotspot_detection]
+    performance_profile:
+      typical_inference_time_ms: 44
+      typical_accuracy_f1: 0.9
+      false_positive_rate: 0.06
+      false_negative_rate: 0.07
+      throughput_fps: 14
+      robustness_notes: >
+        It is useful at night, but hot machinery and sun warmed roofs can raise
+        false positives if location context is absent.
+    resource_profile:
+      min_compute_cpu: 5.0
+      min_memory_mb: 3072
+      min_storage_mb: 768
+      recommended_accelerator: gpu
+      model_size_mb: 61
+
+  - implementation_id: smoke_rgb_retinanet_v1
+    service_type: fire_candidate_detection
+    model_family: retinanet
+    model_version: v1
+    semantic_variant_type: compatible
+    compatible_node_types: [rsu, edge_server]
+    semantic_profile:
+      description: >
+        This model focuses on smoke plumes rather than direct flame evidence, so
+        it is compatible with wildfire early warning but not the most complete
+        fire candidate detector.
+      input_semantic: >
+        It expects stabilized RGB aerial imagery with enough sky or background
+        contrast for smoke shape to remain visible across frames.
+      output_semantic: >
+        It produces smoke candidate boxes and confidence values that help early
+        warning logic, but it leaves flame confirmation to later stages.
+    domain:
+      primary_domains: [smoke, aerial, wildfire]
+      secondary_domains: [early_warning, hillside_monitoring]
+      unsuitable_domains: [indoor_flame, person_reid, defect_inspection]
+    capabilities: [smoke_detection, object_localization]
+    performance_profile:
+      typical_inference_time_ms: 33
+      typical_accuracy_f1: 0.84
+      false_positive_rate: 0.1
+      false_negative_rate: 0.11
+      throughput_fps: 19
+      robustness_notes: >
+        It is useful when smoke appears before open flame, but dust, fog, and
+        cloud edges can trigger extra false alarms.
+    resource_profile:
+      min_compute_cpu: 4.0
+      min_memory_mb: 2048
+      min_storage_mb: 512
+      recommended_accelerator: gpu
+      model_size_mb: 47
+
+  - implementation_id: indoor_flame_frcnn_v1
+    service_type: fire_candidate_detection
+    model_family: faster_rcnn
+    model_version: v1
+    semantic_variant_type: weak
+    compatible_node_types: [edge_server, cloud_server]
+    semantic_profile:
+      description: >
+        This detector was trained for indoor industrial flames and therefore
+        recognizes clear burner like fire shapes, but it is weak on aerial smoke
+        and diffuse wildfire fronts.
+      input_semantic: >
+        It expects close range RGB imagery of indoor spaces where flame sources
+        occupy a visible portion of the frame and backgrounds are structured.
+      output_semantic: >
+        It outputs flame boxes that can still fire on strong wildfire imagery,
+        yet the score quality is unreliable for open terrain scenes.
+    domain:
+      primary_domains: [indoor_fire, industrial_flame, rgb]
+      secondary_domains: [facility_safety]
+      unsuitable_domains: [wildfire_smoke, aerial_landscape, traffic]
+    capabilities: [flame_detection, object_localization]
+    performance_profile:
+      typical_inference_time_ms: 59
+      typical_accuracy_f1: 0.69
+      false_positive_rate: 0.15
+      false_negative_rate: 0.19
+      throughput_fps: 8
+      robustness_notes: >
+        It can detect obvious flame cores, but domain shift from indoor to
+        outdoor aerial scenes sharply lowers recall.
+    resource_profile:
+      min_compute_cpu: 6.0
+      min_memory_mb: 4096
+      min_storage_mb: 1024
+      recommended_accelerator: gpu
+      model_size_mb: 89
+
+  - implementation_id: coco_detector_v5
+    service_type: fire_candidate_detection
+    model_family: yolov5
+    model_version: v5
+    semantic_variant_type: mismatch
+    compatible_node_types: [uav, rsu, edge_server]
+    semantic_profile:
+      description: >
+        This is a generic object detector trained on common scene categories and
+        does not encode wildfire smoke or flame semantics, even though it may
+        confidently detect vehicles, people, or animals.
+      input_semantic: >
+        It expects ordinary RGB imagery and looks for standard object categories
+        rather than event evidence such as smoke plumes or heat signatures.
+      output_semantic: >
+        It returns generic object boxes whose labels do not help the wildfire
+        pipeline decide whether a fire candidate exists.
+    domain:
+      primary_domains: [generic_objects, rgb]
+      secondary_domains: [traffic, urban_monitoring]
+      unsuitable_domains: [wildfire, thermal_fire, defect_analysis]
+    capabilities: [generic_detection, object_localization]
+    performance_profile:
+      typical_inference_time_ms: 24
+      typical_accuracy_f1: 0.22
+      false_positive_rate: 0.4
+      false_negative_rate: 0.47
+      throughput_fps: 28
+      robustness_notes: >
+        It runs efficiently, but its label space is semantically detached from
+        the fire candidate objective and should score very poorly.
+    resource_profile:
+      min_compute_cpu: 3.0
+      min_memory_mb: 1536
+      min_storage_mb: 384
+      recommended_accelerator: gpu
+      model_size_mb: 31
+
+  - implementation_id: traffic_vehicle_bytetrack_v4
+    service_type: vehicle_detection_and_tracking
+    model_family: bytetrack
+    model_version: v4
+    semantic_variant_type: exact
+    compatible_node_types: [uav, vehicle, rsu, edge_server]
+    semantic_profile:
+      description: >
+        This traffic model detects road vehicles and maintains stable identities
+        through lane changes, partial occlusion, and intersection turns in low
+        altitude traffic surveillance footage.
+      input_semantic: >
+        It expects stabilized roadway video with frame rate high enough for
+        track association and with camera views covering multiple lanes.
+      output_semantic: >
+        It returns vehicle boxes, persistent track ids, and motion state updates
+        that downstream risk assessment can consume directly.
+    domain:
+      primary_domains: [traffic, roadway, vehicle]
+      secondary_domains: [intersection, fleet_monitoring]
+      unsuitable_domains: [pedestrian_reid, wildfire, indoor_assets]
+    capabilities: [vehicle_detection, multi_object_tracking, speed_estimation]
+    performance_profile:
+      typical_inference_time_ms: 34
+      typical_accuracy_f1: 0.92
+      false_positive_rate: 0.05
+      false_negative_rate: 0.06
+      throughput_fps: 23
+      robustness_notes: >
+        It is robust on dense roads, but very small distant vehicles still lower
+        recall on high altitude passes.
+    resource_profile:
+      min_compute_cpu: 4.0
+      min_memory_mb: 2048
+      min_storage_mb: 512
+      recommended_accelerator: gpu
+      model_size_mb: 49
+
+  - implementation_id: highway_vehicle_deepsort_v2
+    service_type: vehicle_detection_and_tracking
+    model_family: deepsort
+    model_version: v2
+    semantic_variant_type: equivalent
+    compatible_node_types: [rsu, edge_server, cloud_server]
+    semantic_profile:
+      description: >
+        This detector and tracker combination serves the same traffic purpose as
+        the exact model but emphasizes long horizon identity continuity on open
+        highways rather than compact intersections.
+      input_semantic: >
+        It expects roadway video with clear lane structure, moderate object size,
+        and enough temporal continuity for appearance based reidentification.
+      output_semantic: >
+        It emits vehicle detections and longer track histories that support
+        downstream incident analysis and road behavior review.
+    domain:
+      primary_domains: [traffic, highway, vehicle]
+      secondary_domains: [tolling, corridor_monitoring]
+      unsuitable_domains: [pedestrian, wildfire, warehouse_inspection]
+    capabilities: [vehicle_detection, multi_object_tracking, reidentification]
+    performance_profile:
+      typical_inference_time_ms: 41
+      typical_accuracy_f1: 0.89
+      false_positive_rate: 0.06
+      false_negative_rate: 0.08
+      throughput_fps: 18
+      robustness_notes: >
+        It keeps ids well on straight corridors, but tight urban turns and
+        heavy occlusion reduce association quality.
+    resource_profile:
+      min_compute_cpu: 5.0
+      min_memory_mb: 3072
+      min_storage_mb: 768
+      recommended_accelerator: gpu
+      model_size_mb: 58
+
+  - implementation_id: generic_vehicle_yolonas_v1
+    service_type: vehicle_detection_and_tracking
+    model_family: yolonas
+    model_version: v1
+    semantic_variant_type: compatible
+    compatible_node_types: [uav, rsu, edge_server]
+    semantic_profile:
+      description: >
+        This detector tracks common vehicle classes well enough for generic road
+        monitoring, but it carries less traffic specific association logic than
+        the preferred surveillance models.
+      input_semantic: >
+        It expects RGB road imagery with visible vehicles and only short gaps in
+        observation between frames.
+      output_semantic: >
+        It outputs vehicle detections and simple track continuity estimates that
+        are usable, though less stable during complex traffic interactions.
+    domain:
+      primary_domains: [generic_vehicle, traffic]
+      secondary_domains: [parking, fleet]
+      unsuitable_domains: [pedestrian_reid, wildfire, defect_detection]
+    capabilities: [vehicle_detection, short_track_linking]
+    performance_profile:
+      typical_inference_time_ms: 27
+      typical_accuracy_f1: 0.83
+      false_positive_rate: 0.09
+      false_negative_rate: 0.11
+      throughput_fps: 27
+      robustness_notes: >
+        It is efficient on edge nodes, but complex merges and heavy occlusion
+        produce fragmented trajectories.
+    resource_profile:
+      min_compute_cpu: 3.0
+      min_memory_mb: 1536
+      min_storage_mb: 384
+      recommended_accelerator: gpu
+      model_size_mb: 34
+
+  - implementation_id: parking_lot_counter_v1
+    service_type: vehicle_detection_and_tracking
+    model_family: density_counter
+    model_version: v1
+    semantic_variant_type: weak
+    compatible_node_types: [rsu, edge_server]
+    semantic_profile:
+      description: >
+        This model counts parked vehicles in mostly static lots and can detect
+        cars, but it is weak for roadway tracking because it does not preserve
+        rich motion semantics or lane level behavior.
+      input_semantic: >
+        It expects overhead or fixed angle parking scenes with slow motion and
+        repeated views of the same ground plane.
+      output_semantic: >
+        It returns occupancy oriented vehicle counts and approximate positions,
+        not stable multi frame trajectories for moving traffic.
+    domain:
+      primary_domains: [parking, occupancy, vehicle]
+      secondary_domains: [campus_monitoring]
+      unsuitable_domains: [fast_traffic, pedestrian, wildfire]
+    capabilities: [vehicle_counting, coarse_localization]
+    performance_profile:
+      typical_inference_time_ms: 16
+      typical_accuracy_f1: 0.71
+      false_positive_rate: 0.14
+      false_negative_rate: 0.17
+      throughput_fps: 31
+      robustness_notes: >
+        It is acceptable for occupancy snapshots, but it fails to model the
+        motion continuity required by trajectory aware traffic tasks.
+    resource_profile:
+      min_compute_cpu: 2.0
+      min_memory_mb: 1024
+      min_storage_mb: 256
+      recommended_accelerator: none
+      model_size_mb: 16
+
+  - implementation_id: animal_herd_tracker_v2
+    service_type: vehicle_detection_and_tracking
+    model_family: sort
+    model_version: v2
+    semantic_variant_type: mismatch
+    compatible_node_types: [uav, rsu]
+    semantic_profile:
+      description: >
+        This tracker is tuned for livestock movement patterns and therefore
+        assumes non rigid shapes and flock behavior that do not map to road
+        vehicle semantics.
+      input_semantic: >
+        It expects aerial RGB footage of open fields with animals that cluster,
+        split, and move without lane structure.
+      output_semantic: >
+        It emits herd tracklets and animal counts that provide little value for
+        traffic control or roadway incident reasoning.
+    domain:
+      primary_domains: [livestock, herd_tracking, aerial]
+      secondary_domains: [wildlife_monitoring]
+      unsuitable_domains: [traffic, license_compliance, urban_security]
+    capabilities: [animal_detection, group_tracking]
+    performance_profile:
+      typical_inference_time_ms: 21
+      typical_accuracy_f1: 0.26
+      false_positive_rate: 0.38
+      false_negative_rate: 0.44
+      throughput_fps: 24
+      robustness_notes: >
+        It is computationally valid, but its target ontology and motion prior
+        are fundamentally wrong for the traffic service type.
+    resource_profile:
+      min_compute_cpu: 2.5
+      min_memory_mb: 1024
+      min_storage_mb: 256
+      recommended_accelerator: none
+      model_size_mb: 19
+
+  - implementation_id: city_person_reid_fastreid_v3
+    service_type: person_detection_and_reid
+    model_family: fastreid
+    model_version: v3
+    semantic_variant_type: exact
+    compatible_node_types: [rsu, edge_server, cloud_server]
+    semantic_profile:
+      description: >
+        This urban security model detects pedestrians and links them across view
+        changes using appearance embeddings, making it suitable for watchlist
+        oriented patrol and city surveillance chains.
+      input_semantic: >
+        It expects stabilized urban RGB video where people remain visible long
+        enough to extract body appearance and short term movement cues.
+      output_semantic: >
+        It returns person boxes, track ids, and reidentification embeddings that
+        later identity verification can compare against known references.
+    domain:
+      primary_domains: [urban_security, pedestrian, reid]
+      secondary_domains: [crowd_monitoring, patrol]
+      unsuitable_domains: [vehicle_tracking, wildfire, defect_inspection]
+    capabilities: [person_detection, reidentification, multi_camera_linking]
+    performance_profile:
+      typical_inference_time_ms: 46
+      typical_accuracy_f1: 0.91
+      false_positive_rate: 0.06
+      false_negative_rate: 0.07
+      throughput_fps: 15
+      robustness_notes: >
+        It performs well in city scenes, but heavy overhead views from high
+        altitude reduce embedding quality.
+    resource_profile:
+      min_compute_cpu: 5.0
+      min_memory_mb: 3072
+      min_storage_mb: 768
+      recommended_accelerator: gpu
+      model_size_mb: 67
+
+  - implementation_id: crowd_person_detector_v2
+    service_type: person_detection_and_reid
+    model_family: crowdhuman_detr
+    model_version: v2
+    semantic_variant_type: equivalent
+    compatible_node_types: [edge_server, cloud_server]
+    semantic_profile:
+      description: >
+        This crowded scene detector targets dense pedestrian scenes and serves
+        the same urban security purpose, although its identity continuity is
+        weaker than the exact reidentification stack.
+      input_semantic: >
+        It expects RGB surveillance video with frequent crowd occlusion and
+        enough resolution to separate adjacent pedestrian bodies.
+      output_semantic: >
+        It emits person detections and short appearance descriptors that support
+        follow on identity work, especially in crowd management settings.
+    domain:
+      primary_domains: [crowd_security, pedestrian]
+      secondary_domains: [urban_events, transit_hubs]
+      unsuitable_domains: [traffic_vehicle, wildfire, thermal_only]
+    capabilities: [person_detection, crowd_localization, short_reid]
+    performance_profile:
+      typical_inference_time_ms: 52
+      typical_accuracy_f1: 0.88
+      false_positive_rate: 0.07
+      false_negative_rate: 0.08
+      throughput_fps: 13
+      robustness_notes: >
+        It handles dense scenes well, but track continuity drops once targets
+        leave and reenter the field of view.
+    resource_profile:
+      min_compute_cpu: 6.0
+      min_memory_mb: 4096
+      min_storage_mb: 1024
+      recommended_accelerator: gpu
+      model_size_mb: 79
+
+  - implementation_id: perimeter_intrusion_pose_v1
+    service_type: person_detection_and_reid
+    model_family: pose_intrusion_net
+    model_version: v1
+    semantic_variant_type: compatible
+    compatible_node_types: [rsu, edge_server]
+    semantic_profile:
+      description: >
+        This model was built for perimeter intrusion monitoring and therefore
+        focuses on human presence and motion direction more than full identity
+        continuity, yet it remains compatible with urban security tasks.
+      input_semantic: >
+        It expects RGB surveillance imagery of fences, roadsides, or public
+        boundaries where human posture and crossing direction are visible.
+      output_semantic: >
+        It returns person detections, coarse tracklets, and pose cues that help
+        security logic decide whether movement is suspicious.
+    domain:
+      primary_domains: [security_perimeter, pedestrian]
+      secondary_domains: [urban_security, intrusion]
+      unsuitable_domains: [face_closeup, wildfire, industrial_defects]
+    capabilities: [person_detection, intrusion_monitoring, pose_tracking]
+    performance_profile:
+      typical_inference_time_ms: 29
+      typical_accuracy_f1: 0.82
+      false_positive_rate: 0.1
+      false_negative_rate: 0.11
+      throughput_fps: 22
+      robustness_notes: >
+        It is efficient and useful for boundary crossing, but reidentification
+        is weaker across long gaps or multiple cameras.
+    resource_profile:
+      min_compute_cpu: 3.0
+      min_memory_mb: 1536
+      min_storage_mb: 384
+      recommended_accelerator: gpu
+      model_size_mb: 36
+
+  - implementation_id: retail_customer_tracker_v1
+    service_type: person_detection_and_reid
+    model_family: retail_tracking_net
+    model_version: v1
+    semantic_variant_type: weak
+    compatible_node_types: [edge_server, cloud_server]
+    semantic_profile:
+      description: >
+        This tracker follows shoppers through store aisles and can detect people,
+        but it assumes indoor camera height, close body crops, and slower motion
+        than typical outdoor security scenes.
+      input_semantic: >
+        It expects indoor RGB retail video with regular aisle geometry, stable
+        lighting, and a narrow range of person scale.
+      output_semantic: >
+        It emits shopper tracklets and dwell metrics that only partially match
+        the needs of city security patrol workflows.
+    domain:
+      primary_domains: [retail_analytics, pedestrian]
+      secondary_domains: [indoor_security]
+      unsuitable_domains: [urban_aerial, wildfire, vehicle_flow]
+    capabilities: [person_tracking, dwell_analysis]
+    performance_profile:
+      typical_inference_time_ms: 24
+      typical_accuracy_f1: 0.7
+      false_positive_rate: 0.13
+      false_negative_rate: 0.18
+      throughput_fps: 26
+      robustness_notes: >
+        It is reliable indoors, but outdoor scale changes and crowd diversity
+        quickly reduce identity quality.
+    resource_profile:
+      min_compute_cpu: 2.5
+      min_memory_mb: 1024
+      min_storage_mb: 256
+      recommended_accelerator: none
+      model_size_mb: 22
+
+  - implementation_id: hardhat_worker_classifier_v2
+    service_type: person_detection_and_reid
+    model_family: ppe_classifier
+    model_version: v2
+    semantic_variant_type: mismatch
+    compatible_node_types: [rsu, edge_server]
+    semantic_profile:
+      description: >
+        This worker safety model detects whether people wear hardhats and vests,
+        which is useful on industrial sites but does not provide reidentification
+        semantics for urban security chains.
+      input_semantic: >
+        It expects close or medium range RGB views of workers with visible upper
+        body clothing and controlled industrial backgrounds.
+      output_semantic: >
+        It returns safety gear labels around people instead of identity stable
+        embeddings, leaving downstream watchlist logic without usable evidence.
+    domain:
+      primary_domains: [industrial_safety, ppe]
+      secondary_domains: [facility_monitoring]
+      unsuitable_domains: [urban_security, face_matching, wildfire]
+    capabilities: [person_detection, ppe_classification]
+    performance_profile:
+      typical_inference_time_ms: 18
+      typical_accuracy_f1: 0.29
+      false_positive_rate: 0.35
+      false_negative_rate: 0.42
+      throughput_fps: 30
+      robustness_notes: >
+        It can see people, but the output ontology is wrong for the identity
+        continuity objective of this service type.
+    resource_profile:
+      min_compute_cpu: 2.0
+      min_memory_mb: 768
+      min_storage_mb: 256
+      recommended_accelerator: none
+      model_size_mb: 15
+
+  - implementation_id: blade_surface_defect_yolo_v3
+    service_type: industrial_defect_detection
+    model_family: surface_yolo
+    model_version: v3
+    semantic_variant_type: exact
+    compatible_node_types: [uav, rsu, edge_server]
+    semantic_profile:
+      description: >
+        This detector localizes cracks, chips, and erosion on industrial asset
+        surfaces from close range inspection imagery and is tuned for turbine
+        blades, panels, and structural coatings.
+      input_semantic: >
+        It expects high detail inspection RGB imagery with controlled overlap
+        and enough texture to resolve small material defects.
+      output_semantic: >
+        It returns localized defect candidates with confidence, area, and rough
+        morphology tags for downstream severity grading.
+    domain:
+      primary_domains: [industrial, inspection, surface_defect]
+      secondary_domains: [wind_turbine, infrastructure]
+      unsuitable_domains: [traffic, wildfire, pedestrian_identity]
+    capabilities: [defect_detection, crack_localization, surface_inspection]
+    performance_profile:
+      typical_inference_time_ms: 32
+      typical_accuracy_f1: 0.92
+      false_positive_rate: 0.05
+      false_negative_rate: 0.06
+      throughput_fps: 20
+      robustness_notes: >
+        It is strong on high resolution asset imagery, but severe glare and
+        reflective coatings still complicate tiny crack detection.
+    resource_profile:
+      min_compute_cpu: 4.0
+      min_memory_mb: 2048
+      min_storage_mb: 512
+      recommended_accelerator: gpu
+      model_size_mb: 46
+
+  - implementation_id: weld_crack_segformer_v2
+    service_type: industrial_defect_detection
+    model_family: segformer
+    model_version: v2
+    semantic_variant_type: equivalent
+    compatible_node_types: [rsu, edge_server, cloud_server]
+    semantic_profile:
+      description: >
+        This segmentation model targets weld seams and fine cracks, serving the
+        same detection purpose as the exact asset model but emphasizing contour
+        completeness over simple bounding boxes.
+      input_semantic: >
+        It expects close range inspection imagery or thermal enhanced imagery
+        with visible seam geometry and enough resolution for pixel level masks.
+      output_semantic: >
+        It emits defect masks and defect confidence maps that later stages can
+        use for category and severity classification.
+    domain:
+      primary_domains: [industrial, weld_inspection, crack_segmentation]
+      secondary_domains: [pipeline, steel_structure]
+      unsuitable_domains: [traffic_scene, wildfire_smoke, face_recognition]
+    capabilities: [defect_segmentation, crack_detection]
+    performance_profile:
+      typical_inference_time_ms: 48
+      typical_accuracy_f1: 0.9
+      false_positive_rate: 0.06
+      false_negative_rate: 0.07
+      throughput_fps: 12
+      robustness_notes: >
+        It captures fine defect boundaries well, but only on nodes with enough
+        memory for dense segmentation.
+    resource_profile:
+      min_compute_cpu: 5.0
+      min_memory_mb: 3072
+      min_storage_mb: 768
+      recommended_accelerator: gpu
+      model_size_mb: 64
+
+  - implementation_id: thermal_hotspot_inspector_v1
+    service_type: industrial_defect_detection
+    model_family: thermal_anomaly_net
+    model_version: v1
+    semantic_variant_type: compatible
+    compatible_node_types: [rsu, edge_server]
+    semantic_profile:
+      description: >
+        This model flags abnormal hot regions on inspected equipment and is
+        compatible with industrial defect detection when thermal failure is a
+        proxy for material or electrical problems.
+      input_semantic: >
+        It expects calibrated thermal imagery of machinery, panels, or rotating
+        components captured during inspection passes.
+      output_semantic: >
+        It returns thermal anomaly regions with temperature contrast estimates,
+        which are useful but narrower than full surface defect semantics.
+    domain:
+      primary_domains: [industrial, thermal_anomaly]
+      secondary_domains: [maintenance, power_equipment]
+      unsuitable_domains: [rgb_surface_only, traffic, urban_identity]
+    capabilities: [thermal_anomaly_detection, hotspot_localization]
+    performance_profile:
+      typical_inference_time_ms: 22
+      typical_accuracy_f1: 0.83
+      false_positive_rate: 0.09
+      false_negative_rate: 0.1
+      throughput_fps: 24
+      robustness_notes: >
+        It is useful for overheating assets, but cold surface defects remain
+        invisible to this implementation.
+    resource_profile:
+      min_compute_cpu: 3.0
+      min_memory_mb: 1536
+      min_storage_mb: 384
+      recommended_accelerator: gpu
+      model_size_mb: 29
+
+  - implementation_id: warehouse_package_damage_v2
+    service_type: industrial_defect_detection
+    model_family: damage_cnn
+    model_version: v2
+    semantic_variant_type: weak
+    compatible_node_types: [edge_server, cloud_server]
+    semantic_profile:
+      description: >
+        This model detects torn boxes and crushed packages in warehouses, which
+        overlaps with defect semantics but is weaker for detailed industrial
+        asset inspection.
+      input_semantic: >
+        It expects RGB imagery of packaged goods with visible edges, labels, and
+        mostly frontal views under warehouse lighting.
+      output_semantic: >
+        It returns package damage regions and damage scores that only loosely map
+        to structural or material defect analysis on industrial assets.
+    domain:
+      primary_domains: [warehouse, package_damage]
+      secondary_domains: [logistics_quality]
+      unsuitable_domains: [turbine_blades, weld_seams, wildfire]
+    capabilities: [damage_detection, package_inspection]
+    performance_profile:
+      typical_inference_time_ms: 19
+      typical_accuracy_f1: 0.71
+      false_positive_rate: 0.13
+      false_negative_rate: 0.17
+      throughput_fps: 29
+      robustness_notes: >
+        It is reasonable for packaging defects, but its learned shapes and
+        materials do not transfer well to engineered asset surfaces.
+    resource_profile:
+      min_compute_cpu: 2.5
+      min_memory_mb: 1024
+      min_storage_mb: 256
+      recommended_accelerator: none
+      model_size_mb: 21
+
+  - implementation_id: traffic_sign_detector_v4
+    service_type: industrial_defect_detection
+    model_family: sign_detector
+    model_version: v4
+    semantic_variant_type: mismatch
+    compatible_node_types: [uav, rsu]
+    semantic_profile:
+      description: >
+        This detector recognizes traffic signs and signal heads. It is a valid
+        vision model, but it contains no industrial defect semantics and would
+        mislead the inspection pipeline.
+      input_semantic: >
+        It expects road scene RGB imagery with sign like shapes and standardized
+        colors rather than detailed asset surfaces.
+      output_semantic: >
+        It emits road sign classes and boxes, which do not represent defect
+        candidates or actionable maintenance evidence.
+    domain:
+      primary_domains: [traffic_signs, roadway]
+      secondary_domains: [urban_navigation]
+      unsuitable_domains: [industrial_inspection, thermal_anomaly, wildfire]
+    capabilities: [sign_detection, scene_labeling]
+    performance_profile:
+      typical_inference_time_ms: 17
+      typical_accuracy_f1: 0.25
+      false_positive_rate: 0.36
+      false_negative_rate: 0.45
+      throughput_fps: 33
+      robustness_notes: >
+        It runs cheaply, but the produced labels are irrelevant to defect
+        discovery and should be treated as semantic failure.
+    resource_profile:
+      min_compute_cpu: 2.0
+      min_memory_mb: 768
+      min_storage_mb: 256
+      recommended_accelerator: none
+      model_size_mb: 14
+
+  - implementation_id: wildfire_smoke_fire_fuser_v2
+    service_type: smoke_fire_fusion
+    model_family: evidence_transformer
+    model_version: v2
+    semantic_variant_type: exact
+    compatible_node_types: [rsu, edge_server, cloud_server]
+    semantic_profile:
+      description: >
+        This fusion model combines smoke detections, flame candidates, and short
+        temporal persistence to decide whether separate weak cues support one
+        wildfire hypothesis.
+      input_semantic: >
+        It expects smoke and fire candidate records that include time, location,
+        confidence, and enough overlap to test mutual consistency.
+      output_semantic: >
+        It returns a fused wildfire evidence object with joint confidence and a
+        concise explanation of which cues agreed.
+    domain:
+      primary_domains: [wildfire, smoke_fire_fusion, aerial]
+      secondary_domains: [early_warning, emergency_monitoring]
+      unsuitable_domains: [traffic_incident, identity_matching, document_flow]
+    capabilities: [evidence_fusion, wildfire_reasoning, confidence_aggregation]
+    performance_profile:
+      typical_inference_time_ms: 21
+      typical_accuracy_f1: 0.92
+      false_positive_rate: 0.05
+      false_negative_rate: 0.06
+      throughput_fps: 30
+      robustness_notes: >
+        It is effective when inputs are synchronized, but missing timestamps
+        weaken the fusion confidence sharply.
+    resource_profile:
+      min_compute_cpu: 3.0
+      min_memory_mb: 1536
+      min_storage_mb: 384
+      recommended_accelerator: gpu
+      model_size_mb: 28
+
+  - implementation_id: fire_evidence_bayes_fusion_v1
+    service_type: smoke_fire_fusion
+    model_family: bayesian_fusion
+    model_version: v1
+    semantic_variant_type: equivalent
+    compatible_node_types: [rsu, edge_server]
+    semantic_profile:
+      description: >
+        This probabilistic fusion engine merges smoke and flame observations with
+        Bayesian update rules, serving the same wildfire evidence role through a
+        more interpretable but less expressive model family.
+      input_semantic: >
+        It expects candidate detections with calibrated confidence scores and a
+        simple estimate of spatial overlap or temporal proximity.
+      output_semantic: >
+        It emits posterior wildfire probabilities and evidence summaries that
+        downstream verification can interpret directly.
+    domain:
+      primary_domains: [wildfire, probabilistic_fusion]
+      secondary_domains: [safety_monitoring]
+      unsuitable_domains: [identity_biometrics, traffic_tracks, archive_only]
+    capabilities: [probabilistic_fusion, confidence_reasoning]
+    performance_profile:
+      typical_inference_time_ms: 13
+      typical_accuracy_f1: 0.88
+      false_positive_rate: 0.07
+      false_negative_rate: 0.08
+      throughput_fps: 45
+      robustness_notes: >
+        It is lightweight and interpretable, but complex smoke and flame timing
+        patterns are modeled less richly than the exact transformer.
+    resource_profile:
+      min_compute_cpu: 2.0
+      min_memory_mb: 768
+      min_storage_mb: 256
+      recommended_accelerator: none
+      model_size_mb: 12
+
+  - implementation_id: alert_consensus_rule_engine_v3
+    service_type: smoke_fire_fusion
+    model_family: rule_engine
+    model_version: v3
+    semantic_variant_type: compatible
+    compatible_node_types: [rsu, edge_server]
+    semantic_profile:
+      description: >
+        This rule engine merges smoke and flame alerts through thresholds and
+        temporal windows. It is compatible with wildfire evidence fusion, though
+        it lacks the nuanced weighting of learned models.
+      input_semantic: >
+        It expects structured candidate messages with source type, confidence,
+        timestamp, and basic location metadata.
+      output_semantic: >
+        It produces a fused alert state that indicates whether enough evidence
+        exists to continue into verification.
+    domain:
+      primary_domains: [wildfire, rule_based_fusion]
+      secondary_domains: [edge_alerting]
+      unsuitable_domains: [raw_video, biometrics, defect_taxonomy]
+    capabilities: [rule_fusion, temporal_windowing, alert_consensus]
+    performance_profile:
+      typical_inference_time_ms: 7
+      typical_accuracy_f1: 0.8
+      false_positive_rate: 0.11
+      false_negative_rate: 0.12
+      throughput_fps: 70
+      robustness_notes: >
+        It is easy to deploy and explain, but rigid thresholds are brittle under
+        changing weather or sensor quality.
+    resource_profile:
+      min_compute_cpu: 1.0
+      min_memory_mb: 384
+      min_storage_mb: 128
+      recommended_accelerator: none
+      model_size_mb: 5
+
+  - implementation_id: factory_alarm_correlator_v1
+    service_type: smoke_fire_fusion
+    model_family: alarm_correlator
+    model_version: v1
+    semantic_variant_type: weak
+    compatible_node_types: [edge_server, cloud_server]
+    semantic_profile:
+      description: >
+        This correlator merges smoke and flame alarms inside fixed industrial
+        plants. The fusion logic is related, but it assumes indoor sensors and
+        equipment layouts rather than wide outdoor wildfire scenes.
+      input_semantic: >
+        It expects alarm events from static detectors and fixed cameras with
+        consistent coverage of rooms or production lines.
+      output_semantic: >
+        It emits consolidated plant fire alerts that only partially transfer to
+        aerial wildfire monitoring due to domain mismatch.
+    domain:
+      primary_domains: [industrial_fire, alarm_correlation]
+      secondary_domains: [facility_safety]
+      unsuitable_domains: [wildfire_aerial, traffic, person_reid]
+    capabilities: [alarm_fusion, facility_fire_reasoning]
+    performance_profile:
+      typical_inference_time_ms: 9
+      typical_accuracy_f1: 0.68
+      false_positive_rate: 0.14
+      false_negative_rate: 0.18
+      throughput_fps: 55
+      robustness_notes: >
+        It works on static plant layouts, but wind drift and wide terrain make
+        its priors unreliable for aerial wildfire tasks.
+    resource_profile:
+      min_compute_cpu: 1.5
+      min_memory_mb: 512
+      min_storage_mb: 128
+      recommended_accelerator: none
+      model_size_mb: 7
+
+  - implementation_id: single_camera_motion_filter_v2
+    service_type: smoke_fire_fusion
+    model_family: motion_filter
+    model_version: v2
+    semantic_variant_type: mismatch
+    compatible_node_types: [uav, rsu]
+    semantic_profile:
+      description: >
+        This filter removes moving background clutter from one camera stream, but
+        it does not fuse smoke with fire evidence and therefore misses the core
+        semantics of this service type.
+      input_semantic: >
+        It expects raw video frames from a single camera and a background model
+        rather than already extracted smoke and flame candidates.
+      output_semantic: >
+        It emits motion masks without any joint wildfire evidence object, so the
+        downstream verification stage receives the wrong abstraction.
+    domain:
+      primary_domains: [motion_segmentation, single_camera]
+      secondary_domains: [generic_video_filtering]
+      unsuitable_domains: [smoke_fire_fusion, industrial_alarm_fusion, identity]
+    capabilities: [motion_filtering, background_subtraction]
+    performance_profile:
+      typical_inference_time_ms: 6
+      typical_accuracy_f1: 0.23
+      false_positive_rate: 0.41
+      false_negative_rate: 0.46
+      throughput_fps: 75
+      robustness_notes: >
+        It is fast but semantically off target, because no actual cross cue
+        fusion takes place.
+    resource_profile:
+      min_compute_cpu: 1.0
+      min_memory_mb: 256
+      min_storage_mb: 128
+      recommended_accelerator: none
+      model_size_mb: 4
+
+  - implementation_id: aerial_multisensor_event_fusion_v3
+    service_type: multi_sensor_event_fusion
+    model_family: multimodal_transformer
+    model_version: v3
+    semantic_variant_type: exact
+    compatible_node_types: [edge_server, cloud_server]
+    semantic_profile:
+      description: >
+        This fusion model merges detections from visual, thermal, and auxiliary
+        sensors into one coherent event hypothesis for low altitude missions that
+        need cross sensor confirmation.
+      input_semantic: >
+        It expects structured event candidates from multiple sensor streams with
+        aligned timestamps and rough spatial correspondence.
+      output_semantic: >
+        It returns a consolidated event record with cross sensor confidence,
+        source attribution, and disagreement indicators.
+    domain:
+      primary_domains: [multisensor, event_fusion, aerial]
+      secondary_domains: [wildfire, industrial_inspection]
+      unsuitable_domains: [single_sensor_only, text_only, archive_routing]
+    capabilities: [multisensor_fusion, event_reasoning, source_attribution]
+    performance_profile:
+      typical_inference_time_ms: 39
+      typical_accuracy_f1: 0.93
+      false_positive_rate: 0.04
+      false_negative_rate: 0.05
+      throughput_fps: 14
+      robustness_notes: >
+        It is accurate with clean metadata, but partial sensor dropout lowers
+        confidence calibration.
+    resource_profile:
+      min_compute_cpu: 5.0
+      min_memory_mb: 3072
+      min_storage_mb: 768
+      recommended_accelerator: gpu
+      model_size_mb: 72
+
+  - implementation_id: edge_kalman_sensor_fusion_v2
+    service_type: multi_sensor_event_fusion
+    model_family: kalman_graph_fusion
+    model_version: v2
+    semantic_variant_type: equivalent
+    compatible_node_types: [rsu, edge_server]
+    semantic_profile:
+      description: >
+        This edge oriented fusion stack tracks multi sensor observations through
+        state estimation, offering an equivalent event fusion role with stronger
+        temporal smoothness and lower compute than deep transformers.
+      input_semantic: >
+        It expects sensor observations that can be represented as state updates
+        with timestamps, covariance, and approximate spatial relations.
+      output_semantic: >
+        It emits fused event states with uncertainty measures that downstream
+        verification or reporting can interpret.
+    domain:
+      primary_domains: [multisensor, state_estimation]
+      secondary_domains: [traffic, wildfire]
+      unsuitable_domains: [raw_image_rank_only, document_summarization]
+    capabilities: [sensor_fusion, state_estimation, uncertainty_tracking]
+    performance_profile:
+      typical_inference_time_ms: 18
+      typical_accuracy_f1: 0.88
+      false_positive_rate: 0.06
+      false_negative_rate: 0.08
+      throughput_fps: 34
+      robustness_notes: >
+        It is efficient and stable, but it does not capture rich nonlinear
+        cross modality interactions as well as the exact model.
+    resource_profile:
+      min_compute_cpu: 2.5
+      min_memory_mb: 1024
+      min_storage_mb: 256
+      recommended_accelerator: none
+      model_size_mb: 18
+
+  - implementation_id: geo_temporal_incident_merger_v1
+    service_type: multi_sensor_event_fusion
+    model_family: geo_temporal_merger
+    model_version: v1
+    semantic_variant_type: compatible
+    compatible_node_types: [rsu, edge_server, cloud_server]
+    semantic_profile:
+      description: >
+        This merger joins incident reports across sensors by time and location.
+        It is compatible with event fusion, although it works on coarser records
+        than the preferred learned multisensor stacks.
+      input_semantic: >
+        It expects candidate events that already contain timestamps, coordinates,
+        and simple type labels from upstream services.
+      output_semantic: >
+        It produces merged incident clusters with support counts and consensus
+        scores that can feed verification or storage.
+    domain:
+      primary_domains: [incident_merging, geotemporal_fusion]
+      secondary_domains: [traffic, security, wildfire]
+      unsuitable_domains: [raw_video, face_embedding, defect_masks]
+    capabilities: [event_merging, geospatial_clustering, temporal_linking]
+    performance_profile:
+      typical_inference_time_ms: 11
+      typical_accuracy_f1: 0.82
+      false_positive_rate: 0.09
+      false_negative_rate: 0.1
+      throughput_fps: 50
+      robustness_notes: >
+        It is reliable for structured upstream messages, but coarse clustering
+        can merge nearby but unrelated events.
+    resource_profile:
+      min_compute_cpu: 2.0
+      min_memory_mb: 768
+      min_storage_mb: 256
+      recommended_accelerator: none
+      model_size_mb: 10
+
+  - implementation_id: smart_building_sensor_correlator_v2
+    service_type: multi_sensor_event_fusion
+    model_family: building_sensor_fusion
+    model_version: v2
+    semantic_variant_type: weak
+    compatible_node_types: [edge_server, cloud_server]
+    semantic_profile:
+      description: >
+        This correlator fuses badge, camera, and room sensors inside smart
+        buildings. The fusion principle is related, but its priors are tied to
+        indoor floor plans and static sensor geometry.
+      input_semantic: >
+        It expects indoor event messages with room identifiers, door states, and
+        fixed camera detections from stable infrastructure.
+      output_semantic: >
+        It emits consolidated indoor incidents that only weakly transfer to
+        outdoor aerial missions or moving inspection workflows.
+    domain:
+      primary_domains: [smart_building, indoor_fusion]
+      secondary_domains: [facility_security]
+      unsuitable_domains: [aerial_multisensor, wildfire, moving_assets]
+    capabilities: [sensor_correlation, indoor_event_fusion]
+    performance_profile:
+      typical_inference_time_ms: 10
+      typical_accuracy_f1: 0.69
+      false_positive_rate: 0.14
+      false_negative_rate: 0.17
+      throughput_fps: 58
+      robustness_notes: >
+        It runs well on structured indoor infrastructure, but the domain shift
+        to mobile outdoor sensing is substantial.
+    resource_profile:
+      min_compute_cpu: 1.5
+      min_memory_mb: 512
+      min_storage_mb: 128
+      recommended_accelerator: none
+      model_size_mb: 8
+
+  - implementation_id: isolated_image_ranker_v1
+    service_type: multi_sensor_event_fusion
+    model_family: image_ranker
+    model_version: v1
+    semantic_variant_type: mismatch
+    compatible_node_types: [edge_server]
+    semantic_profile:
+      description: >
+        This model ranks single images by visual salience, but it has no notion
+        of combining evidence across sensors or time and therefore is a semantic
+        mismatch for event fusion.
+      input_semantic: >
+        It expects one image at a time with no linked metadata, timestamps, or
+        source identity for multimodal reasoning.
+      output_semantic: >
+        It emits an image importance score rather than a fused event artifact,
+        leaving downstream components with the wrong data type.
+    domain:
+      primary_domains: [image_ranking, salience]
+      secondary_domains: [media_curation]
+      unsuitable_domains: [multisensor_event_fusion, trajectory_risk, identity]
+    capabilities: [image_scoring, salience_ranking]
+    performance_profile:
+      typical_inference_time_ms: 8
+      typical_accuracy_f1: 0.21
+      false_positive_rate: 0.42
+      false_negative_rate: 0.48
+      throughput_fps: 62
+      robustness_notes: >
+        It is operational software, but it never produces the cross sensor event
+        abstraction required by this service type.
+    resource_profile:
+      min_compute_cpu: 1.0
+      min_memory_mb: 384
+      min_storage_mb: 128
+      recommended_accelerator: none
+      model_size_mb: 6
+
+  - implementation_id: urban_intrusion_risk_lstm_v2
+    service_type: trajectory_risk_assessment
+    model_family: risk_lstm
+    model_version: v2
+    semantic_variant_type: exact
+    compatible_node_types: [rsu, edge_server, cloud_server]
+    semantic_profile:
+      description: >
+        This model scores tracked motion for intrusion, abrupt maneuver, and
+        unsafe path patterns in urban security and roadway scenes using recent
+        trajectory history and local context.
+      input_semantic: >
+        It expects track sequences with position, velocity, heading, and simple
+        neighborhood context over several seconds.
+      output_semantic: >
+        It returns risk scores, anomaly tags, and a short explanation of which
+        trajectory features drove the warning.
+    domain:
+      primary_domains: [trajectory_risk, urban_security, traffic]
+      secondary_domains: [intrusion, collision_warning]
+      unsuitable_domains: [static_image_only, report_generation, defect_masks]
+    capabilities: [trajectory_scoring, anomaly_detection, risk_reasoning]
+    performance_profile:
+      typical_inference_time_ms: 17
+      typical_accuracy_f1: 0.91
+      false_positive_rate: 0.05
+      false_negative_rate: 0.06
+      throughput_fps: 40
+      robustness_notes: >
+        It is strong on short horizon risk cues, but highly erratic upstream
+        tracks can still destabilize its scores.
+    resource_profile:
+      min_compute_cpu: 2.5
+      min_memory_mb: 1024
+      min_storage_mb: 256
+      recommended_accelerator: none
+      model_size_mb: 17
+
+  - implementation_id: traffic_conflict_graphnet_v1
+    service_type: trajectory_risk_assessment
+    model_family: graphnet
+    model_version: v1
+    semantic_variant_type: equivalent
+    compatible_node_types: [edge_server, cloud_server]
+    semantic_profile:
+      description: >
+        This graph model evaluates interactions among multiple tracked agents to
+        estimate conflict risk, serving the same trajectory assessment purpose
+        through relational reasoning.
+      input_semantic: >
+        It expects track sets with relative positions and recent motion vectors
+        so pairwise and group interactions can be modeled.
+      output_semantic: >
+        It emits per track and per interaction risk values that highlight which
+        nearby agents contribute to unsafe behavior.
+    domain:
+      primary_domains: [traffic_conflict, trajectory_graph]
+      secondary_domains: [urban_security, intersection]
+      unsuitable_domains: [single_agent_static, report_text, defect_imaging]
+    capabilities: [interaction_modeling, collision_risk, graph_reasoning]
+    performance_profile:
+      typical_inference_time_ms: 29
+      typical_accuracy_f1: 0.89
+      false_positive_rate: 0.06
+      false_negative_rate: 0.07
+      throughput_fps: 24
+      robustness_notes: >
+        It gives rich relational signals, but graph construction cost limits the
+        frame rate on modest nodes.
+    resource_profile:
+      min_compute_cpu: 4.0
+      min_memory_mb: 2048
+      min_storage_mb: 512
+      recommended_accelerator: gpu
+      model_size_mb: 38
+
+  - implementation_id: route_anomaly_scoring_v3
+    service_type: trajectory_risk_assessment
+    model_family: anomaly_ranker
+    model_version: v3
+    semantic_variant_type: compatible
+    compatible_node_types: [vehicle, rsu, edge_server]
+    semantic_profile:
+      description: >
+        This scorer compares current tracks against expected route corridors and
+        flags deviations. It is compatible with risk assessment, though it is
+        narrower than full interaction aware models.
+      input_semantic: >
+        It expects tracked paths with map matched route context or designated
+        movement corridors for comparison.
+      output_semantic: >
+        It returns anomaly scores and route deviation labels that can trigger
+        further inspection or alerting.
+    domain:
+      primary_domains: [route_anomaly, trajectory_risk]
+      secondary_domains: [fleet_compliance, patrol]
+      unsuitable_domains: [dense_crowd_identity, wildfire, defect_analysis]
+    capabilities: [route_deviation_detection, anomaly_scoring]
+    performance_profile:
+      typical_inference_time_ms: 12
+      typical_accuracy_f1: 0.83
+      false_positive_rate: 0.09
+      false_negative_rate: 0.1
+      throughput_fps: 55
+      robustness_notes: >
+        It is efficient when route priors are known, but it underestimates risk
+        from complex near miss interactions.
+    resource_profile:
+      min_compute_cpu: 1.5
+      min_memory_mb: 768
+      min_storage_mb: 256
+      recommended_accelerator: none
+      model_size_mb: 9
+
+  - implementation_id: warehouse_robot_proximity_v1
+    service_type: trajectory_risk_assessment
+    model_family: proximity_rules
+    model_version: v1
+    semantic_variant_type: weak
+    compatible_node_types: [edge_server]
+    semantic_profile:
+      description: >
+        This rule set scores collision risk among indoor warehouse robots. The
+        motion logic is related, but the scene topology and speed profile are
+        much simpler than urban traffic or public security tasks.
+      input_semantic: >
+        It expects tracked robot positions on constrained aisle networks with
+        known right of way policies and low top speed.
+      output_semantic: >
+        It emits proximity based risk flags that only weakly transfer to more
+        open and diverse outdoor trajectories.
+    domain:
+      primary_domains: [warehouse_robotics, proximity_risk]
+      secondary_domains: [indoor_logistics]
+      unsuitable_domains: [urban_vehicle, pedestrian_intrusion, wildfire]
+    capabilities: [proximity_risk, rule_scoring]
+    performance_profile:
+      typical_inference_time_ms: 5
+      typical_accuracy_f1: 0.67
+      false_positive_rate: 0.15
+      false_negative_rate: 0.18
+      throughput_fps: 85
+      robustness_notes: >
+        It is fast and interpretable, but the simplified motion prior limits
+        transfer to outdoor multi agent scenes.
+    resource_profile:
+      min_compute_cpu: 1.0
+      min_memory_mb: 256
+      min_storage_mb: 128
+      recommended_accelerator: none
+      model_size_mb: 4
+
+  - implementation_id: static_image_severity_classifier_v2
+    service_type: trajectory_risk_assessment
+    model_family: severity_cnn
+    model_version: v2
+    semantic_variant_type: mismatch
+    compatible_node_types: [edge_server]
+    semantic_profile:
+      description: >
+        This classifier estimates scene severity from a single image, but it has
+        no trajectory history and therefore cannot assess motion risk.
+      input_semantic: >
+        It expects one still frame with a coarse event label rather than tracked
+        positions, velocities, and temporal interaction data.
+      output_semantic: >
+        It returns a static scene severity score that is not equivalent to
+        trajectory based risk reasoning.
+    domain:
+      primary_domains: [image_severity, scene_classification]
+      secondary_domains: [incident_screening]
+      unsuitable_domains: [trajectory_risk, track_based_security, route_planning]
+    capabilities: [scene_classification, severity_scoring]
+    performance_profile:
+      typical_inference_time_ms: 9
+      typical_accuracy_f1: 0.2
+      false_positive_rate: 0.41
+      false_negative_rate: 0.49
+      throughput_fps: 70
+      robustness_notes: >
+        It can rank images, but it lacks the temporal state required for this
+        service type and should be treated as semantic mismatch.
+    resource_profile:
+      min_compute_cpu: 1.0
+      min_memory_mb: 384
+      min_storage_mb: 128
+      recommended_accelerator: none
+      model_size_mb: 7
+
+  - implementation_id: wildfire_event_verifier_v2
+    service_type: fire_event_verification
+    model_family: event_transformer
+    model_version: v2
+    semantic_variant_type: exact
+    compatible_node_types: [rsu, edge_server, cloud_server]
+    semantic_profile:
+      description: >
+        This verifier inspects temporal fire evidence, smoke consistency, and
+        location context to decide whether a candidate should be escalated as a
+        true wildfire event.
+      input_semantic: >
+        It expects fused fire candidate records with timestamps, confidence,
+        location hints, and short temporal history rather than raw frames alone.
+      output_semantic: >
+        It returns a verified or rejected wildfire event decision with reasons
+        that later alerting systems can trust.
+    domain:
+      primary_domains: [wildfire, event_verification, aerial]
+      secondary_domains: [emergency_response, early_warning]
+      unsuitable_domains: [identity_matching, traffic_flow, package_damage]
+    capabilities: [event_verification, temporal_consistency_check, wildfire_reasoning]
+    performance_profile:
+      typical_inference_time_ms: 24
+      typical_accuracy_f1: 0.94
+      false_positive_rate: 0.04
+      false_negative_rate: 0.05
+      throughput_fps: 26
+      robustness_notes: >
+        It is accurate when upstream fusion is available, but sparse temporal
+        context makes borderline cases harder to reject correctly.
+    resource_profile:
+      min_compute_cpu: 3.0
+      min_memory_mb: 1536
+      min_storage_mb: 384
+      recommended_accelerator: gpu
+      model_size_mb: 32
+
+  - implementation_id: fire_sequence_transformer_v1
+    service_type: fire_event_verification
+    model_family: sequence_transformer
+    model_version: v1
+    semantic_variant_type: equivalent
+    compatible_node_types: [edge_server, cloud_server]
+    semantic_profile:
+      description: >
+        This sequence model verifies fire events from a short candidate history,
+        serving the same role as the exact verifier with a stronger emphasis on
+        temporal ordering across multiple observations.
+      input_semantic: >
+        It expects ordered event candidate sequences with per step confidence,
+        smoke context, and optional thermal support.
+      output_semantic: >
+        It emits verification labels and event level confidence calibrated over
+        the full observation sequence.
+    domain:
+      primary_domains: [wildfire, sequence_verification]
+      secondary_domains: [incident_screening]
+      unsuitable_domains: [single_static_image, biometric_identity, logistics]
+    capabilities: [sequence_reasoning, event_verification]
+    performance_profile:
+      typical_inference_time_ms: 34
+      typical_accuracy_f1: 0.91
+      false_positive_rate: 0.05
+      false_negative_rate: 0.07
+      throughput_fps: 18
+      robustness_notes: >
+        It captures temporal progression well, but compute demand is higher than
+        the compact exact verifier.
+    resource_profile:
+      min_compute_cpu: 4.0
+      min_memory_mb: 2048
+      min_storage_mb: 512
+      recommended_accelerator: gpu
+      model_size_mb: 44
+
+  - implementation_id: smoke_persistence_checker_v3
+    service_type: fire_event_verification
+    model_family: temporal_rules
+    model_version: v3
+    semantic_variant_type: compatible
+    compatible_node_types: [rsu, edge_server]
+    semantic_profile:
+      description: >
+        This rule based verifier confirms fire candidates only when smoke or hot
+        regions persist across a minimum time window, making it compatible but
+        narrower than a full context aware verifier.
+      input_semantic: >
+        It expects time stamped candidate records with repeated confidence values
+        from a single area over several observation steps.
+      output_semantic: >
+        It returns a pass or reject decision together with persistence evidence
+        that supports downstream alert filtering.
+    domain:
+      primary_domains: [wildfire, persistence_check]
+      secondary_domains: [edge_filtering]
+      unsuitable_domains: [identity, route_risk, report_generation]
+    capabilities: [temporal_filtering, event_confirmation]
+    performance_profile:
+      typical_inference_time_ms: 8
+      typical_accuracy_f1: 0.82
+      false_positive_rate: 0.09
+      false_negative_rate: 0.1
+      throughput_fps: 68
+      robustness_notes: >
+        It is fast and conservative, but it can miss short lived yet important
+        fire events.
+    resource_profile:
+      min_compute_cpu: 1.0
+      min_memory_mb: 384
+      min_storage_mb: 128
+      recommended_accelerator: none
+      model_size_mb: 6
+
+  - implementation_id: industrial_flame_auditor_v1
+    service_type: fire_event_verification
+    model_family: audit_classifier
+    model_version: v1
+    semantic_variant_type: weak
+    compatible_node_types: [edge_server, cloud_server]
+    semantic_profile:
+      description: >
+        This verifier checks whether a plant fire alarm is credible inside fixed
+        industrial facilities. The verification concept overlaps, but its priors
+        are weak for open terrain wildfire scenes.
+      input_semantic: >
+        It expects event candidates from static indoor cameras and plant sensors
+        with room identifiers and equipment context.
+      output_semantic: >
+        It emits facility oriented alarm validity scores that only weakly match
+        outdoor wildfire verification needs.
+    domain:
+      primary_domains: [industrial_fire, alarm_audit]
+      secondary_domains: [facility_safety]
+      unsuitable_domains: [wildfire_terrain, traffic, person_identity]
+    capabilities: [alarm_audit, fire_event_review]
+    performance_profile:
+      typical_inference_time_ms: 12
+      typical_accuracy_f1: 0.69
+      false_positive_rate: 0.14
+      false_negative_rate: 0.17
+      throughput_fps: 52
+      robustness_notes: >
+        It works on structured plant alerts, but environmental context mismatch
+        lowers trust on aerial wildfire events.
+    resource_profile:
+      min_compute_cpu: 1.5
+      min_memory_mb: 512
+      min_storage_mb: 128
+      recommended_accelerator: none
+      model_size_mb: 8
+
+  - implementation_id: weather_alert_classifier_v2
+    service_type: fire_event_verification
+    model_family: weather_classifier
+    model_version: v2
+    semantic_variant_type: mismatch
+    compatible_node_types: [edge_server]
+    semantic_profile:
+      description: >
+        This classifier predicts weather alert classes from meteorological data,
+        which is unrelated to verifying whether a fire candidate is real.
+      input_semantic: >
+        It expects structured weather features such as wind, humidity, and storm
+        indicators rather than fire candidate records or fused evidence.
+      output_semantic: >
+        It emits weather category labels, not verification decisions about a
+        specific wildfire event hypothesis.
+    domain:
+      primary_domains: [weather_alerting, meteorology]
+      secondary_domains: [forecast_support]
+      unsuitable_domains: [fire_verification, person_identity, defect_review]
+    capabilities: [weather_classification, forecast_screening]
+    performance_profile:
+      typical_inference_time_ms: 7
+      typical_accuracy_f1: 0.18
+      false_positive_rate: 0.43
+      false_negative_rate: 0.5
+      throughput_fps: 80
+      robustness_notes: >
+        It may still inform mission context, but it cannot verify the event type
+        defined by this service.
+    resource_profile:
+      min_compute_cpu: 1.0
+      min_memory_mb: 256
+      min_storage_mb: 128
+      recommended_accelerator: none
+      model_size_mb: 5
+
+  - implementation_id: city_face_gait_verifier_v3
+    service_type: identity_verification
+    model_family: face_gait_transformer
+    model_version: v3
+    semantic_variant_type: exact
+    compatible_node_types: [edge_server, cloud_server]
+    semantic_profile:
+      description: >
+        This verifier combines face and gait evidence to confirm whether a track
+        belongs to a known person in urban security operations, balancing close
+        biometric cues with longer range movement signatures.
+      input_semantic: >
+        It expects person crops, track history, and reference identity records
+        with enough image quality for biometric comparison.
+      output_semantic: >
+        It returns identity match decisions, confidence scores, and evidence
+        notes that explain whether face, gait, or both drove the result.
+    domain:
+      primary_domains: [urban_security, identity, biometrics]
+      secondary_domains: [watchlist, patrol]
+      unsuitable_domains: [vehicle_license, wildfire, industrial_defect]
+    capabilities: [identity_verification, face_matching, gait_matching]
+    performance_profile:
+      typical_inference_time_ms: 43
+      typical_accuracy_f1: 0.92
+      false_positive_rate: 0.05
+      false_negative_rate: 0.06
+      throughput_fps: 14
+      robustness_notes: >
+        It performs best on medium range scenes, while severe face blur or top
+        down views shift reliance toward weaker gait evidence.
+    resource_profile:
+      min_compute_cpu: 5.0
+      min_memory_mb: 3072
+      min_storage_mb: 768
+      recommended_accelerator: gpu
+      model_size_mb: 74
+
+  - implementation_id: access_control_face_matcher_v2
+    service_type: identity_verification
+    model_family: facenet
+    model_version: v2
+    semantic_variant_type: equivalent
+    compatible_node_types: [edge_server, cloud_server]
+    semantic_profile:
+      description: >
+        This face matcher verifies people against enrollment photos and serves
+        the same identity confirmation goal, though it depends more strongly on
+        frontal facial evidence than the exact multimodal verifier.
+      input_semantic: >
+        It expects face crops with controlled alignment and a gallery of known
+        identity references suitable for embedding comparison.
+      output_semantic: >
+        It emits match probabilities and nearest identity candidates that later
+        policy layers can interpret.
+    domain:
+      primary_domains: [face_identity, access_control]
+      secondary_domains: [urban_security, checkpoint]
+      unsuitable_domains: [full_body_only, vehicle_tracks, wildfire]
+    capabilities: [face_verification, identity_matching]
+    performance_profile:
+      typical_inference_time_ms: 22
+      typical_accuracy_f1: 0.88
+      false_positive_rate: 0.07
+      false_negative_rate: 0.08
+      throughput_fps: 28
+      robustness_notes: >
+        It is efficient when frontal faces are visible, but occlusion or long
+        distance shots reduce confidence quickly.
+    resource_profile:
+      min_compute_cpu: 3.0
+      min_memory_mb: 1536
+      min_storage_mb: 384
+      recommended_accelerator: gpu
+      model_size_mb: 33
+
+  - implementation_id: person_track_identity_linker_v1
+    service_type: identity_verification
+    model_family: track_linker
+    model_version: v1
+    semantic_variant_type: compatible
+    compatible_node_types: [rsu, edge_server]
+    semantic_profile:
+      description: >
+        This linker infers identity consistency from track continuity and soft
+        appearance cues. It is compatible with identity verification, but it is
+        weaker than direct biometric matching.
+      input_semantic: >
+        It expects stable person tracklets with coarse appearance descriptors and
+        historical visit patterns from the monitored area.
+      output_semantic: >
+        It returns probable identity links or unknown labels that help preserve
+        continuity even when face evidence is limited.
+    domain:
+      primary_domains: [identity_linking, urban_security]
+      secondary_domains: [reid, patrol_history]
+      unsuitable_domains: [biometric_enrollment_only, wildfire, defect_labels]
+    capabilities: [identity_linking, track_consistency]
+    performance_profile:
+      typical_inference_time_ms: 12
+      typical_accuracy_f1: 0.8
+      false_positive_rate: 0.1
+      false_negative_rate: 0.11
+      throughput_fps: 48
+      robustness_notes: >
+        It maintains continuity with limited signals, but similar clothing among
+        different people can cause mistaken links.
+    resource_profile:
+      min_compute_cpu: 1.5
+      min_memory_mb: 768
+      min_storage_mb: 256
+      recommended_accelerator: none
+      model_size_mb: 11
+
+  - implementation_id: badge_reader_proxy_v1
+    service_type: identity_verification
+    model_family: barcode_proxy
+    model_version: v1
+    semantic_variant_type: weak
+    compatible_node_types: [edge_server]
+    semantic_profile:
+      description: >
+        This verifier proxies identity through badge and access token readings.
+        The identity concept overlaps, but it is weak for open area surveillance
+        where credentials are not visually available.
+      input_semantic: >
+        It expects structured badge scans or close images of physical tokens
+        rather than unconstrained person imagery.
+      output_semantic: >
+        It emits token based identity decisions that only weakly map to person
+        identity verification in free movement scenes.
+    domain:
+      primary_domains: [access_badges, facility_identity]
+      secondary_domains: [indoor_security]
+      unsuitable_domains: [urban_patrol, aerial_surveillance, wildfire]
+    capabilities: [credential_check, identity_proxy]
+    performance_profile:
+      typical_inference_time_ms: 6
+      typical_accuracy_f1: 0.66
+      false_positive_rate: 0.16
+      false_negative_rate: 0.19
+      throughput_fps: 82
+      robustness_notes: >
+        It works well when badges are present, but those assumptions rarely hold
+        in the target urban security workflows.
+    resource_profile:
+      min_compute_cpu: 1.0
+      min_memory_mb: 256
+      min_storage_mb: 128
+      recommended_accelerator: none
+      model_size_mb: 4
+
+  - implementation_id: vehicle_plate_classifier_v2
+    service_type: identity_verification
+    model_family: plate_classifier
+    model_version: v2
+    semantic_variant_type: mismatch
+    compatible_node_types: [rsu, edge_server]
+    semantic_profile:
+      description: >
+        This model verifies vehicle plates and registration patterns. It handles
+        identity in a broad sense, but the target entity is a vehicle, not a
+        person under urban security review.
+      input_semantic: >
+        It expects vehicle crops with readable license plate regions and related
+        registration metadata.
+      output_semantic: >
+        It emits vehicle identity matches that do not answer whether a tracked
+        person matches a human identity reference.
+    domain:
+      primary_domains: [vehicle_identity, plate_recognition]
+      secondary_domains: [traffic_enforcement]
+      unsuitable_domains: [human_identity, wildfire, defect_reports]
+    capabilities: [plate_verification, vehicle_matching]
+    performance_profile:
+      typical_inference_time_ms: 14
+      typical_accuracy_f1: 0.24
+      false_positive_rate: 0.39
+      false_negative_rate: 0.46
+      throughput_fps: 38
+      robustness_notes: >
+        It is a valid identity service for vehicles, but it is semantically
+        wrong for person focused verification chains.
+    resource_profile:
+      min_compute_cpu: 2.0
+      min_memory_mb: 768
+      min_storage_mb: 256
+      recommended_accelerator: none
+      model_size_mb: 13
+
+  - implementation_id: turbine_defect_grader_v2
+    service_type: defect_classification
+    model_family: defect_grader_net
+    model_version: v2
+    semantic_variant_type: exact
+    compatible_node_types: [rsu, edge_server, cloud_server]
+    semantic_profile:
+      description: >
+        This classifier grades industrial defect candidates into a maintenance
+        taxonomy and severity scale, making it suitable for inspection workflows
+        that require actionable repair prioritization.
+      input_semantic: >
+        It expects localized defect crops or masks with supporting context about
+        the asset surface and acquisition angle.
+      output_semantic: >
+        It returns structured defect categories, severity levels, and confidence
+        so report generation can summarize the findings.
+    domain:
+      primary_domains: [industrial, defect_taxonomy, maintenance]
+      secondary_domains: [turbine, infrastructure]
+      unsuitable_domains: [traffic_scene, person_identity, wildfire_alert]
+    capabilities: [defect_classification, severity_grading, maintenance_tagging]
+    performance_profile:
+      typical_inference_time_ms: 18
+      typical_accuracy_f1: 0.93
+      false_positive_rate: 0.05
+      false_negative_rate: 0.05
+      throughput_fps: 35
+      robustness_notes: >
+        It is strong when candidate crops are clean, but uncertainty rises if
+        upstream detection misses defect boundaries.
+    resource_profile:
+      min_compute_cpu: 2.5
+      min_memory_mb: 1024
+      min_storage_mb: 256
+      recommended_accelerator: gpu
+      model_size_mb: 24
+
+  - implementation_id: pcb_fault_taxonomy_net_v1
+    service_type: defect_classification
+    model_family: taxonomy_cnn
+    model_version: v1
+    semantic_variant_type: equivalent
+    compatible_node_types: [edge_server, cloud_server]
+    semantic_profile:
+      description: >
+        This model classifies printed circuit faults into a fine taxonomy and
+        serves the same inspection classification role with emphasis on micro
+        texture and electronics specific categories.
+      input_semantic: >
+        It expects defect crops with clear board traces, solder joints, or other
+        small electronics structures.
+      output_semantic: >
+        It emits defect labels and severity hints that can still be adapted into
+        a structured maintenance record.
+    domain:
+      primary_domains: [electronics_inspection, defect_taxonomy]
+      secondary_domains: [industrial_quality]
+      unsuitable_domains: [large_mechanical_assets, urban_security, wildfire]
+    capabilities: [fault_classification, severity_estimation]
+    performance_profile:
+      typical_inference_time_ms: 23
+      typical_accuracy_f1: 0.89
+      false_positive_rate: 0.06
+      false_negative_rate: 0.07
+      throughput_fps: 27
+      robustness_notes: >
+        It is reliable for small electronics patterns, but transfer to large
+        structural defects is less direct.
+    resource_profile:
+      min_compute_cpu: 3.0
+      min_memory_mb: 1536
+      min_storage_mb: 384
+      recommended_accelerator: gpu
+      model_size_mb: 31
+
+  - implementation_id: corrosion_severity_ranker_v3
+    service_type: defect_classification
+    model_family: ranking_gbm
+    model_version: v3
+    semantic_variant_type: compatible
+    compatible_node_types: [rsu, edge_server]
+    semantic_profile:
+      description: >
+        This ranker scores corrosion and surface wear severity from localized
+        defect evidence. It is compatible with defect classification, although
+        its label space is narrower than a full industrial taxonomy.
+      input_semantic: >
+        It expects localized corrosion candidates with area, texture features,
+        and optional thickness estimates from upstream tools.
+      output_semantic: >
+        It returns severity bands and wear scores that can inform maintenance
+        planning even when exact defect classes are coarse.
+    domain:
+      primary_domains: [corrosion, severity_ranking, industrial]
+      secondary_domains: [infrastructure, pipeline]
+      unsuitable_domains: [face_identity, wildfire, traffic_behavior]
+    capabilities: [severity_ranking, corrosion_scoring]
+    performance_profile:
+      typical_inference_time_ms: 9
+      typical_accuracy_f1: 0.82
+      false_positive_rate: 0.09
+      false_negative_rate: 0.1
+      throughput_fps: 60
+      robustness_notes: >
+        It is effective for corrosion cases, but non corrosion defects receive
+        less informative labels.
+    resource_profile:
+      min_compute_cpu: 1.5
+      min_memory_mb: 512
+      min_storage_mb: 128
+      recommended_accelerator: none
+      model_size_mb: 8
+
+  - implementation_id: package_damage_labeler_v1
+    service_type: defect_classification
+    model_family: damage_labeler
+    model_version: v1
+    semantic_variant_type: weak
+    compatible_node_types: [edge_server]
+    semantic_profile:
+      description: >
+        This classifier labels package dents and tears. It overlaps with defect
+        grading in spirit, but it was trained on logistics packaging rather than
+        engineered industrial assets.
+      input_semantic: >
+        It expects close RGB crops of boxes, labels, and wrapping materials with
+        visible surface damage.
+      output_semantic: >
+        It emits damage categories suitable for warehouse claims, not a broad
+        industrial maintenance taxonomy.
+    domain:
+      primary_domains: [package_damage, logistics_quality]
+      secondary_domains: [warehouse_inspection]
+      unsuitable_domains: [turbine_blade, weld_crack, wildfire]
+    capabilities: [damage_classification, claim_tagging]
+    performance_profile:
+      typical_inference_time_ms: 11
+      typical_accuracy_f1: 0.7
+      false_positive_rate: 0.13
+      false_negative_rate: 0.17
+      throughput_fps: 54
+      robustness_notes: >
+        It is fine for packaging faults, but category mismatch limits value on
+        heavy industrial equipment.
+    resource_profile:
+      min_compute_cpu: 1.5
+      min_memory_mb: 512
+      min_storage_mb: 128
+      recommended_accelerator: none
+      model_size_mb: 9
+
+  - implementation_id: pedestrian_attribute_classifier_v2
+    service_type: defect_classification
+    model_family: attribute_classifier
+    model_version: v2
+    semantic_variant_type: mismatch
+    compatible_node_types: [edge_server]
+    semantic_profile:
+      description: >
+        This classifier predicts human attributes such as clothing color and bag
+        presence. It contains no defect taxonomy and is semantically unrelated
+        to industrial inspection output.
+      input_semantic: >
+        It expects person crops from surveillance footage rather than localized
+        asset defects or material evidence.
+      output_semantic: >
+        It emits human attribute labels that cannot be turned into maintenance
+        defect categories or severity grades.
+    domain:
+      primary_domains: [human_attributes, surveillance]
+      secondary_domains: [urban_security]
+      unsuitable_domains: [industrial_defects, wildfire, traffic_risk]
+    capabilities: [attribute_classification, person_tagging]
+    performance_profile:
+      typical_inference_time_ms: 10
+      typical_accuracy_f1: 0.19
+      false_positive_rate: 0.42
+      false_negative_rate: 0.49
+      throughput_fps: 58
+      robustness_notes: >
+        It is operationally correct for people, but its label space is unusable
+        for defect grading.
+    resource_profile:
+      min_compute_cpu: 1.0
+      min_memory_mb: 384
+      min_storage_mb: 128
+      recommended_accelerator: none
+      model_size_mb: 6
+
+  - implementation_id: wildfire_alert_router_v2
+    service_type: emergency_alert_publish
+    model_family: alert_policy_engine
+    model_version: v2
+    semantic_variant_type: exact
+    compatible_node_types: [rsu, edge_server, cloud_server]
+    semantic_profile:
+      description: >
+        This alert publisher turns verified wildfire events into routed emergency
+        notifications with severity, destination, and enough context for field
+        teams to act immediately.
+      input_semantic: >
+        It expects verified event records containing location, confidence,
+        priority, and concise justification from upstream verification.
+      output_semantic: >
+        It emits structured alert packages with recipient groups, severity, and
+        message content ready for dispatch.
+    domain:
+      primary_domains: [emergency_alert, wildfire, notification]
+      secondary_domains: [traffic_incident, urban_security]
+      unsuitable_domains: [media_streaming, archive_storage, defect_segmentation]
+    capabilities: [alert_routing, priority_assignment, notification_formatting]
+    performance_profile:
+      typical_inference_time_ms: 6
+      typical_accuracy_f1: 0.95
+      false_positive_rate: 0.03
+      false_negative_rate: 0.04
+      throughput_fps: 90
+      robustness_notes: >
+        It is highly reliable as long as upstream events include complete
+        location and severity fields.
+    resource_profile:
+      min_compute_cpu: 1.0
+      min_memory_mb: 256
+      min_storage_mb: 128
+      recommended_accelerator: none
+      model_size_mb: 5
+
+  - implementation_id: incident_notifier_policy_v1
+    service_type: emergency_alert_publish
+    model_family: notifier_workflow
+    model_version: v1
+    semantic_variant_type: equivalent
+    compatible_node_types: [rsu, edge_server, cloud_server]
+    semantic_profile:
+      description: >
+        This notifier uses policy templates to publish operational incidents and
+        serves the same alerting purpose with more explicit workflow routing and
+        compliance oriented message templates.
+      input_semantic: >
+        It expects verified incident payloads that already include event type,
+        severity, and target audience tags.
+      output_semantic: >
+        It returns formatted notifications and delivery tasks ready for message
+        buses, dispatch consoles, or operator dashboards.
+    domain:
+      primary_domains: [incident_alerting, workflow_notification]
+      secondary_domains: [wildfire, traffic, urban_security]
+      unsuitable_domains: [playlist_delivery, video_archival, raw_detection]
+    capabilities: [message_workflow, policy_routing, notification_dispatch]
+    performance_profile:
+      typical_inference_time_ms: 8
+      typical_accuracy_f1: 0.91
+      false_positive_rate: 0.05
+      false_negative_rate: 0.05
+      throughput_fps: 75
+      robustness_notes: >
+        It is versatile across incident types, but template maintenance becomes
+        heavier as policy variants grow.
+    resource_profile:
+      min_compute_cpu: 1.0
+      min_memory_mb: 384
+      min_storage_mb: 128
+      recommended_accelerator: none
+      model_size_mb: 6
+
+  - implementation_id: edge_alarm_broker_v3
+    service_type: emergency_alert_publish
+    model_family: broker_rules
+    model_version: v3
+    semantic_variant_type: compatible
+    compatible_node_types: [rsu, edge_server]
+    semantic_profile:
+      description: >
+        This broker forwards event alerts from edge nodes to preconfigured
+        channels. It is compatible with emergency publishing, though it carries
+        less semantic enrichment than the preferred routers.
+      input_semantic: >
+        It expects event summaries with a resolved priority value and a defined
+        target topic or endpoint.
+      output_semantic: >
+        It emits lightweight dispatch messages and delivery acknowledgments for
+        downstream logging.
+    domain:
+      primary_domains: [edge_alerting, broker_dispatch]
+      secondary_domains: [wildfire, traffic]
+      unsuitable_domains: [report_generation, biometric_identity, archive_indexing]
+    capabilities: [message_brokering, alert_dispatch]
+    performance_profile:
+      typical_inference_time_ms: 4
+      typical_accuracy_f1: 0.84
+      false_positive_rate: 0.08
+      false_negative_rate: 0.09
+      throughput_fps: 120
+      robustness_notes: >
+        It is simple and fast, but it assumes upstream services already handled
+        most alert semantics.
+    resource_profile:
+      min_compute_cpu: 0.5
+      min_memory_mb: 256
+      min_storage_mb: 128
+      recommended_accelerator: none
+      model_size_mb: 3
+
+  - implementation_id: factory_shift_notice_sender_v1
+    service_type: emergency_alert_publish
+    model_family: notice_sender
+    model_version: v1
+    semantic_variant_type: weak
+    compatible_node_types: [edge_server, cloud_server]
+    semantic_profile:
+      description: >
+        This sender distributes operational notices to factory teams. It can
+        publish urgent messages, but its templates and recipient logic are tuned
+        for planned industrial communication rather than public emergencies.
+      input_semantic: >
+        It expects structured notices with plant team identifiers, schedule
+        context, and message templates for internal operations.
+      output_semantic: >
+        It emits formatted notices that only partially match the urgency and
+        routing semantics of emergency response alerts.
+    domain:
+      primary_domains: [industrial_notice, internal_comms]
+      secondary_domains: [facility_operations]
+      unsuitable_domains: [public_emergency, wildfire_dispatch, traffic_control]
+    capabilities: [notice_delivery, internal_routing]
+    performance_profile:
+      typical_inference_time_ms: 5
+      typical_accuracy_f1: 0.68
+      false_positive_rate: 0.14
+      false_negative_rate: 0.16
+      throughput_fps: 95
+      robustness_notes: >
+        It is dependable for internal workflows, but external emergency routing
+        and escalation semantics are weak.
+    resource_profile:
+      min_compute_cpu: 0.5
+      min_memory_mb: 256
+      min_storage_mb: 128
+      recommended_accelerator: none
+      model_size_mb: 3
+
+  - implementation_id: media_playlist_dispatcher_v2
+    service_type: emergency_alert_publish
+    model_family: playlist_router
+    model_version: v2
+    semantic_variant_type: mismatch
+    compatible_node_types: [edge_server]
+    semantic_profile:
+      description: >
+        This dispatcher publishes media playlists to display endpoints. It moves
+        messages around, but it does not express emergency severity, audience
+        policy, or incident semantics.
+      input_semantic: >
+        It expects content asset references and playback schedules rather than
+        verified operational event records.
+      output_semantic: >
+        It emits playlist delivery commands that cannot substitute for emergency
+        alert packages.
+    domain:
+      primary_domains: [media_delivery, playlist_dispatch]
+      secondary_domains: [digital_signage]
+      unsuitable_domains: [emergency_alerting, wildfire, urban_security]
+    capabilities: [content_dispatch, schedule_delivery]
+    performance_profile:
+      typical_inference_time_ms: 4
+      typical_accuracy_f1: 0.16
+      false_positive_rate: 0.45
+      false_negative_rate: 0.51
+      throughput_fps: 140
+      robustness_notes: >
+        It is very fast, but the published artifact is semantically unrelated to
+        incident notification.
+    resource_profile:
+      min_compute_cpu: 0.5
+      min_memory_mb: 256
+      min_storage_mb: 128
+      recommended_accelerator: none
+      model_size_mb: 2
+
+  - implementation_id: security_event_archive_indexer_v2
+    service_type: surveillance_event_archive
+    model_family: archive_indexer
+    model_version: v2
+    semantic_variant_type: exact
+    compatible_node_types: [rsu, edge_server, cloud_server]
+    semantic_profile:
+      description: >
+        This archive service stores validated surveillance events together with
+        clip references, search keys, and retention metadata so investigators can
+        retrieve evidence quickly.
+      input_semantic: >
+        It expects structured event summaries, clip pointers, track metadata,
+        and final alert context from upstream services.
+      output_semantic: >
+        It returns archive manifests, retrieval identifiers, and storage status
+        suitable for later audit or replay requests.
+    domain:
+      primary_domains: [surveillance_archive, security_evidence]
+      secondary_domains: [traffic_archive, incident_review]
+      unsuitable_domains: [real_time_tracking_only, wildfire_detection, ppe_check]
+    capabilities: [evidence_storage, metadata_indexing, retrieval_keying]
+    performance_profile:
+      typical_inference_time_ms: 9
+      typical_accuracy_f1: 0.94
+      false_positive_rate: 0.03
+      false_negative_rate: 0.05
+      throughput_fps: 65
+      robustness_notes: >
+        It is dependable when upstream metadata is complete, but missing clip
+        references reduce retrieval quality.
+    resource_profile:
+      min_compute_cpu: 1.5
+      min_memory_mb: 768
+      min_storage_mb: 2048
+      recommended_accelerator: none
+      model_size_mb: 8
+
+  - implementation_id: compressed_incident_store_v1
+    service_type: surveillance_event_archive
+    model_family: compressed_store
+    model_version: v1
+    semantic_variant_type: equivalent
+    compatible_node_types: [edge_server, cloud_server]
+    semantic_profile:
+      description: >
+        This service compresses event clips and stores them with searchable
+        incident metadata, serving the same archival goal with stronger focus on
+        storage efficiency.
+      input_semantic: >
+        It expects clip segments, event labels, and enough metadata to preserve
+        time and location lookup after compression.
+      output_semantic: >
+        It emits compressed archive packages and index records that later tools
+        can search and restore.
+    domain:
+      primary_domains: [incident_archive, compressed_storage]
+      secondary_domains: [surveillance_review]
+      unsuitable_domains: [real_time_alerting, identity_matching, wildfire_fusion]
+    capabilities: [clip_compression, archive_storage, metadata_preservation]
+    performance_profile:
+      typical_inference_time_ms: 14
+      typical_accuracy_f1: 0.9
+      false_positive_rate: 0.05
+      false_negative_rate: 0.06
+      throughput_fps: 40
+      robustness_notes: >
+        It balances storage and retrieval well, but aggressive compression can
+        slightly reduce visual detail for later review.
+    resource_profile:
+      min_compute_cpu: 2.0
+      min_memory_mb: 1024
+      min_storage_mb: 4096
+      recommended_accelerator: none
+      model_size_mb: 12
+
+  - implementation_id: edge_clip_archive_router_v3
+    service_type: surveillance_event_archive
+    model_family: edge_storage_router
+    model_version: v3
+    semantic_variant_type: compatible
+    compatible_node_types: [rsu, edge_server]
+    semantic_profile:
+      description: >
+        This router forwards incident clips and summary metadata into archive
+        buckets. It is compatible with event archival, though its indexing logic
+        is simpler than dedicated evidence systems.
+      input_semantic: >
+        It expects event clips, storage paths, and minimal metadata such as
+        source, time, and incident tag.
+      output_semantic: >
+        It returns storage placement confirmations and lightweight archive keys
+        that can later be expanded by a fuller archive backend.
+    domain:
+      primary_domains: [edge_archive, clip_routing]
+      secondary_domains: [traffic_review, security_ops]
+      unsuitable_domains: [live_alert_publish, report_generation, face_match]
+    capabilities: [clip_routing, storage_dispatch, archive_tagging]
+    performance_profile:
+      typical_inference_time_ms: 5
+      typical_accuracy_f1: 0.82
+      false_positive_rate: 0.08
+      false_negative_rate: 0.1
+      throughput_fps: 100
+      robustness_notes: >
+        It is fast and operationally simple, but metadata depth is weaker than
+        the exact archival indexer.
+    resource_profile:
+      min_compute_cpu: 1.0
+      min_memory_mb: 512
+      min_storage_mb: 1024
+      recommended_accelerator: none
+      model_size_mb: 5
+
+  - implementation_id: warehouse_video_journal_v1
+    service_type: surveillance_event_archive
+    model_family: video_journaler
+    model_version: v1
+    semantic_variant_type: weak
+    compatible_node_types: [edge_server]
+    semantic_profile:
+      description: >
+        This journal stores warehouse activity clips and shift notes. It has an
+        archival flavor, but its metadata and retrieval patterns are tuned for
+        inventory review rather than public safety evidence.
+      input_semantic: >
+        It expects warehouse video snippets with aisle identifiers, shift labels,
+        and operational notes.
+      output_semantic: >
+        It emits journal entries and clip references that only weakly support
+        surveillance incident reconstruction.
+    domain:
+      primary_domains: [warehouse_video, operational_journal]
+      secondary_domains: [logistics_review]
+      unsuitable_domains: [urban_security_archive, traffic_incidents, wildfire]
+    capabilities: [video_logging, clip_indexing]
+    performance_profile:
+      typical_inference_time_ms: 6
+      typical_accuracy_f1: 0.67
+      false_positive_rate: 0.14
+      false_negative_rate: 0.17
+      throughput_fps: 86
+      robustness_notes: >
+        It is useful for internal operations, but evidence taxonomy and access
+        policies differ from the target surveillance archive role.
+    resource_profile:
+      min_compute_cpu: 1.0
+      min_memory_mb: 512
+      min_storage_mb: 2048
+      recommended_accelerator: none
+      model_size_mb: 4
+
+  - implementation_id: transient_stream_relay_v2
+    service_type: surveillance_event_archive
+    model_family: stream_relay
+    model_version: v2
+    semantic_variant_type: mismatch
+    compatible_node_types: [uav, rsu, edge_server]
+    semantic_profile:
+      description: >
+        This relay forwards live streams to another endpoint. It moves media but
+        does not preserve event evidence with searchable archive semantics.
+      input_semantic: >
+        It expects live stream packets and target relay addresses rather than
+        validated incident summaries and retention metadata.
+      output_semantic: >
+        It emits forwarded stream chunks without archive manifests, indexing, or
+        retrieval references.
+    domain:
+      primary_domains: [live_streaming, relay]
+      secondary_domains: [media_transport]
+      unsuitable_domains: [evidence_archive, incident_review, defect_report]
+    capabilities: [stream_forwarding, packet_relay]
+    performance_profile:
+      typical_inference_time_ms: 3
+      typical_accuracy_f1: 0.17
+      false_positive_rate: 0.44
+      false_negative_rate: 0.5
+      throughput_fps: 150
+      robustness_notes: >
+        It is efficient for transport, but it never creates the retained evidence
+        objects expected from this service type.
+    resource_profile:
+      min_compute_cpu: 0.5
+      min_memory_mb: 256
+      min_storage_mb: 128
+      recommended_accelerator: none
+      model_size_mb: 2
+
+  - implementation_id: inspection_report_llm_v2
+    service_type: inspection_report_generation
+    model_family: report_llm
+    model_version: v2
+    semantic_variant_type: exact
+    compatible_node_types: [edge_server, cloud_server]
+    semantic_profile:
+      description: >
+        This report generator turns classified inspection findings into a clear
+        maintenance report with defect summary, severity rationale, and next step
+        recommendations for engineers.
+      input_semantic: >
+        It expects structured defect findings, asset metadata, timestamps, and
+        evidence references rather than raw imagery alone.
+      output_semantic: >
+        It returns a structured inspection report with narrative summary, defect
+        table entries, and maintenance recommendations.
+    domain:
+      primary_domains: [industrial_report, maintenance_documentation]
+      secondary_domains: [asset_health, compliance]
+      unsuitable_domains: [real_time_alerting, trajectory_risk, wildfire_fusion]
+    capabilities: [report_generation, finding_summarization, maintenance_recommendation]
+    performance_profile:
+      typical_inference_time_ms: 58
+      typical_accuracy_f1: 0.92
+      false_positive_rate: 0.04
+      false_negative_rate: 0.06
+      throughput_fps: 8
+      robustness_notes: >
+        It produces detailed reports, but it should be run on nodes with enough
+        memory and only after upstream classifications are stable.
+    resource_profile:
+      min_compute_cpu: 6.0
+      min_memory_mb: 4096
+      min_storage_mb: 1024
+      recommended_accelerator: gpu
+      model_size_mb: 94
+
+  - implementation_id: template_maintenance_reporter_v1
+    service_type: inspection_report_generation
+    model_family: template_reporter
+    model_version: v1
+    semantic_variant_type: equivalent
+    compatible_node_types: [edge_server, cloud_server]
+    semantic_profile:
+      description: >
+        This reporter fills a structured maintenance template from classified
+        findings and serves the same reporting role with more deterministic
+        phrasing and less narrative flexibility.
+      input_semantic: >
+        It expects defect categories, severity levels, asset ids, and evidence
+        links already normalized into a predictable schema.
+      output_semantic: >
+        It emits a consistent structured report whose sections map directly to
+        maintenance workflows and compliance review.
+    domain:
+      primary_domains: [maintenance_reporting, structured_templates]
+      secondary_domains: [industrial_compliance]
+      unsuitable_domains: [live_surveillance_alerts, wildfire_events, biometrics]
+    capabilities: [template_reporting, structured_documentation]
+    performance_profile:
+      typical_inference_time_ms: 16
+      typical_accuracy_f1: 0.88
+      false_positive_rate: 0.06
+      false_negative_rate: 0.08
+      throughput_fps: 32
+      robustness_notes: >
+        It is consistent and cheap, but nuanced explanations are less expressive
+        than the exact report generator.
+    resource_profile:
+      min_compute_cpu: 2.0
+      min_memory_mb: 1024
+      min_storage_mb: 512
+      recommended_accelerator: none
+      model_size_mb: 13
+
+  - implementation_id: checklist_summary_compiler_v3
+    service_type: inspection_report_generation
+    model_family: checklist_compiler
+    model_version: v3
+    semantic_variant_type: compatible
+    compatible_node_types: [rsu, edge_server]
+    semantic_profile:
+      description: >
+        This compiler converts findings into a checklist style summary that can
+        support inspection reporting, although it is less complete than a full
+        narrative maintenance report.
+      input_semantic: >
+        It expects normalized inspection findings with pass fail style fields,
+        severity tags, and basic evidence references.
+      output_semantic: >
+        It returns a concise checklist report suitable for quick review or
+        handoff into a larger documentation system.
+    domain:
+      primary_domains: [inspection_summary, checklist_reporting]
+      secondary_domains: [field_review, industrial_ops]
+      unsuitable_domains: [incident_alerting, live_tracking, identity_verification]
+    capabilities: [summary_compilation, checklist_reporting]
+    performance_profile:
+      typical_inference_time_ms: 9
+      typical_accuracy_f1: 0.81
+      false_positive_rate: 0.09
+      false_negative_rate: 0.1
+      throughput_fps: 58
+      robustness_notes: >
+        It is efficient and clear, but it omits some contextual reasoning that
+        maintenance engineers may want for hard cases.
+    resource_profile:
+      min_compute_cpu: 1.5
+      min_memory_mb: 768
+      min_storage_mb: 256
+      recommended_accelerator: none
+      model_size_mb: 7
+
+  - implementation_id: field_note_digest_writer_v1
+    service_type: inspection_report_generation
+    model_family: maintenance_blog_writer
+    model_version: v1
+    semantic_variant_type: weak
+    compatible_node_types: [edge_server]
+    semantic_profile:
+      description: >
+        This writer condenses technician field notes into readable summaries. It
+        is related to report generation, but it assumes free form human notes
+        rather than structured machine inspection findings.
+      input_semantic: >
+        It expects operator notes, short observations, and manually entered task
+        details gathered during on site work.
+      output_semantic: >
+        It returns a prose digest that only weakly matches the evidence grounded
+        reporting semantics required for automated inspection chains.
+    domain:
+      primary_domains: [field_notes, maintenance_summary]
+      secondary_domains: [work_order_documentation]
+      unsuitable_domains: [automated_defect_pipeline, wildfire_alerting, traffic]
+    capabilities: [note_summarization, prose_digest]
+    performance_profile:
+      typical_inference_time_ms: 13
+      typical_accuracy_f1: 0.69
+      false_positive_rate: 0.13
+      false_negative_rate: 0.17
+      throughput_fps: 36
+      robustness_notes: >
+        It is useful when humans already wrote the core observations, but it is
+        weak for purely machine generated defect evidence.
+    resource_profile:
+      min_compute_cpu: 2.0
+      min_memory_mb: 1024
+      min_storage_mb: 256
+      recommended_accelerator: none
+      model_size_mb: 12
+
+  - implementation_id: transcript_meeting_summarizer_v2
+    service_type: inspection_report_generation
+    model_family: transcript_summarizer
+    model_version: v2
+    semantic_variant_type: mismatch
+    compatible_node_types: [cloud_server]
+    semantic_profile:
+      description: >
+        This summarizer condenses spoken meeting transcripts. It produces text,
+        but it does not transform classified inspection evidence into a proper
+        maintenance report.
+      input_semantic: >
+        It expects long form conversational transcripts with speaker turns and
+        agenda context rather than defect findings and asset metadata.
+      output_semantic: >
+        It emits meeting summaries whose structure does not satisfy inspection
+        report requirements for defect traceability or severity accounting.
+    domain:
+      primary_domains: [meeting_summary, transcript_processing]
+      secondary_domains: [administrative_documentation]
+      unsuitable_domains: [industrial_inspection, surveillance_archive, wildfire]
+    capabilities: [transcript_summarization, meeting_digest]
+    performance_profile:
+      typical_inference_time_ms: 27
+      typical_accuracy_f1: 0.18
+      false_positive_rate: 0.41
+      false_negative_rate: 0.5
+      throughput_fps: 18
+      robustness_notes: >
+        It generates coherent text, but the semantic source and expected output
+        are wrong for automated inspection reporting.
+    resource_profile:
+      min_compute_cpu: 3.0
+      min_memory_mb: 2048
+      min_storage_mb: 512
+      recommended_accelerator: gpu
+      model_size_mb: 37

@@ -23,9 +23,8 @@ METHOD_LABELS = {
     "mappo_ctde": "MAPPO-CTDE",
     "iql_offline": "IQL\n(Replay)",
     "topology_greedy": "Topology Greedy\n+ Exchange",
-    "marl_no_semantic": "MARL-noSem",
+    "marl_no_semantic": "MARL-topo",
     "marl_semantic_no_topology": "MARL-sem",
-    "marl_topology_no_semantic": "MARL-topo",
     "proposed_semantic_topology_marl": "LASDM-ST-MARL",
     "centralized_planner": "LASDM-Centralized\nUpper Bound",
     "centralized_oracle": "LASDM-Centralized\nUpper Bound",
@@ -41,7 +40,6 @@ METHOD_ORDER = [
     "topology_greedy",
     "marl_no_semantic",
     "marl_semantic_no_topology",
-    "marl_topology_no_semantic",
     "proposed_semantic_topology_marl",
 ]
 SCENARIO_LABELS = {
@@ -70,9 +68,8 @@ OKABE_ITO = {
     "mappo_ctde": "#e41a1c",
     "iql_offline": "#4daf4a",
     "topology_greedy": "#0072B2",
-    "marl_no_semantic": "#999999",
+    "marl_no_semantic": "#56B4E9",
     "marl_semantic_no_topology": "#CC79A7",
-    "marl_topology_no_semantic": "#56B4E9",
     "proposed_semantic_topology_marl": "#009E73",
     "centralized_planner": "#000000",
     "centralized_oracle": "#000000",
@@ -86,9 +83,8 @@ METHOD_MARKERS = {
     "mappo_ctde": "x",
     "iql_offline": "+",
     "topology_greedy": "^",
-    "marl_no_semantic": "v",
+    "marl_no_semantic": "P",
     "marl_semantic_no_topology": "D",
-    "marl_topology_no_semantic": "P",
     "proposed_semantic_topology_marl": "*",
     "centralized_planner": "X",
     "centralized_oracle": "X",
@@ -111,7 +107,7 @@ PAPER_METHOD_ORDER = [
     "iql_offline",
     "topology_greedy",
     "marl_semantic_no_topology",
-    "marl_topology_no_semantic",
+    "marl_no_semantic",
     "proposed_semantic_topology_marl",
 ]
 REFERENCE_METHOD_ORDER = ["centralized_planner", "centralized_oracle"]
@@ -462,7 +458,7 @@ def plot_reward_curve(raw_root: Optional[Path]) -> plt.Figure:
     df["method"] = df["__path"].map(method_from_path)
     df["seed"] = df["__path"].map(seed_from_path)
     fig, ax = plt.subplots(figsize=(7.6, 4.2))
-    candidates = ["proposed_semantic_topology_marl", "marl_topology_no_semantic", "marl_semantic_no_topology", "marl_no_semantic"]
+    candidates = ["proposed_semantic_topology_marl", "marl_no_semantic", "marl_semantic_no_topology"]
     plotted = 0
     for method in candidates:
         sub = df[df["method"].eq(method)].copy()
@@ -1536,7 +1532,7 @@ def _proposed_exceeds_topology_on_ratio(df: pd.DataFrame) -> bool:
         return False
     method_col = df["method"].astype(str)
     proposed = df[method_col == "proposed_semantic_topology_marl"]
-    topology = df[method_col.isin(["topology_greedy", "marl_topology_no_semantic"])]
+    topology = df[method_col.isin(["topology_greedy", "marl_no_semantic"])]
     if proposed.empty or topology.empty:
         return False
     for metric in ("success_ratio", "deadline_hit_ratio", "qos_hit_ratio"):
@@ -1554,7 +1550,7 @@ def _proposed_improves_tail_latency(df: pd.DataFrame) -> bool:
         return False
     method_col = df["method"].astype(str)
     proposed = pd.to_numeric(df.loc[method_col == "proposed_semantic_topology_marl", "latency_s"], errors="coerce").dropna()
-    topology = pd.to_numeric(df.loc[method_col.isin(["topology_greedy", "marl_topology_no_semantic"]), "latency_s"], errors="coerce").dropna()
+    topology = pd.to_numeric(df.loc[method_col.isin(["topology_greedy", "marl_no_semantic"]), "latency_s"], errors="coerce").dropna()
     if proposed.empty or topology.empty:
         return False
     return float(proposed.quantile(0.95)) <= float(topology.quantile(0.95)) - 0.50

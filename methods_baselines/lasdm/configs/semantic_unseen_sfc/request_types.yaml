@@ -1,0 +1,106 @@
+schema_version: lasdm.semantic.request_types.unseen_sfc.v1
+request_type_count: 4
+
+request_types:
+  - request_type: flood_rescue_mapping
+    description: >
+      Flood rescue mapping monitors inundated streets, rooftops, and temporary
+      shelters after heavy rainfall. It must separate stranded people, blocked
+      rescue vehicles, and safe access corridors from visual clutter such as
+      floating debris and reflected water surfaces.
+    primary_domains: [flood, rescue, aerial, disaster_response]
+    secondary_domains: [water_level, evacuation, rooftop, emergency_mapping]
+    goal_output_semantic: >
+      The terminal output should describe verified rescue-relevant locations,
+      visible access routes, and prioritized alert records that emergency teams
+      can use without inspecting the raw aerial stream.
+    representative_service_chain:
+      - aerial_video_preprocessing
+      - multi_spectral_fusion_preprocessing
+      - person_detection_and_reid
+      - vehicle_detection_and_tracking
+      - multi_sensor_event_fusion
+      - trajectory_risk_assessment
+      - emergency_alert_publish
+      - surveillance_event_archive
+    preferred_node_types: [uav, rsu, edge_server, cloud_server]
+    qos_profile:
+      deadline_s: 5.5
+      accuracy_priority: high
+      continuity_priority: high
+
+  - request_type: precision_crop_stress_patrol
+    description: >
+      Precision crop stress patrol inspects fields for irrigation failure,
+      heat stress, pest damage, and disease patterns. It combines aerial
+      thermal and multispectral cues before producing a compact agronomy report
+      for targeted intervention.
+    primary_domains: [agriculture, crop_health, multispectral, thermal]
+    secondary_domains: [irrigation, pest_damage, field_scouting, vegetation]
+    goal_output_semantic: >
+      The terminal output should summarize crop stress regions, suspected
+      causes, severity, and recommended field actions with enough evidence for
+      farm operators to schedule inspection or treatment.
+    representative_service_chain:
+      - thermal_frame_preprocessing
+      - multi_spectral_fusion_preprocessing
+      - industrial_defect_detection
+      - defect_classification
+      - inspection_report_generation
+    preferred_node_types: [uav, rsu, edge_server, cloud_server]
+    qos_profile:
+      deadline_s: 8.0
+      accuracy_priority: high
+      continuity_priority: medium
+
+  - request_type: pipeline_leak_inspection
+    description: >
+      Pipeline leak inspection searches long linear infrastructure for thermal
+      anomalies, corrosion marks, wet soil patterns, and suspicious vapor
+      plumes. It needs a chain that can fuse weak evidence and verify whether
+      an apparent anomaly is operationally meaningful.
+    primary_domains: [pipeline, leak_detection, infrastructure, thermal]
+    secondary_domains: [corrosion, vapor_plume, right_of_way, maintenance]
+    goal_output_semantic: >
+      The terminal output should provide a verified leak or damage record with
+      severity, location context, supporting fused evidence, and maintenance
+      routing information.
+    representative_service_chain:
+      - thermal_frame_preprocessing
+      - multi_spectral_fusion_preprocessing
+      - industrial_defect_detection
+      - multi_sensor_event_fusion
+      - defect_classification
+      - emergency_alert_publish
+      - inspection_report_generation
+    preferred_node_types: [uav, rsu, edge_server, cloud_server]
+    qos_profile:
+      deadline_s: 7.0
+      accuracy_priority: high
+      continuity_priority: high
+
+  - request_type: port_perimeter_safety
+    description: >
+      Port perimeter safety watches container yards, gates, and restricted
+      lanes for unauthorized movement, unsafe vehicle interactions, and
+      pedestrian exposure near heavy equipment. The chain must reason across
+      vehicles, people, identity cues, and movement risk.
+    primary_domains: [port, perimeter, logistics, safety]
+    secondary_domains: [container_yard, access_control, heavy_equipment, patrol]
+    goal_output_semantic: >
+      The terminal output should report a validated port safety incident with
+      involved tracks, identity or access evidence when available, risk
+      rationale, and an auditable archive pointer.
+    representative_service_chain:
+      - aerial_video_preprocessing
+      - vehicle_detection_and_tracking
+      - person_detection_and_reid
+      - trajectory_risk_assessment
+      - identity_verification
+      - emergency_alert_publish
+      - surveillance_event_archive
+    preferred_node_types: [uav, vehicle, rsu, edge_server, cloud_server]
+    qos_profile:
+      deadline_s: 4.5
+      accuracy_priority: high
+      continuity_priority: high

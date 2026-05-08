@@ -10,7 +10,7 @@ import random
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import yaml
 
@@ -110,6 +110,215 @@ DEFAULT_SEMANTIC_OUTPUT_ROOT_ABS = os.path.join(WORKSPACE_ROOT, str(DEFAULT_SEMA
 PHYSICAL_VEHICLE_COUNT = 100
 PHYSICAL_UAV_COUNT = 20
 PHYSICAL_RSU_COUNT = 4
+
+DEFAULT_EVAL_BASELINES = [
+    "intra_region_only",
+    "cross_region_auction",
+    "pure_semantic_greedy_no_exchange",
+    "local_semantic_runtime_greedy",
+    "nsga2_semantic_qos",
+    "topology_greedy",
+    "marl_no_semantic",
+    "marl_semantic_no_topology",
+    "marl_no_exchange",
+    "marl_no_temporal",
+    "marl_no_cross_region",
+    "proposed_semantic_topology_marl",
+]
+DEFAULT_TRAINED_BASELINES = [
+    "mappo_ctde",
+    "iql_offline",
+]
+LEARNED_IPPO_BASELINES = {
+    "proposed_semantic_topology_marl",
+    "marl_no_semantic",
+    "marl_topology_no_semantic",
+    "marl_semantic_no_topology",
+    "marl_no_topology",
+    "marl_no_exchange",
+    "marl_no_temporal",
+    "marl_no_cross_region",
+}
+IPPO_BASELINE_CONFIG_UPDATES: Dict[str, Dict[str, Any]] = {
+    "proposed_semantic_topology_marl": {
+        "auto_exchange": True,
+        "include_remote_candidates": True,
+        "include_semantic_features": True,
+        "include_topology_features": True,
+        "include_temporal_features": True,
+    },
+    "marl_no_semantic": {
+        "auto_exchange": True,
+        "include_remote_candidates": True,
+        "include_semantic_features": False,
+        "include_topology_features": True,
+        "include_temporal_features": True,
+    },
+    "marl_topology_no_semantic": {
+        "auto_exchange": True,
+        "include_remote_candidates": True,
+        "include_semantic_features": False,
+        "include_topology_features": True,
+        "include_temporal_features": True,
+    },
+    "marl_semantic_no_topology": {
+        "auto_exchange": True,
+        "include_remote_candidates": True,
+        "include_semantic_features": True,
+        "include_topology_features": False,
+        "include_temporal_features": True,
+    },
+    "marl_no_topology": {
+        "auto_exchange": True,
+        "include_remote_candidates": True,
+        "include_semantic_features": True,
+        "include_topology_features": False,
+        "include_temporal_features": True,
+    },
+    "marl_no_exchange": {
+        "auto_exchange": False,
+        "include_remote_candidates": False,
+        "include_semantic_features": True,
+        "include_topology_features": True,
+        "include_temporal_features": True,
+    },
+    "marl_no_temporal": {
+        "auto_exchange": True,
+        "include_remote_candidates": True,
+        "include_semantic_features": True,
+        "include_topology_features": True,
+        "include_temporal_features": False,
+    },
+    "marl_no_cross_region": {
+        "auto_exchange": True,
+        "include_remote_candidates": False,
+        "include_semantic_features": True,
+        "include_topology_features": True,
+        "include_temporal_features": True,
+    },
+    "pure_semantic_greedy_no_exchange": {
+        "auto_exchange": False,
+        "include_remote_candidates": False,
+        "include_semantic_features": True,
+        "include_topology_features": False,
+        "include_temporal_features": False,
+    },
+    "local_semantic_runtime_greedy": {
+        "auto_exchange": False,
+        "include_remote_candidates": False,
+        "include_semantic_features": True,
+        "include_topology_features": True,
+        "include_temporal_features": True,
+    },
+    "nsga2_semantic_qos": {
+        "auto_exchange": True,
+        "include_remote_candidates": True,
+        "include_semantic_features": True,
+        "include_topology_features": True,
+        "include_temporal_features": True,
+    },
+    "mappo_ctde": {
+        "auto_exchange": True,
+        "include_remote_candidates": True,
+        "include_semantic_features": True,
+        "include_topology_features": True,
+        "include_temporal_features": True,
+    },
+    "iql_offline": {
+        "auto_exchange": True,
+        "include_remote_candidates": True,
+        "include_semantic_features": True,
+        "include_topology_features": True,
+        "include_temporal_features": True,
+    },
+}
+IPPO_BASELINE_ALIASES: Dict[str, str] = {
+    "marl_topology_no_semantic": "marl_no_semantic",
+    "marl_no_topology": "marl_semantic_no_topology",
+}
+
+
+def _baseline_settings(name: str) -> Tuple[str, Dict[str, Any]]:
+    if name == "semantic_greedy_no_exchange":
+        raise ValueError("semantic_greedy_no_exchange was removed in V21; use pure_semantic_greedy_no_exchange or local_semantic_runtime_greedy")
+    if name == "pure_semantic_greedy_no_exchange":
+        return "pure_semantic_greedy_no_exchange", dict(IPPO_BASELINE_CONFIG_UPDATES[name])
+    if name == "local_semantic_runtime_greedy":
+        return "local_semantic_runtime_greedy", dict(IPPO_BASELINE_CONFIG_UPDATES[name])
+    if name == "nsga2_semantic_qos":
+        return "nsga2_semantic_qos", dict(IPPO_BASELINE_CONFIG_UPDATES[name])
+    if name in DEFAULT_TRAINED_BASELINES:
+        return name, dict(IPPO_BASELINE_CONFIG_UPDATES[name])
+    if name == "intra_region_only":
+        return "intra_region_only", {"auto_exchange": False, "include_remote_candidates": False}
+    if name == "cross_region_auction":
+        return "cross_region_auction", {"auto_exchange": True, "include_remote_candidates": True}
+    if name == "semantic_greedy_with_exchange":
+        raise ValueError("semantic_greedy_with_exchange was removed in V21; use utility_prior_with_exchange")
+    if name == "utility_prior_with_exchange":
+        return "utility_prior_with_exchange", {"auto_exchange": True, "include_remote_candidates": True}
+    if name == "topology_greedy":
+        return "topology_greedy", {"auto_exchange": True, "include_remote_candidates": True}
+    canonical = canonical_ippo_baseline(name)
+    if canonical in IPPO_BASELINE_CONFIG_UPDATES:
+        if canonical in {"marl_no_semantic", "marl_topology_no_semantic"}:
+            return "marl_no_semantic", dict(IPPO_BASELINE_CONFIG_UPDATES[canonical])
+        if canonical in {"marl_semantic_no_topology", "marl_no_topology"}:
+            return "marl_semantic_no_topology", dict(IPPO_BASELINE_CONFIG_UPDATES[canonical])
+        return "topology_greedy", dict(IPPO_BASELINE_CONFIG_UPDATES[canonical])
+    if name in {"centralized_planner", "centralized_oracle"}:
+        return "centralized_planner", {
+            "auto_exchange": False,
+            "include_remote_candidates": True,
+            "global_candidate_catalog": True,
+            "semantic_top_k": 64,
+        }
+    return name, {}
+
+
+def is_ippo_checkpoint_baseline(name: str) -> bool:
+    canonical = canonical_ippo_baseline(name)
+    if canonical in {"mappo_ctde", "iql_offline"}:
+        return False
+    return canonical in LEARNED_IPPO_BASELINES
+
+
+def checkpoint_subdir_for_baseline(name: str) -> str:
+    canonical = canonical_ippo_baseline(name)
+    return "" if canonical == "proposed_semantic_topology_marl" else canonical
+
+
+def canonical_ippo_baseline(name: str) -> str:
+    return IPPO_BASELINE_ALIASES.get(str(name), str(name))
+
+
+def _select_scenarios(config: Mapping[str, Any], names: Sequence[str] | None) -> List[Dict[str, Any]]:
+    scenarios = list(config.get("semantic_topology_experiment", {}).get("scenarios", []) or [])
+    if not scenarios:
+        scenarios = list(config.get("experiment", {}).get("scenarios", []) or [{"name": "default"}])
+    normalized = [dict(item) if isinstance(item, Mapping) else {"name": str(item)} for item in scenarios]
+    if not names:
+        return [
+            item
+            for item in normalized
+            if bool(item.get("include_in_default", item.get("enabled", True)))
+        ]
+    requested = {str(name) for name in names}
+    selected = [item for item in normalized if str(item.get("name")) in requested]
+    missing = sorted(requested - {str(item.get("name")) for item in selected})
+    if missing:
+        raise ValueError(f"Unknown semantic-topology scenario(s): {', '.join(missing)}")
+    return selected
+
+
+def _deep_merge(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> Dict[str, Any]:
+    merged = copy.deepcopy(dict(base))
+    for key, value in dict(overlay).items():
+        if isinstance(value, Mapping) and isinstance(merged.get(key), Mapping):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
 
 
 def main() -> None:
@@ -304,6 +513,23 @@ def build_offline_env(
 ) -> SemanticTopologyMARLEnv:
     scenario_cfg = _resolve_scenario(config, scenario)
     run_config = _materialize_offline_config(config, scenario_cfg, service_role_sweep, seed)
+    semantic_env = build_semantic_env_from_run_config(
+        run_config,
+        scenario_cfg,
+        service_role_sweep=service_role_sweep,
+        max_steps=max_steps,
+    )
+    if attach_runtime:
+        _attach_runtime_env(semantic_env, config, scenario_cfg, seed, baseline)
+    return semantic_env
+
+
+def build_semantic_env_from_run_config(
+    run_config: Mapping[str, Any],
+    scenario_cfg: Mapping[str, Any],
+    service_role_sweep: str,
+    max_steps: int,
+) -> SemanticTopologyMARLEnv:
     directory = ServiceInstanceDirectory()
     for item in run_config.get("service_instances", []):
         directory.register(ServiceInstance.from_dict(item))
@@ -357,8 +583,6 @@ def build_offline_env(
         reward_fn=_build_reward_fn(marl_cfg),
         config=env_cfg,
     )
-    if attach_runtime:
-        _attach_runtime_env(semantic_env, config, scenario_cfg, seed, baseline)
     return semantic_env
 
 def _attach_runtime_env(
